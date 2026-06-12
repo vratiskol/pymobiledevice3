@@ -123,7 +123,36 @@ BACKUP_SELECTIONS = {
         BackupSelectionRule("HomeDomain", "Library/AddressBook/AddressBook.sqlitedb-shm"),
         BackupSelectionRule("HomeDomain", "Library/AddressBook/AddressBook.sqlitedb-wal"),
     ),
-    "sms": (BackupSelectionRule("HomeDomain", "Library/SMS/sms.db"),),
+    "knowledge": (
+        BackupSelectionRule("HomeDomain", "Library/CoreDuet/Knowledge/knowledgeC.db"),
+        BackupSelectionRule("HomeDomain", "Library/CoreDuet/Knowledge/knowledgeC.db-shm"),
+        BackupSelectionRule("HomeDomain", "Library/CoreDuet/Knowledge/knowledgeC.db-wal"),
+    ),
+    "safari_history": (
+        BackupSelectionRule("AppDomain-com.apple.mobilesafari", "Library/Metadata Cache/LPLinkMetadata.db"),
+        BackupSelectionRule("AppDomain-com.apple.mobilesafari", "Library/Metadata Cache/LPLinkMetadata.db-shm"),
+        BackupSelectionRule("AppDomain-com.apple.mobilesafari", "Library/Metadata Cache/LPLinkMetadata.db-wal"),
+        BackupSelectionRule("AppDomain-com.apple.mobilesafari", "Library/Preferences/com.apple.Safari.History.plist"),
+        BackupSelectionRule(
+            "AppDomain-com.apple.mobilesafari", "Library/WebKit/WebsiteData/SearchHistory/RecentSearches.plist"
+        ),
+        BackupSelectionRule("AppDomainGroup-group.com.apple.PegasusConfiguration", "EngagedCompletions/Cache.db"),
+        BackupSelectionRule("AppDomainGroup-group.com.apple.PegasusConfiguration", "EngagedCompletions/Cache.db-shm"),
+        BackupSelectionRule("AppDomainGroup-group.com.apple.PegasusConfiguration", "EngagedCompletions/Cache.db-wal"),
+        BackupSelectionRule("HomeDomain", "Library/Safari/History.db"),
+        BackupSelectionRule("HomeDomain", "Library/Safari/History.db-shm"),
+        BackupSelectionRule("HomeDomain", "Library/Safari/History.db-wal"),
+    ),
+    "sms": (
+        BackupSelectionRule("HomeDomain", "Library/SMS/sms.db"),
+        BackupSelectionRule("HomeDomain", "Library/SMS/sms.db-shm"),
+        BackupSelectionRule("HomeDomain", "Library/SMS/sms.db-wal"),
+    ),
+    "tcc": (
+        BackupSelectionRule("HomeDomain", "Library/TCC/TCC.db"),
+        BackupSelectionRule("HomeDomain", "Library/TCC/TCC.db-shm"),
+        BackupSelectionRule("HomeDomain", "Library/TCC/TCC.db-wal"),
+    ),
     "whatsapp": (
         BackupSelectionRule("AppDomain-net.whatsapp.WhatsApp", "Documents/ChatStorage.sqlite"),
         BackupSelectionRule("AppDomain-net.whatsapp.WhatsApp", "Documents/ChatStorage.sqlite-shm"),
@@ -133,6 +162,18 @@ BACKUP_SELECTIONS = {
         BackupSelectionRule("AppDomainGroup-group.net.whatsapp.WhatsApp.shared", "ChatStorage.sqlite-wal"),
     ),
 }
+BACKUP_SELECTION_REGEXES = {
+    "database_artifacts": (
+        r"\.(plist|db|db-shm|db-wal|sqlite|sqlite-shm|sqlite-wal|sqlitedb|sqlitedb-shm|sqlitedb-wal|storedata|storedata-shm|storedata-wal)$",
+    ),
+}
+BACKUP_SELECTION_NAMES = tuple(sorted(set(BACKUP_SELECTIONS) | set(BACKUP_SELECTION_REGEXES)))
+BACKUP_EXCLUSION_REGEXES = {
+    "photos": (r"^CameraRollDomain[/-]",),
+}
+BACKUP_EXCLUSION_NAMES = tuple(
+    sorted(set(BACKUP_SELECTIONS) | set(BACKUP_SELECTION_REGEXES) | set(BACKUP_EXCLUSION_REGEXES))
+)
 
 
 class Mobilebackup2Service(LockdownService):
@@ -606,14 +647,89 @@ class Mobilebackup2Service(LockdownService):
 
         rules = []
         for selection_name in only:
-            preset = BACKUP_SELECTIONS.get(selection_name.lower())
+            selection_name_normalized = Mobilebackup2Service._validate_backup_selection_name(selection_name)
+            preset = BACKUP_SELECTIONS.get(selection_name_normalized)
             if preset is None:
-                available = ", ".join(sorted(BACKUP_SELECTIONS))
-                raise PyMobileDevice3Exception(
-                    f"Unsupported backup selection: {selection_name}. Available: {available}"
-                )
+                continue
             rules.extend(preset)
         return tuple(rules)
+
+    @staticmethod
+    def resolve_backup_selection_regexes(only: Optional[Sequence[str]]) -> tuple[str, ...]:
+        """
+        Resolve backup selection names to regex-backed selection filters.
+
+        :param only: A sequence of backup selection names to resolve. If None or empty,
+            no regex selections will be resolved.
+        :return: A tuple of regex patterns for selected regex-backed presets.
+        :raises PyMobileDevice3Exception: If an unsupported backup selection name is provided.
+        """
+        if not only:
+            return ()
+
+        patterns = []
+        for selection_name in only:
+            selection_name_normalized = Mobilebackup2Service._validate_backup_selection_name(selection_name)
+            patterns.extend(BACKUP_SELECTION_REGEXES.get(selection_name_normalized, ()))
+        return tuple(patterns)
+
+    @staticmethod
+    def resolve_backup_exclusion(exclude: Optional[Sequence[str]]) -> tuple[BackupSelectionRule, ...]:
+        """
+        Resolve backup exclusion names to exact backup selection rules.
+
+        :param exclude: A sequence of backup exclusion names to resolve. If None or empty,
+            no exact exclusions will be resolved.
+        :return: A tuple of backup selection rules derived from the input sequence.
+        :raises PyMobileDevice3Exception: If an unsupported backup exclusion name is provided.
+        """
+        if not exclude:
+            return ()
+
+        rules = []
+        for exclusion_name in exclude:
+            exclusion_name_normalized = Mobilebackup2Service._validate_backup_exclusion_name(exclusion_name)
+            preset = BACKUP_SELECTIONS.get(exclusion_name_normalized)
+            if preset is None:
+                continue
+            rules.extend(preset)
+        return tuple(rules)
+
+    @staticmethod
+    def resolve_backup_exclusion_regexes(exclude: Optional[Sequence[str]]) -> tuple[str, ...]:
+        """
+        Resolve backup exclusion names to regex-backed exclusion filters.
+
+        :param exclude: A sequence of backup exclusion names to resolve. If None or empty,
+            no regex exclusions will be resolved.
+        :return: A tuple of regex patterns for selected regex-backed exclusions.
+        :raises PyMobileDevice3Exception: If an unsupported backup exclusion name is provided.
+        """
+        if not exclude:
+            return ()
+
+        patterns = []
+        for exclusion_name in exclude:
+            exclusion_name_normalized = Mobilebackup2Service._validate_backup_exclusion_name(exclusion_name)
+            patterns.extend(BACKUP_SELECTION_REGEXES.get(exclusion_name_normalized, ()))
+            patterns.extend(BACKUP_EXCLUSION_REGEXES.get(exclusion_name_normalized, ()))
+        return tuple(patterns)
+
+    @staticmethod
+    def _validate_backup_selection_name(selection_name: str) -> str:
+        selection_name_normalized = selection_name.lower()
+        if selection_name_normalized not in BACKUP_SELECTION_NAMES:
+            available = ", ".join(BACKUP_SELECTION_NAMES)
+            raise PyMobileDevice3Exception(f"Unsupported backup selection: {selection_name}. Available: {available}")
+        return selection_name_normalized
+
+    @staticmethod
+    def _validate_backup_exclusion_name(exclusion_name: str) -> str:
+        exclusion_name_normalized = exclusion_name.lower()
+        if exclusion_name_normalized not in BACKUP_EXCLUSION_NAMES:
+            available = ", ".join(BACKUP_EXCLUSION_NAMES)
+            raise PyMobileDevice3Exception(f"Unsupported backup exclusion: {exclusion_name}. Available: {available}")
+        return exclusion_name_normalized
 
     @staticmethod
     def should_preserve_backup_file(
@@ -722,6 +838,28 @@ class Mobilebackup2Service(LockdownService):
 
         def _filter(backup_file: BackupFile) -> bool:
             return any(callback(backup_file) for callback in active_callbacks)
+
+        return _filter
+
+    @staticmethod
+    def combine_include_exclude_filter_callbacks(
+        include_callback: Optional[BackupFilterCallback], exclude_callback: Optional[BackupFilterCallback]
+    ) -> Optional[BackupFilterCallback]:
+        """
+        Combines include and exclude backup filter callbacks. Exclusions take precedence.
+
+        If no include callback is supplied, every payload is considered included unless it is excluded.
+        If no exclude callback is supplied, the include callback is returned unchanged.
+        """
+        if include_callback is None and exclude_callback is None:
+            return None
+        if exclude_callback is None:
+            return include_callback
+
+        def _filter(backup_file: BackupFile) -> bool:
+            if include_callback is not None and not include_callback(backup_file):
+                return False
+            return not exclude_callback(backup_file)
 
         return _filter
 
