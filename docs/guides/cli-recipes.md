@@ -30,6 +30,9 @@ pymobiledevice3 syslog live -v unwanted_log
 # Restart device
 pymobiledevice3 diagnostics restart
 
+# Print a JSON index of crash report and diagnostic log artifacts
+pymobiledevice3 crash index --depth -1
+
 # Pull crash reports
 pymobiledevice3 crash pull /path/to/crashes
 ```

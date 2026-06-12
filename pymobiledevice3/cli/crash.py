@@ -4,7 +4,7 @@ from typing import Annotated, Optional
 import typer
 from typer_injector import InjectingTyper
 
-from pymobiledevice3.cli.cli_common import ServiceProviderDep, async_command
+from pymobiledevice3.cli.cli_common import ServiceProviderDep, async_command, print_json
 from pymobiledevice3.services.crash_reports import CrashReportsManager, CrashReportsShell
 
 cli = InjectingTyper(
@@ -136,6 +136,56 @@ async def crash_ls(
     async with CrashReportsManager(service_provider) as crash_manager:
         for path in await crash_manager.ls(remote_file, depth):
             print(path)
+
+
+@cli.command("index")
+@async_command
+async def crash_index(
+    service_provider: ServiceProviderDep,
+    remote_file: Annotated[str, typer.Argument(help="Path whose crash/log artifacts should be indexed")] = "/",
+    depth: Annotated[
+        int,
+        typer.Option(
+            "--depth",
+            "-d",
+            help="Listing depth, -1 to recurse through all crash/log directories",
+        ),
+    ] = -1,
+    match: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--match",
+            "-m",
+            help="Case-sensitive basename regex filter (repeatable; all must match - conjunction)",
+        ),
+    ] = None,
+    match_insensitive: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--match-insensitive",
+            "-mi",
+            help="Case-insensitive basename regex filter (repeatable; all must match - conjunction)",
+        ),
+    ] = None,
+    include_directories: Annotated[
+        bool,
+        typer.Option(
+            "--include-dirs",
+            help="Include directory entries in addition to file artifacts",
+        ),
+    ] = False,
+) -> None:
+    """Print a JSON index of crash report and diagnostic log artifacts"""
+    async with CrashReportsManager(service_provider) as crash_manager:
+        print_json(
+            await crash_manager.index(
+                remote_file,
+                depth=depth,
+                match=match or [],
+                match_insensitive=match_insensitive or [],
+                include_directories=include_directories,
+            )
+        )
 
 
 @cli.command("flush")

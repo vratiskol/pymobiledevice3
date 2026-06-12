@@ -53,6 +53,21 @@ async def _create_crash_report(crash_manager: CrashReportsManager, filename: str
     )
 
 
+class FakeIndexAfc:
+    def __init__(self, paths: list[str], stats: dict[str, dict]) -> None:
+        self.paths = paths
+        self.stats = stats
+        self.calls = []
+
+    async def dirlist(self, path: str, depth: int) -> AsyncGenerator[str]:
+        self.calls.append((path, depth))
+        for item in self.paths:
+            yield item
+
+    async def stat(self, path: str) -> dict:
+        return self.stats[path]
+
+
 def _nested_paths(root: str, depth: int) -> list[str]:
     paths = [root]
     for _ in range(1, depth):
@@ -315,3 +330,137 @@ async def test_parse_latest_no_matches(
 
     with pytest.raises(ValueError):
         await crash_manager.parse_latest(path=remote_temp_directory, match=match, match_insensitive=match_insensitive)
+
+
+async def test_index_returns_file_entries_sorted_with_counts() -> None:
+    manager = CrashReportsManager(object())
+    modified_at = datetime(2026, 6, 12, 12, 30, 0)
+    created_at = datetime(2026, 6, 12, 12, 0, 0)
+    manager.afc = FakeIndexAfc(
+        [
+            "/",
+            "/DiagnosticLogs",
+            "/DiagnosticLogs/sysdiagnose/sysdiagnose_test.tar.gz",
+            "/JetsamEvent.ips",
+            "/JetsamEvent.ips.synced",
+            "/system.log",
+        ],
+        {
+            "/DiagnosticLogs": {
+                "st_birthtime": created_at,
+                "st_ifmt": "S_IFDIR",
+                "st_mtime": modified_at,
+                "st_size": 64,
+            },
+            "/DiagnosticLogs/sysdiagnose/sysdiagnose_test.tar.gz": {
+                "st_birthtime": created_at,
+                "st_ifmt": "S_IFREG",
+                "st_mtime": modified_at,
+                "st_size": 2048,
+            },
+            "/JetsamEvent.ips": {
+                "st_birthtime": created_at,
+                "st_ifmt": "S_IFREG",
+                "st_mtime": modified_at,
+                "st_size": 512,
+            },
+            "/JetsamEvent.ips.synced": {
+                "st_birthtime": created_at,
+                "st_ifmt": "S_IFREG",
+                "st_mtime": modified_at,
+                "st_size": 256,
+            },
+            "/system.log": {
+                "st_birthtime": created_at,
+                "st_ifmt": "S_IFREG",
+                "st_mtime": modified_at,
+                "st_size": 128,
+            },
+        },
+    )
+
+    result = await manager.index("/", depth=-1)
+
+    assert manager.afc.calls == [("/", -1)]
+    assert result["count"] == 4
+    assert result["directory_count"] == 0
+    assert result["file_count"] == 4
+    assert result["include_directories"] is False
+    assert result["root"] == "/"
+    assert result["total_size"] == 2944
+    assert [entry["path"] for entry in result["entries"]] == [
+        "/DiagnosticLogs/sysdiagnose/sysdiagnose_test.tar.gz",
+        "/JetsamEvent.ips",
+        "/JetsamEvent.ips.synced",
+        "/system.log",
+    ]
+    assert [entry["artifact_type"] for entry in result["entries"]] == [
+        "sysdiagnose",
+        "crash_report",
+        "crash_report",
+        "diagnostic_log",
+    ]
+    assert result["entries"][0]["modified_at"] == "2026-06-12T12:30:00"
+    assert result["entries"][0]["created_at"] == "2026-06-12T12:00:00"
+
+
+async def test_index_can_include_directories_and_filter_by_basename() -> None:
+    manager = CrashReportsManager(object())
+    timestamp = datetime(2026, 6, 12, 12, 0, 0)
+    manager.afc = FakeIndexAfc(
+        [
+            "/",
+            "/DiagnosticLogs",
+            "/DiagnosticLogs/sysdiagnose",
+            "/DiagnosticLogs/sysdiagnose/sysdiagnose_test.tar.gz",
+            "/JetsamEvent.ips",
+        ],
+        {
+            "/DiagnosticLogs": {
+                "st_birthtime": timestamp,
+                "st_ifmt": "S_IFDIR",
+                "st_mtime": timestamp,
+                "st_size": 64,
+            },
+            "/DiagnosticLogs/sysdiagnose": {
+                "st_birthtime": timestamp,
+                "st_ifmt": "S_IFDIR",
+                "st_mtime": timestamp,
+                "st_size": 64,
+            },
+            "/DiagnosticLogs/sysdiagnose/sysdiagnose_test.tar.gz": {
+                "st_birthtime": timestamp,
+                "st_ifmt": "S_IFREG",
+                "st_mtime": timestamp,
+                "st_size": 1024,
+            },
+            "/JetsamEvent.ips": {
+                "st_birthtime": timestamp,
+                "st_ifmt": "S_IFREG",
+                "st_mtime": timestamp,
+                "st_size": 512,
+            },
+        },
+    )
+
+    result = await manager.index("/", depth=-1, match_insensitive=[r"sysdiagnose"], include_directories=True)
+
+    assert result["count"] == 2
+    assert result["directory_count"] == 1
+    assert result["file_count"] == 1
+    assert result["total_size"] == 1024
+    assert [entry["path"] for entry in result["entries"]] == [
+        "/DiagnosticLogs/sysdiagnose",
+        "/DiagnosticLogs/sysdiagnose/sysdiagnose_test.tar.gz",
+    ]
+    assert [entry["artifact_type"] for entry in result["entries"]] == [
+        "sysdiagnose",
+        "sysdiagnose",
+    ]
+
+
+async def test_index_rejects_invalid_depth() -> None:
+    manager = CrashReportsManager(object())
+
+    with pytest.raises(ValueError, match="depth must be -1 or >= 0"):
+        await manager.index(depth=-2)

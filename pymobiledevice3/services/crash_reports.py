@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import logging
 import posixpath
 import re
@@ -29,6 +30,8 @@ SYSDIAGNOSE_IN_PROGRESS_MAX_TTL_SECS = 600
 
 # on iOS17, we need to wait for a moment before trying to fetch the sysdiagnose archive
 IOS17_SYSDIAGNOSE_DELAY = 3
+CRASH_REPORT_EXTENSIONS = (".ips", ".ips.synced", ".panic", ".panic.synced", ".crash", ".crash.synced")
+LOG_ARTIFACT_EXTENSIONS = (".log", ".logarchive", ".tracev3", ".txt")
 
 
 class CrashReportsManager:
@@ -96,6 +99,58 @@ class CrashReportsManager:
         async for item in self.afc.dirlist(path, depth):
             result.append(item)
         return result[1:]  # skip the root path '/'
+
+    async def index(
+        self,
+        path: str = "/",
+        depth: int = -1,
+        match: Optional[list[str]] = None,
+        match_insensitive: Optional[list[str]] = None,
+        include_directories: bool = False,
+    ) -> dict:
+        """
+        Build a JSON-serializable index of crash report and diagnostic log artifacts.
+
+        :param path: Path whose entries should be indexed. Defaults to '/'
+        :param depth: Listing depth, -1 to list recursively.
+        :param match: Case-sensitive regex patterns over artifact basename.
+        :param match_insensitive: Case-insensitive regex patterns over artifact basename.
+        :param include_directories: Include directory entries in addition to files.
+        :return: JSON-serializable index with aggregate counts and artifact entries.
+        """
+        if depth < -1:
+            raise ValueError("depth must be -1 or >= 0")
+
+        patterns = self._compile_index_patterns(match=match, match_insensitive=match_insensitive)
+        entries = []
+
+        async for entry in self.afc.dirlist(path, depth):
+            if entry == path:
+                continue
+            if not self._index_entry_matches(entry, patterns):
+                continue
+
+            stat = await self.afc.stat(entry)
+            is_directory = stat.get("st_ifmt") == "S_IFDIR"
+            if is_directory and not include_directories:
+                continue
+
+            entries.append(self._format_index_entry(entry, stat))
+
+        entries.sort(key=lambda item: item["path"])
+        file_count = sum(1 for item in entries if item["kind"] == "file")
+        directory_count = sum(1 for item in entries if item["kind"] == "directory")
+
+        return {
+            "count": len(entries),
+            "depth": depth,
+            "directory_count": directory_count,
+            "entries": entries,
+            "file_count": file_count,
+            "include_directories": include_directories,
+            "root": path,
+            "total_size": sum(item["size"] for item in entries if item["kind"] == "file"),
+        }
 
     async def parse(self, path: str = "/") -> CrashReportBase:
         """
@@ -311,6 +366,54 @@ class CrashReportsManager:
             if self._check_timeout(end_time):
                 raise SysdiagnoseTimeoutError("Timeout finding in-progress sysdiagnose filename")
             await asyncio.sleep(0.1)
+
+    @staticmethod
+    def _compile_index_patterns(
+        match: Optional[list[str]] = None, match_insensitive: Optional[list[str]] = None
+    ) -> list[re.Pattern]:
+        patterns = [re.compile(pattern) for pattern in match or []]
+        patterns.extend(re.compile(pattern, re.IGNORECASE) for pattern in match_insensitive or [])
+        return patterns
+
+    @staticmethod
+    def _index_entry_matches(path: str, patterns: list[re.Pattern]) -> bool:
+        basename = posixpath.basename(path)
+        return not patterns or all(pattern.search(basename) for pattern in patterns)
+
+    @staticmethod
+    def _format_index_entry(path: str, stat: dict) -> dict:
+        kind = "directory" if stat.get("st_ifmt") == "S_IFDIR" else "file"
+        return {
+            "artifact_type": CrashReportsManager._classify_artifact(path, kind),
+            "created_at": CrashReportsManager._format_index_time(stat.get("st_birthtime")),
+            "kind": kind,
+            "modified_at": CrashReportsManager._format_index_time(stat.get("st_mtime")),
+            "name": posixpath.basename(path),
+            "parent": posixpath.dirname(path) or "/",
+            "path": path,
+            "size": stat.get("st_size", 0),
+        }
+
+    @staticmethod
+    def _classify_artifact(path: str, kind: str) -> str:
+        basename = posixpath.basename(path).lower()
+        path_lower = path.lower()
+
+        if "sysdiagnose" in path_lower:
+            return "sysdiagnose"
+        if kind == "directory":
+            return "directory"
+        if basename.endswith(CRASH_REPORT_EXTENSIONS):
+            return "crash_report"
+        if basename.endswith(LOG_ARTIFACT_EXTENSIONS) or path_lower.strip("/").startswith("diagnosticlogs/"):
+            return "diagnostic_log"
+        return "other"
+
+    @staticmethod
+    def _format_index_time(value: object) -> Optional[str]:
+        if isinstance(value, datetime.datetime):
+            return value.isoformat()
+        return None
 
     def _check_timeout(self, end_time: Optional[float] = None) -> bool:
         return end_time is not None and time.monotonic() > end_time
