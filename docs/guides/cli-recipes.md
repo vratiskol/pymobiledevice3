@@ -52,6 +52,9 @@ pymobiledevice3 backup2 backup --full DIRECTORY
 # Validate a completed local backup
 pymobiledevice3 backup2 verify DIRECTORY
 
+# Export a completed local backup metadata summary
+pymobiledevice3 backup2 summary DIRECTORY
+
 # Preserve only selected backup payloads
 pymobiledevice3 backup2 backup --only sms DIRECTORY
 pymobiledevice3 backup2 backup --only whatsapp DIRECTORY

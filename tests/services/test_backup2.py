@@ -226,6 +226,23 @@ def test_validate_backup_accepts_complete_unencrypted_backup(tmp_path: Path) -> 
     assert result.to_dict()["complete"] is True
 
 
+def test_backup_validation_result_exports_metadata_summary(tmp_path: Path) -> None:
+    create_test_backup(tmp_path)
+
+    result = Mobilebackup2Service.validate_backup(tmp_path, BACKUP_SOURCE, include_file_summary=True)
+    summary = result.to_summary_dict()
+
+    assert summary["complete"] is True
+    assert summary["source"] == BACKUP_SOURCE
+    assert summary["device"]["product_type"] == "iPhone1,1"
+    assert summary["device"]["product_version"] == "1.0"
+    assert summary["backup"]["encrypted"] is False
+    assert summary["backup"]["snapshot_state"] == "finished"
+    assert summary["files"]["manifest_count"] == 2
+    assert summary["files"]["filesystem_count"] == 4
+    assert summary["metadata_files"]["Manifest.db"]["size"] > 0
+
+
 def test_validate_backup_accepts_encrypted_manifest_db_without_sqlite_parse(tmp_path: Path) -> None:
     create_test_backup(tmp_path, encrypted=True)
 

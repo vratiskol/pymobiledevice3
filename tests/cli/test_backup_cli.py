@@ -12,7 +12,13 @@ def create_complete_backup(tmp_path):
     source = "test-source"
     device_directory = tmp_path / source
     device_directory.mkdir()
-    (device_directory / "Info.plist").write_bytes(plistlib.dumps({"Product Type": "iPhone1,1"}))
+    (device_directory / "Info.plist").write_bytes(
+        plistlib.dumps({
+            "Build Version": "23A000",
+            "Product Type": "iPhone1,1",
+            "Product Version": "1.0",
+        })
+    )
     (device_directory / "Manifest.plist").write_bytes(plistlib.dumps({"IsEncrypted": False, "Version": "10.0"}))
     (device_directory / "Status.plist").write_bytes(plistlib.dumps({"SnapshotState": "finished"}))
     with closing(sqlite3.connect(device_directory / "Manifest.db")) as connection:
@@ -76,6 +82,17 @@ def test_backup_command_has_verify_subcommand():
     assert "Validate local backup metadata" in result.output
 
 
+def test_backup_command_has_summary_subcommand():
+    runner = CliRunner()
+
+    result = runner.invoke(__main__.app, ["backup2", "summary", "--help"])
+
+    assert result.exit_code == 0
+    assert "Export a local backup metadata summary" in result.output
+    assert "--filesystem-summary" in result.output
+    assert "filesystem file count" in result.output
+
+
 def test_backup_verify_outputs_validation_summary(tmp_path):
     source = create_complete_backup(tmp_path)
     runner = CliRunner()
@@ -88,6 +105,41 @@ def test_backup_verify_outputs_validation_summary(tmp_path):
     assert output["source"] == source
     assert output["manifest_file_count"] == 1
     assert output["required_file_sizes"]["Manifest.db"] > 0
+
+
+def test_backup_summary_outputs_metadata_export(tmp_path):
+    source = create_complete_backup(tmp_path)
+    runner = CliRunner()
+
+    result = runner.invoke(__main__.app, ["backup2", "summary", "--source", source, str(tmp_path)])
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["complete"] is True
+    assert output["source"] == source
+    assert output["device"]["product_type"] == "iPhone1,1"
+    assert output["device"]["product_version"] == "1.0"
+    assert output["backup"]["encrypted"] is False
+    assert output["backup"]["snapshot_state"] == "finished"
+    assert output["files"]["manifest_count"] == 1
+    assert output["files"]["filesystem_count"] == 4
+    assert output["metadata_files"]["Manifest.db"]["size"] > 0
+
+
+def test_backup_summary_can_skip_filesystem_walk(tmp_path):
+    source = create_complete_backup(tmp_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        __main__.app,
+        ["backup2", "summary", "--no-filesystem-summary", "--source", source, str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["files"]["manifest_count"] == 1
+    assert output["files"]["filesystem_count"] is None
+    assert output["files"]["filesystem_size"] is None
 
 
 def test_backup_verify_reports_incomplete_backup_without_traceback(tmp_path):

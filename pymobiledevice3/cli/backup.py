@@ -158,6 +158,34 @@ def verify(backup_directory: BackupDirectoryArg, source: SourceOption = "") -> N
 
 
 @cli.command()
+def summary(
+    backup_directory: BackupDirectoryArg,
+    source: SourceOption = "",
+    filesystem_summary: Annotated[
+        bool,
+        typer.Option(
+            "--filesystem-summary/--no-filesystem-summary",
+            help="Walk the backup directory to include filesystem file count and total size.",
+        ),
+    ] = True,
+) -> None:
+    """
+    Export a local backup metadata summary without connecting to a device.
+    """
+    try:
+        source = Mobilebackup2Service.resolve_backup_source(backup_directory, source)
+        result = Mobilebackup2Service.validate_backup(
+            backup_directory,
+            source,
+            include_file_summary=filesystem_summary,
+        )
+    except BackupValidationError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    print_json(result.to_summary_dict(), colored=False)
+
+
+@cli.command()
 @async_command
 async def restore(
     service_provider: ServiceProviderDep,

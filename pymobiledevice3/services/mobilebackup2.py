@@ -149,6 +149,37 @@ class BackupValidationResult:
             "status": status_summary,
         }
 
+    def to_summary_dict(self) -> dict:
+        return {
+            "complete": True,
+            "source": self.identifier,
+            "path": str(self.device_directory),
+            "device": {
+                "build_version": self.info.get("Build Version"),
+                "itunes_version": self.info.get("iTunes Version"),
+                "product_type": self.info.get("Product Type"),
+                "product_version": self.info.get("Product Version"),
+                "target_type": self.info.get("Target Type"),
+            },
+            "backup": {
+                "backup_state": self.status.get("BackupState"),
+                "date": self.manifest.get("Date"),
+                "encrypted": self.is_encrypted,
+                "is_full_backup": self.status.get("IsFullBackup"),
+                "manifest_version": self.manifest.get("Version"),
+                "snapshot_state": self.status.get("SnapshotState"),
+                "status_date": self.status.get("Date"),
+                "status_version": self.status.get("Version"),
+                "was_passcode_set": self.manifest.get("WasPasscodeSet"),
+            },
+            "files": {
+                "filesystem_count": self.filesystem_file_count,
+                "filesystem_size": self.filesystem_size,
+                "manifest_count": self.manifest_file_count,
+            },
+            "metadata_files": {name: {"size": size} for name, size in sorted(self.required_file_sizes.items())},
+        }
+
 
 BackupFilterCallback = Callable[[BackupFile], bool]
 
