@@ -79,6 +79,12 @@ BACKUP_METADATA_FILES = frozenset({
 })
 INCREMENTAL_BACKUP_REQUIRED_FILES = ("Manifest.plist", "Manifest.db", "Status.plist")
 REQUIRED_BACKUP_METADATA_FILES = ("Info.plist", "Manifest.plist", "Manifest.db", "Status.plist")
+BACKUP_STAGE_DEVICE_TRANSFER = "device_transfer"
+BACKUP_STAGE_DEVICE_TRANSFER_COMPLETE = "device_transfer_complete"
+BACKUP_STAGE_LOCAL_FILTERING = "local_filtering"
+BACKUP_STAGE_LOCAL_VALIDATION = "local_validation"
+BACKUP_STAGE_LOCAL_UNBACK = "local_unback"
+BACKUP_STAGE_COMPLETE = "complete"
 
 
 @dataclass(frozen=True)
@@ -151,6 +157,7 @@ class BackupValidationResult:
 
 
 BackupFilterCallback = Callable[[BackupFile], bool]
+BackupStageCallback = Callable[[str], None]
 
 
 BACKUP_SELECTIONS = {
@@ -206,6 +213,7 @@ class Mobilebackup2Service(LockdownService):
         filter_callback: Optional[BackupFilterCallback] = None,
         password: str = "",
         unback: bool = False,
+        stage_callback: Optional[BackupStageCallback] = None,
     ) -> None:
         """
         Backup a device.
@@ -215,6 +223,7 @@ class Mobilebackup2Service(LockdownService):
         :param filter_callback: Callback deciding whether to keep a backup file.
         :param password: Password of the backup if it is encrypted.
         :param unback: Also unpack the completed backup locally using pyiosbackup.
+        :param stage_callback: Callback called when backup execution enters a new stage.
         The function shall receive the percentage as a parameter.
         """
         backup_directory = Path(backup_directory)
@@ -266,10 +275,14 @@ class Mobilebackup2Service(LockdownService):
                     manifest_path.unlink(missing_ok=True)
                 (device_directory / "Manifest.plist").touch()
 
+                self._emit_backup_stage(stage_callback, BACKUP_STAGE_DEVICE_TRANSFER)
                 await dl.send_process_message({"MessageName": "Backup", "TargetIdentifier": self.lockdown.udid})
                 await dl.dl_loop(progress_callback)
+                self._emit_backup_stage(stage_callback, BACKUP_STAGE_DEVICE_TRANSFER_COMPLETE)
                 if filter_callback is not None:
+                    self._emit_backup_stage(stage_callback, BACKUP_STAGE_LOCAL_FILTERING)
                     self.prune_backup_directory(device_directory, filter_callback, password=password)
+                self._emit_backup_stage(stage_callback, BACKUP_STAGE_LOCAL_VALIDATION)
                 validation_result = self.validate_backup(
                     backup_directory,
                     self.lockdown.udid,
@@ -283,7 +296,9 @@ class Mobilebackup2Service(LockdownService):
                     validation_result.filesystem_size,
                 )
                 if unback:
+                    self._emit_backup_stage(stage_callback, BACKUP_STAGE_LOCAL_UNBACK)
                     self.unback_with_pyiosbackup(device_directory, password=password)
+                self._emit_backup_stage(stage_callback, BACKUP_STAGE_COMPLETE)
             finally:
                 notification_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -323,6 +338,11 @@ class Mobilebackup2Service(LockdownService):
             self.logger.warning("User has cancelled the backup process on the device")
         else:
             self.logger.debug("Received backup notification: %s", event)
+
+    @staticmethod
+    def _emit_backup_stage(stage_callback: Optional[BackupStageCallback], stage: str) -> None:
+        if stage_callback is not None:
+            stage_callback(stage)
 
     async def restore(
         self,

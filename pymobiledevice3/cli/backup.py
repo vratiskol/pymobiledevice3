@@ -11,7 +11,15 @@ from typer_injector import InjectingTyper
 
 from pymobiledevice3.cli.cli_common import ServiceProviderDep, async_command, print_json
 from pymobiledevice3.exceptions import BackupValidationError
-from pymobiledevice3.services.mobilebackup2 import BACKUP_SELECTIONS, Mobilebackup2Service
+from pymobiledevice3.services.mobilebackup2 import (
+    BACKUP_SELECTIONS,
+    BACKUP_STAGE_COMPLETE,
+    BACKUP_STAGE_DEVICE_TRANSFER_COMPLETE,
+    BACKUP_STAGE_LOCAL_FILTERING,
+    BACKUP_STAGE_LOCAL_UNBACK,
+    BACKUP_STAGE_LOCAL_VALIDATION,
+    Mobilebackup2Service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +86,13 @@ BackupRegexOption = Annotated[
         help="Preserve only backup payloads whose device path or manifest path matches this regex. Repeat to keep multiple regexes.",
     ),
 ]
+BACKUP_STAGE_MESSAGES = {
+    BACKUP_STAGE_DEVICE_TRANSFER_COMPLETE: "Device transfer complete. Finalizing local backup.",
+    BACKUP_STAGE_LOCAL_FILTERING: "Applying backup file filters.",
+    BACKUP_STAGE_LOCAL_VALIDATION: "Validating completed backup metadata.",
+    BACKUP_STAGE_LOCAL_UNBACK: "Unpacking completed backup.",
+    BACKUP_STAGE_COMPLETE: "Backup complete.",
+}
 
 
 @cli.command()
@@ -128,16 +143,27 @@ async def backup(
             )
 
         with tqdm(total=100, dynamic_ncols=True) as pbar:
+            progress_closed = False
 
             def update_bar(percentage) -> None:
                 pbar.n = percentage
                 pbar.refresh()
+
+            def update_stage(stage: str) -> None:
+                nonlocal progress_closed
+                if stage == BACKUP_STAGE_DEVICE_TRANSFER_COMPLETE and not progress_closed:
+                    pbar.close()
+                    progress_closed = True
+                message = BACKUP_STAGE_MESSAGES.get(stage)
+                if message is not None:
+                    click.echo(message)
 
             await backup_client.backup(
                 full=full,
                 backup_directory=str(backup_directory),
                 progress_callback=update_bar,
                 filter_callback=filter_callback,
+                stage_callback=update_stage,
                 password=password,
                 unback=unback,
             )

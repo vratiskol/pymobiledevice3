@@ -6,6 +6,14 @@ from contextlib import closing
 from typer.testing import CliRunner
 
 from pymobiledevice3 import __main__
+from pymobiledevice3.cli.backup import BACKUP_STAGE_MESSAGES
+from pymobiledevice3.services.mobilebackup2 import (
+    BACKUP_STAGE_COMPLETE,
+    BACKUP_STAGE_DEVICE_TRANSFER_COMPLETE,
+    BACKUP_STAGE_LOCAL_FILTERING,
+    BACKUP_STAGE_LOCAL_UNBACK,
+    BACKUP_STAGE_LOCAL_VALIDATION,
+)
 
 
 def create_complete_backup(tmp_path):
@@ -65,6 +73,14 @@ def test_backup_full_help_describes_conditional_default():
     assert "full for an" in normalized_output
     assert "empty or incomplete backup" in normalized_output
     assert "directory" in normalized_output
+
+
+def test_backup_stage_messages_cover_local_finalization_steps():
+    assert BACKUP_STAGE_MESSAGES[BACKUP_STAGE_DEVICE_TRANSFER_COMPLETE].startswith("Device transfer complete")
+    assert BACKUP_STAGE_MESSAGES[BACKUP_STAGE_LOCAL_FILTERING] == "Applying backup file filters."
+    assert BACKUP_STAGE_MESSAGES[BACKUP_STAGE_LOCAL_VALIDATION] == "Validating completed backup metadata."
+    assert BACKUP_STAGE_MESSAGES[BACKUP_STAGE_LOCAL_UNBACK] == "Unpacking completed backup."
+    assert BACKUP_STAGE_MESSAGES[BACKUP_STAGE_COMPLETE] == "Backup complete."
 
 
 def test_backup_command_has_verify_subcommand():

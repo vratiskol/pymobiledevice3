@@ -15,6 +15,12 @@ from pymobiledevice3.services.device_link import DeviceLink
 from pymobiledevice3.services.mobilebackup2 import (
     BACKUP_OBSERVED_NOTIFICATIONS,
     BACKUP_SELECTIONS,
+    BACKUP_STAGE_COMPLETE,
+    BACKUP_STAGE_DEVICE_TRANSFER,
+    BACKUP_STAGE_DEVICE_TRANSFER_COMPLETE,
+    BACKUP_STAGE_LOCAL_FILTERING,
+    BACKUP_STAGE_LOCAL_UNBACK,
+    BACKUP_STAGE_LOCAL_VALIDATION,
     NP_LOCAL_AUTH_DISMISSED,
     NP_LOCAL_AUTH_PRESENTED,
     NP_SYNC_CANCEL_REQUEST,
@@ -282,6 +288,33 @@ def test_log_backup_notification_surfaces_passcode_prompt_to_operator() -> None:
     service.logger.warning.assert_any_call("Please enter the device passcode to continue the backup")
     service.logger.info.assert_called_once_with("Device passcode prompt dismissed")
     service.logger.warning.assert_any_call("User has cancelled the backup process on the device")
+
+
+def test_emit_backup_stage_calls_callback() -> None:
+    observed = []
+
+    for stage in (
+        BACKUP_STAGE_DEVICE_TRANSFER,
+        BACKUP_STAGE_DEVICE_TRANSFER_COMPLETE,
+        BACKUP_STAGE_LOCAL_FILTERING,
+        BACKUP_STAGE_LOCAL_VALIDATION,
+        BACKUP_STAGE_LOCAL_UNBACK,
+        BACKUP_STAGE_COMPLETE,
+    ):
+        Mobilebackup2Service._emit_backup_stage(observed.append, stage)
+
+    assert observed == [
+        BACKUP_STAGE_DEVICE_TRANSFER,
+        BACKUP_STAGE_DEVICE_TRANSFER_COMPLETE,
+        BACKUP_STAGE_LOCAL_FILTERING,
+        BACKUP_STAGE_LOCAL_VALIDATION,
+        BACKUP_STAGE_LOCAL_UNBACK,
+        BACKUP_STAGE_COMPLETE,
+    ]
+
+
+def test_emit_backup_stage_allows_missing_callback() -> None:
+    Mobilebackup2Service._emit_backup_stage(None, BACKUP_STAGE_LOCAL_VALIDATION)
 
 
 def test_unback_with_pyiosbackup_replaces_existing_output(monkeypatch, tmp_path: Path) -> None:
