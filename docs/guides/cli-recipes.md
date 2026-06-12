@@ -46,7 +46,7 @@ pymobiledevice3 apps list
 # Query specific app bundle IDs
 pymobiledevice3 apps query BUNDLE_ID1 BUNDLE_ID2
 
-# Full backup
+# Full backup; also replaces an incomplete previous attempt in the same directory
 pymobiledevice3 backup2 backup --full DIRECTORY
 
 # Validate a completed local backup

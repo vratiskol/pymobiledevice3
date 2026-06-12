@@ -258,6 +258,41 @@ def test_validate_backup_reports_invalid_manifest_db(tmp_path: Path) -> None:
         Mobilebackup2Service.validate_backup(tmp_path, BACKUP_SOURCE)
 
 
+def test_validate_backup_start_state_allows_new_backup_directory(tmp_path: Path) -> None:
+    Mobilebackup2Service.validate_backup_start_state(tmp_path, BACKUP_SOURCE, full=False)
+
+
+def test_validate_backup_start_state_allows_empty_device_directory(tmp_path: Path) -> None:
+    (tmp_path / BACKUP_SOURCE).mkdir()
+
+    Mobilebackup2Service.validate_backup_start_state(tmp_path, BACKUP_SOURCE, full=False)
+
+
+def test_validate_backup_start_state_allows_complete_incremental_source(tmp_path: Path) -> None:
+    create_test_backup(tmp_path)
+
+    Mobilebackup2Service.validate_backup_start_state(tmp_path, BACKUP_SOURCE, full=False)
+
+
+def test_validate_backup_start_state_allows_full_retry_with_partial_metadata(tmp_path: Path) -> None:
+    device_directory = tmp_path / BACKUP_SOURCE
+    device_directory.mkdir()
+    (device_directory / "Info.plist").write_bytes(plistlib.dumps({}))
+    (device_directory / "Manifest.plist").write_bytes(b"")
+
+    Mobilebackup2Service.validate_backup_start_state(tmp_path, BACKUP_SOURCE, full=True)
+
+
+def test_validate_backup_start_state_rejects_partial_incremental_source(tmp_path: Path) -> None:
+    device_directory = tmp_path / BACKUP_SOURCE
+    device_directory.mkdir()
+    (device_directory / "Info.plist").write_bytes(plistlib.dumps({}))
+    (device_directory / "Manifest.plist").write_bytes(b"")
+
+    with pytest.raises(BackupValidationError, match="Cannot continue incremental backup"):
+        Mobilebackup2Service.validate_backup_start_state(tmp_path, BACKUP_SOURCE, full=False)
+
+
 @pytest.mark.asyncio
 async def test_observe_backup_notifications_registers_passcode_and_backup_notifications() -> None:
     notification_proxy = Mock()

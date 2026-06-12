@@ -127,20 +127,34 @@ async def backup(
                 param_hint="--password",
             )
 
+        try:
+            backup_client.validate_backup_start_state(
+                backup_directory,
+                backup_client.lockdown.udid,
+                full=full or filter_callback is not None,
+            )
+        except BackupValidationError as exc:
+            click.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(code=1) from None
+
         with tqdm(total=100, dynamic_ncols=True) as pbar:
 
             def update_bar(percentage) -> None:
                 pbar.n = percentage
                 pbar.refresh()
 
-            await backup_client.backup(
-                full=full,
-                backup_directory=str(backup_directory),
-                progress_callback=update_bar,
-                filter_callback=filter_callback,
-                password=password,
-                unback=unback,
-            )
+            try:
+                await backup_client.backup(
+                    full=full,
+                    backup_directory=str(backup_directory),
+                    progress_callback=update_bar,
+                    filter_callback=filter_callback,
+                    password=password,
+                    unback=unback,
+                )
+            except BackupValidationError as exc:
+                click.echo(f"Error: {exc}", err=True)
+                raise typer.Exit(code=1) from None
 
 
 @cli.command()

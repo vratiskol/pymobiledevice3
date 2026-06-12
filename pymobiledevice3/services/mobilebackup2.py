@@ -79,6 +79,7 @@ BACKUP_METADATA_FILES = frozenset({
 })
 INCREMENTAL_BACKUP_REQUIRED_FILES = ("Manifest.plist", "Manifest.db", "Status.plist")
 REQUIRED_BACKUP_METADATA_FILES = ("Info.plist", "Manifest.plist", "Manifest.db", "Status.plist")
+INCREMENTAL_BACKUP_RECOVERY_HINT = "Run a full backup or remove the incomplete backup directory before retrying."
 
 
 @dataclass(frozen=True)
@@ -219,6 +220,7 @@ class Mobilebackup2Service(LockdownService):
         """
         backup_directory = Path(backup_directory)
         device_directory = backup_directory / self.lockdown.udid
+        self.validate_backup_start_state(backup_directory, self.lockdown.udid, full=full)
         device_directory.mkdir(exist_ok=True, mode=0o755, parents=True)
         full = self._should_do_full_backup(full, device_directory, filter_callback)
 
@@ -631,6 +633,30 @@ class Mobilebackup2Service(LockdownService):
     @staticmethod
     def _assert_backup_exists(backup_directory: Path, identifier: str):
         Mobilebackup2Service.validate_backup(backup_directory, identifier)
+
+    @classmethod
+    def validate_backup_start_state(cls, backup_directory: Union[str, Path], identifier: str, *, full: bool) -> None:
+        if full:
+            return
+
+        device_directory = Path(backup_directory) / identifier
+        if not device_directory.exists():
+            return
+        if not device_directory.is_dir():
+            raise BackupValidationError(
+                f"Cannot continue incremental backup for source {identifier}: backup path is not a directory. "
+                f"{INCREMENTAL_BACKUP_RECOVERY_HINT}"
+            )
+        if not any(device_directory.iterdir()):
+            return
+
+        try:
+            cls.validate_backup(backup_directory, identifier)
+        except BackupValidationError as exc:
+            raise BackupValidationError(
+                f"Cannot continue incremental backup for source {identifier}: existing backup metadata is "
+                f"incomplete ({exc}). {INCREMENTAL_BACKUP_RECOVERY_HINT}"
+            ) from exc
 
     @staticmethod
     def resolve_backup_source(backup_directory: Union[str, Path], identifier: str = "") -> str:
