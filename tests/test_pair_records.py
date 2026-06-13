@@ -1,7 +1,11 @@
 import base64
 import plistlib
 
+import pytest
+
+from pymobiledevice3 import pair_records
 from pymobiledevice3.pair_records import (
+    delete_lockdown_pairing_record,
     describe_lockdown_pairing_record,
     get_local_pairing_record_path,
     get_lockdown_pairing_record_summary,
@@ -87,3 +91,93 @@ def test_lockdown_pairing_record_summary_rejects_non_dictionary_plist(tmp_path):
 
     assert summary["valid"] is False
     assert summary["error"] == "pair record is not a plist dictionary"
+
+
+def test_delete_lockdown_pairing_record_dry_run(tmp_path):
+    path = _write_lockdown_pair_record(tmp_path)
+
+    result = delete_lockdown_pairing_record("device-1", tmp_path, dry_run=True, include_path=False)
+
+    assert path.exists()
+    assert result == {
+        "identifier": "device-1",
+        "exists": True,
+        "deleted": False,
+        "dry_run": True,
+        "records": [
+            {
+                "identifier": "device-1",
+                "source": "local",
+                "exists": True,
+                "deleted": False,
+                "dry_run": True,
+            }
+        ],
+    }
+
+
+def test_delete_lockdown_pairing_record(tmp_path):
+    path = _write_lockdown_pair_record(tmp_path)
+
+    result = delete_lockdown_pairing_record("device-1", tmp_path, include_path=False)
+
+    assert not path.exists()
+    assert result["deleted"] is True
+    assert result["records"][0]["deleted"] is True
+    assert result["records"][0]["exists"] is False
+
+
+def test_delete_lockdown_pairing_record_missing_ok(tmp_path):
+    result = delete_lockdown_pairing_record("missing", tmp_path, missing_ok=True, include_path=False)
+
+    assert result == {
+        "identifier": "missing",
+        "exists": False,
+        "deleted": False,
+        "dry_run": False,
+        "records": [
+            {
+                "identifier": "missing",
+                "source": "local",
+                "exists": False,
+                "deleted": False,
+                "dry_run": False,
+            }
+        ],
+    }
+
+
+def test_delete_lockdown_pairing_record_missing_fails(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        delete_lockdown_pairing_record("missing", tmp_path)
+
+
+def test_delete_lockdown_pairing_record_does_not_include_itunes_by_default(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    local_path = _write_lockdown_pair_record(tmp_path)
+    itunes_path = tmp_path / "itunes" / "device-1.plist"
+    itunes_path.parent.mkdir()
+    itunes_path.write_bytes(local_path.read_bytes())
+    monkeypatch.setattr(pair_records, "get_itunes_pairing_record_path", lambda identifier: itunes_path)
+
+    result = delete_lockdown_pairing_record("device-1", tmp_path, include_path=False)
+
+    assert result["deleted"] is True
+    assert not local_path.exists()
+    assert itunes_path.exists()
+    assert [record["source"] for record in result["records"]] == ["local"]
+
+
+def test_delete_lockdown_pairing_record_can_include_itunes(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    local_path = _write_lockdown_pair_record(tmp_path)
+    itunes_path = tmp_path / "itunes" / "device-1.plist"
+    itunes_path.parent.mkdir()
+    itunes_path.write_bytes(local_path.read_bytes())
+    monkeypatch.setattr(pair_records, "get_itunes_pairing_record_path", lambda identifier: itunes_path)
+
+    result = delete_lockdown_pairing_record("device-1", tmp_path, include_itunes=True, include_path=False)
+
+    assert result["deleted"] is True
+    assert not local_path.exists()
+    assert not itunes_path.exists()
+    assert [record["source"] for record in result["records"]] == ["local", "itunes"]
+    assert all(record["deleted"] is True for record in result["records"])

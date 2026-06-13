@@ -241,6 +241,47 @@ def get_lockdown_pairing_record_summary(
     }
 
 
+def delete_lockdown_pairing_record(
+    identifier: str,
+    pairing_records_cache_folder: Optional[Path] = None,
+    include_itunes: bool = False,
+    missing_ok: bool = False,
+    dry_run: bool = False,
+    include_path: bool = True,
+) -> dict:
+    targets = [("local", get_local_pairing_record_path(identifier, pairing_records_cache_folder))]
+    if include_itunes:
+        targets.append(("itunes", get_itunes_pairing_record_path(identifier)))
+
+    records = []
+    for source, path in targets:
+        entry = {
+            "identifier": identifier,
+            "source": source,
+            "exists": path.exists(),
+            "deleted": False,
+            "dry_run": dry_run,
+        }
+        if include_path:
+            entry["path"] = str(path)
+        if entry["exists"] and not dry_run:
+            path.unlink()
+            entry["deleted"] = True
+            entry["exists"] = False
+        records.append(entry)
+
+    if not any(record["deleted"] or (record["exists"] and dry_run) for record in records) and not missing_ok:
+        raise FileNotFoundError(get_local_pairing_record_path(identifier, pairing_records_cache_folder))
+
+    return {
+        "identifier": identifier,
+        "exists": any(record["exists"] for record in records),
+        "deleted": any(record["deleted"] for record in records),
+        "dry_run": dry_run,
+        "records": records,
+    }
+
+
 async def get_preferred_pair_record(
     identifier: str, pairing_records_cache_folder: Path, usbmux_address: Optional[str] = None
 ) -> dict:

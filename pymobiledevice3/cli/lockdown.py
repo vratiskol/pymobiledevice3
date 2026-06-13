@@ -25,6 +25,7 @@ from pymobiledevice3.lockdown import SERVICE_PORT, TcpLockdownClient, create_usi
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.pair_records import (
     create_pairing_records_cache_folder,
+    delete_lockdown_pairing_record,
     generate_host_id,
     get_itunes_pairing_record,
     get_local_pairing_record,
@@ -433,6 +434,49 @@ def lockdown_pair_record(
             include_path=include_path,
         )
     )
+
+
+@cli.command("delete-pair-record")
+def lockdown_delete_pair_record(
+    udid: str,
+    pairing_records_cache_folder: Annotated[
+        Optional[Path],
+        typer.Option(help="Directory containing pymobiledevice3 lockdown pairing records."),
+    ] = None,
+    include_itunes: Annotated[
+        bool,
+        typer.Option(
+            "--include-itunes/--no-include-itunes",
+            help="Also delete matching iTunes/libimobiledevice pair records.",
+        ),
+    ] = False,
+    missing_ok: Annotated[
+        bool,
+        typer.Option(help="Do not fail if no matching record exists."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(help="Report matching records without deleting them."),
+    ] = False,
+    include_path: Annotated[
+        bool,
+        typer.Option("--include-path/--no-include-path", help="Include local filesystem paths in output."),
+    ] = True,
+) -> None:
+    """delete local lockdown pair records for a device"""
+    try:
+        print_json(
+            delete_lockdown_pairing_record(
+                udid,
+                pairing_records_cache_folder=pairing_records_cache_folder,
+                include_itunes=include_itunes,
+                missing_ok=missing_ok,
+                dry_run=dry_run,
+                include_path=include_path,
+            )
+        )
+    except FileNotFoundError as e:
+        raise typer.BadParameter(f"pair record not found: {udid}") from e
 
 
 @cli.command("pair-supervised")

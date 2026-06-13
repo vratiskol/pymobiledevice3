@@ -62,3 +62,92 @@ def test_lockdown_pair_record_shows_missing_record(tmp_path):
     assert payload["identifier"] == "missing"
     assert payload["exists"] is False
     assert payload["records"] == []
+
+
+def test_lockdown_delete_pair_record_dry_run(tmp_path):
+    _write_lockdown_pair_record(tmp_path)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "--no-color",
+            "lockdown",
+            "delete-pair-record",
+            "device-1",
+            "--pairing-records-cache-folder",
+            str(tmp_path),
+            "--dry-run",
+            "--no-include-path",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "device-1.plist").exists()
+    payload = json.loads(result.output)
+    assert payload["identifier"] == "device-1"
+    assert payload["deleted"] is False
+    assert payload["dry_run"] is True
+    assert payload["records"][0]["source"] == "local"
+    assert "path" not in payload["records"][0]
+
+
+def test_lockdown_delete_pair_record_deletes_local_record(tmp_path):
+    _write_lockdown_pair_record(tmp_path)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "--no-color",
+            "lockdown",
+            "delete-pair-record",
+            "device-1",
+            "--pairing-records-cache-folder",
+            str(tmp_path),
+            "--no-include-path",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "device-1.plist").exists()
+    payload = json.loads(result.output)
+    assert payload["deleted"] is True
+    assert payload["records"][0]["deleted"] is True
+
+
+def test_lockdown_delete_pair_record_missing_ok(tmp_path):
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "--no-color",
+            "lockdown",
+            "delete-pair-record",
+            "missing",
+            "--pairing-records-cache-folder",
+            str(tmp_path),
+            "--missing-ok",
+            "--no-include-path",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["identifier"] == "missing"
+    assert payload["deleted"] is False
+    assert payload["records"][0]["exists"] is False
+
+
+def test_lockdown_delete_pair_record_missing_fails(tmp_path):
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "--no-color",
+            "lockdown",
+            "delete-pair-record",
+            "missing",
+            "--pairing-records-cache-folder",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "pair record not found: missing" in result.output
