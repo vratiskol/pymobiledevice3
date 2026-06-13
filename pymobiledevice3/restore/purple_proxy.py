@@ -10,12 +10,15 @@ PURPLE_PROXY_SOCKS_PORT = 1081
 PURPLE_PROXY_CONTROL_PORT = 1082
 PURPLE_PROXY_NOTIFY_PORT = 1084
 PURPLE_PROXY_CONTROL_PROTOCOL_VERSION = 1
+PURPLE_PROXY_LOOPBACK_HOST = "127.0.0.1"
 PURPLE_PROXY_COMMAND_KEY = "Command"
 PURPLE_PROXY_CTRL_PROTO_VERSION_KEY = "CtrlProtoVersion"
 PURPLE_PROXY_CONN_PORT_KEY = "ConnPort"
 PURPLE_PROXY_CONN_PROTO_VERSION_KEY = "ConnProtoVersion"
 PURPLE_PROXY_IDENTIFIER_KEY = "Identifier"
 PURPLE_PROXY_LEVEL_KEY = "Level"
+PURPLE_PROXY_SOCKS_PROXY_HOST_KEY = "SOCKSProxyHost"
+PURPLE_PROXY_SOCKS_PROXY_PORT_KEY = "SOCKSProxyPort"
 SENSITIVE_PURPLE_PROXY_KEYS = (
     "ecid",
     "serial",
@@ -35,6 +38,36 @@ class PurpleProxyCommand(str, Enum):
     REGISTER_NOTIFY = "RegisterNotify"
     SET_LOG_LEVEL = "SetLogLevel"
     PING = "Ping"
+
+
+def format_purple_proxy_socks_url(host: str = PURPLE_PROXY_LOOPBACK_HOST, port: int = PURPLE_PROXY_SOCKS_PORT) -> str:
+    return f"socks://{host}:{port}/"
+
+
+def build_purple_proxy_dictionary(
+    *,
+    url: str,
+    host: str = PURPLE_PROXY_LOOPBACK_HOST,
+    socks_port: int = PURPLE_PROXY_SOCKS_PORT,
+    test_reachability: bool = True,
+) -> dict[str, Any]:
+    return {
+        "checked": True,
+        "source": "libReverseProxyDevice",
+        "function": "CopyProxyDictionaryWithOptions",
+        "url": url,
+        "test_reachability": test_reachability,
+        "proxy_url": format_purple_proxy_socks_url(host=host, port=socks_port),
+        "proxy_dictionary": {
+            PURPLE_PROXY_SOCKS_PROXY_HOST_KEY: host,
+            PURPLE_PROXY_SOCKS_PROXY_PORT_KEY: socks_port,
+        },
+        "requires_ping": True,
+    }
+
+
+def is_purple_proxy_pong_response(response: dict[str, Any]) -> bool:
+    return response.get(PURPLE_PROXY_COMMAND_KEY) == "Pong" or response.get("Pong") is True
 
 
 def sanitize_purple_proxy_response(value: Any) -> Any:
@@ -271,8 +304,10 @@ async def run_purple_proxy_control_command(
             response = await asyncio.wait_for(client.begin_control(protocol_version=protocol_version), timeout=timeout)
         elif command is PurpleProxyCommand.WAIT_SOCKET:
             response = await asyncio.wait_for(client.wait_socket(conn_port=conn_port), timeout=timeout)
-        else:
+        elif command is PurpleProxyCommand.PING:
             response = await asyncio.wait_for(client.send_ping(), timeout=timeout)
+        else:
+            raise ValueError(f"unsupported PurpleReverseProxy control command: {command.value}")
     except Exception as e:
         result.update({
             "reachable": False,
@@ -289,6 +324,8 @@ async def run_purple_proxy_control_command(
         "reachable": True,
         "response_keys": sorted(str(key) for key in sanitized_response),
     })
+    if command is PurpleProxyCommand.PING:
+        result["pong"] = is_purple_proxy_pong_response(sanitized_response)
     if include_response:
         result["response"] = sanitized_response
     return result

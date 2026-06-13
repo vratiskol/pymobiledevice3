@@ -10,6 +10,8 @@ from pymobiledevice3.restore.purple_proxy import (
     PURPLE_PROXY_SOCKS_PORT,
     PurpleProxyClient,
     PurpleProxyCommand,
+    build_purple_proxy_dictionary,
+    is_purple_proxy_pong_response,
     probe_purple_proxy_hello,
     run_purple_proxy_control_command,
     run_purple_proxy_notify_command,
@@ -53,6 +55,9 @@ class FakePurpleProxyClient:
 
     async def wait_socket(self, conn_port=PURPLE_PROXY_SOCKS_PORT):
         assert conn_port == 4321
+        return self.response
+
+    async def send_ping(self):
         return self.response
 
     async def register_notify(self):
@@ -222,6 +227,33 @@ def test_sanitize_purple_proxy_response_redacts_identifier_keys():
     }
 
 
+def test_build_purple_proxy_dictionary_matches_firmware_strings():
+    assert build_purple_proxy_dictionary(
+        url="https://example.test/path",
+        host="127.0.0.1",
+        socks_port=4321,
+        test_reachability=False,
+    ) == {
+        "checked": True,
+        "source": "libReverseProxyDevice",
+        "function": "CopyProxyDictionaryWithOptions",
+        "url": "https://example.test/path",
+        "test_reachability": False,
+        "proxy_url": "socks://127.0.0.1:4321/",
+        "proxy_dictionary": {
+            "SOCKSProxyHost": "127.0.0.1",
+            "SOCKSProxyPort": 4321,
+        },
+        "requires_ping": True,
+    }
+
+
+def test_is_purple_proxy_pong_response_accepts_known_shapes():
+    assert is_purple_proxy_pong_response({"Command": "Pong"}) is True
+    assert is_purple_proxy_pong_response({"Pong": True}) is True
+    assert is_purple_proxy_pong_response({"Command": "Error"}) is False
+
+
 @pytest.mark.asyncio
 async def test_probe_purple_proxy_hello_returns_sanitized_response(monkeypatch):
     fake_client = FakePurpleProxyClient({
@@ -338,6 +370,35 @@ async def test_run_purple_proxy_control_command_wait_socket_sends_conn_port(monk
         "reachable": True,
         "response_keys": ["SocketReady"],
         "response": {"SocketReady": True},
+    }
+    assert fake_client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_run_purple_proxy_control_command_ping_marks_pong(monkeypatch):
+    fake_client = FakePurpleProxyClient({"Command": "Pong"})
+
+    async def fake_connect_control(udid=None, **kwargs):
+        return fake_client
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_control", staticmethod(fake_connect_control))
+
+    result = await run_purple_proxy_control_command(
+        PurpleProxyCommand.PING,
+        timeout=0.1,
+        include_response=True,
+    )
+
+    assert result == {
+        "checked": True,
+        "experimental": True,
+        "command": "Ping",
+        "port": PURPLE_PROXY_CONTROL_PORT,
+        "include_response": True,
+        "reachable": True,
+        "response_keys": ["Command"],
+        "pong": True,
+        "response": {"Command": "Pong"},
     }
     assert fake_client.closed is True
 

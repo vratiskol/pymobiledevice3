@@ -47,8 +47,6 @@ PURPLE_REVERSE_PROXY_STRING_MARKERS = {
         "RegisterNotify",
         "SetLogLevel",
         "Level",
-        "sendPingMessage",
-        "sendProxyControlMessage",
         "RPSocketReadDictionary",
         "RPSocketWriteDictionary",
         "com.apple.PurpleReverseProxy",
@@ -58,6 +56,16 @@ PURPLE_REVERSE_PROXY_STRING_MARKERS = {
         "com.apple.private.PurpleReverseProxy.allowed",
     ],
     "device_library": [
+        "CopyProxyDictionary",
+        "CopyProxyDictionaryWithOptions",
+        "TestReachability",
+        "Ping",
+        "Pong",
+        "sendPingMessage",
+        "sendProxyControlMessage",
+        "socks://127.0.0.1:%d/",
+        "_kCFStreamPropertySOCKSProxyHost",
+        "_kCFStreamPropertySOCKSProxyPort",
         "RegisterNotify",
         "SetLogLevel",
         "Level",
@@ -117,6 +125,14 @@ PURPLE_REVERSE_PROXY_CATALOG = {
         "RegisterNotify",
         "SetLogLevel",
     ],
+    "proxy_dictionary": {
+        "function": "CopyProxyDictionaryWithOptions",
+        "test_reachability_option": "TestReachability",
+        "ping_command": "Ping",
+        "pong_response": "Pong",
+        "default_socks_host": "127.0.0.1",
+        "default_socks_port": 1081,
+    },
     "expected_ramdisk_paths": {
         "launchd_plist": str(PURPLE_REVERSE_PROXY_LAUNCHD_PATH),
         "executable": str(PURPLE_REVERSE_PROXY_EXECUTABLE_PATH),
@@ -373,6 +389,9 @@ def inspect_purple_reverse_proxy_root_deep(root: Path) -> dict[str, Any]:
         or strings["purple_reverse_proxy"]["markers"].get("BeginCtrl") is True,
         "notify_protocol_evidence": strings["purple_reverse_proxy"]["markers"].get("RegisterNotify") is True
         or strings["purple_reverse_proxy"]["markers"].get("SetLogLevel") is True,
+        "proxy_dictionary_evidence": strings["device_library"]["markers"].get("CopyProxyDictionaryWithOptions") is True
+        and strings["device_library"]["markers"].get("Ping") is True
+        and strings["device_library"]["markers"].get("Pong") is True,
         "entitlement_evidence": bool(entitlement_components),
         "active_live_probe_required": True,
     }

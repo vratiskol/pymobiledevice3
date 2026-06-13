@@ -63,6 +63,14 @@ def test_purple_reverse_proxy_catalog_exposes_restoreos_identifiers():
     assert "com.apple.PurpleReverseProxy.transaction" in PURPLE_REVERSE_PROXY_CATALOG["lockdown_services"]
     assert PURPLE_REVERSE_PROXY_CATALOG["restore_options"]["enable"] == "UsePurpleReverseProxy"
     assert PURPLE_REVERSE_PROXY_CATALOG["notify_commands"] == ["RegisterNotify", "SetLogLevel"]
+    assert PURPLE_REVERSE_PROXY_CATALOG["proxy_dictionary"] == {
+        "function": "CopyProxyDictionaryWithOptions",
+        "test_reachability_option": "TestReachability",
+        "ping_command": "Ping",
+        "pong_response": "Pong",
+        "default_socks_host": "127.0.0.1",
+        "default_socks_port": 1081,
+    }
 
 
 def test_parse_purple_reverse_proxy_launchd(tmp_path):
@@ -150,6 +158,8 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
     files = {
         "usr/libexec/PurpleReverseProxy": purple_proxy,
         "usr/lib/libReverseProxyDevice.dylib": (
+            b"CopyProxyDictionaryWithOptions TestReachability Ping Pong socks://127.0.0.1:%d/ "
+            b"_kCFStreamPropertySOCKSProxyHost _kCFStreamPropertySOCKSProxyPort "
             b"RegisterNotify SetLogLevel Level RPSocketReadDictionary com.apple.PurpleReverseProxy.RPSocket"
         ),
         "usr/local/bin/restored_update": b"/usr/lib/libReverseProxyDevice.dylib FDRSubmit",
@@ -174,6 +184,9 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
     assert deep["strings"]["purple_reverse_proxy"]["markers"]["HelloCtrl"] is True
     assert deep["strings"]["purple_reverse_proxy"]["markers"]["RegisterNotify"] is True
     assert deep["strings"]["device_library"]["markers"]["SetLogLevel"] is True
+    assert deep["strings"]["device_library"]["markers"]["CopyProxyDictionaryWithOptions"] is True
+    assert deep["strings"]["device_library"]["markers"]["Ping"] is True
+    assert deep["strings"]["device_library"]["markers"]["Pong"] is True
     assert deep["strings"]["amsupport_library"]["markers"]["UsePurpleReverseProxy"] is True
     assert deep["strings"]["fdr_library"]["markers"]["_AMFDRHttpCopyPurpleReverseProxyInformation"] is True
     assert deep["entitlements"]["com.apple.private.PurpleReverseProxy.allowed"]["present"] is True
@@ -184,6 +197,7 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
         "fdr_evidence": True,
         "control_protocol_evidence": True,
         "notify_protocol_evidence": True,
+        "proxy_dictionary_evidence": True,
         "entitlement_evidence": True,
         "active_live_probe_required": True,
     }
@@ -214,6 +228,7 @@ def test_restore_purple_control_help():
     assert "--hello" in result.output
     assert "--begin" in result.output
     assert "--wait-socket" in result.output
+    assert "--ping" in result.output
     assert "--timeout" in result.output
     assert "--conn-port" in result.output
     assert "--include-response" in result.output
@@ -329,6 +344,27 @@ def test_restore_purple_control_wait_socket_prints_json(monkeypatch):
     assert output["reachable"] is True
 
 
+def test_restore_purple_control_ping_prints_json(monkeypatch):
+    async def fake_run_purple_proxy_control_command(command, **kwargs):
+        assert command.value == "Ping"
+        return {
+            "checked": True,
+            "experimental": True,
+            "command": "Ping",
+            "reachable": True,
+            "pong": True,
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_control_command", fake_run_purple_proxy_control_command)
+
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-control", "--ping"])
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["command"] == "Ping"
+    assert output["pong"] is True
+
+
 def test_restore_purple_control_strict_fails_when_unreachable(monkeypatch):
     async def fake_run_purple_proxy_control_command(command, **kwargs):
         return {
@@ -345,6 +381,130 @@ def test_restore_purple_control_strict_fails_when_unreachable(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.output)["reachable"] is False
+
+
+def test_restore_purple_control_ping_strict_fails_when_not_pong(monkeypatch):
+    async def fake_run_purple_proxy_control_command(command, **kwargs):
+        return {
+            "checked": True,
+            "experimental": True,
+            "command": "Ping",
+            "reachable": True,
+            "pong": False,
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_control_command", fake_run_purple_proxy_control_command)
+
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-control", "--ping", "--strict"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.output)["pong"] is False
+
+
+def test_restore_purple_proxy_dict_help():
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-proxy-dict", "--help"])
+
+    assert result.exit_code == 0
+    assert "--url" in result.output
+    assert "--socks-port" in result.output
+    assert "--proxy-host" in result.output
+    assert "--no-test-reachability" in result.output
+    assert "--ping" in result.output
+
+
+def test_restore_purple_proxy_dict_prints_model_json():
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "restore",
+            "purple-proxy-dict",
+            "--url",
+            "https://example.test/path",
+            "--socks-port",
+            "4321",
+            "--no-test-reachability",
+        ],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output == {
+        "checked": True,
+        "source": "libReverseProxyDevice",
+        "function": "CopyProxyDictionaryWithOptions",
+        "url": "https://example.test/path",
+        "test_reachability": False,
+        "proxy_url": "socks://127.0.0.1:4321/",
+        "proxy_dictionary": {
+            "SOCKSProxyHost": "127.0.0.1",
+            "SOCKSProxyPort": 4321,
+        },
+        "requires_ping": True,
+    }
+
+
+def test_restore_purple_proxy_dict_ping_prints_redacted_json(monkeypatch):
+    async def fake_run_purple_proxy_control_command(command, **kwargs):
+        assert command.value == "Ping"
+        assert kwargs == {
+            "udid": "sensitive-udid",
+            "usbmux_address": "/tmp/usbmux",
+            "timeout": 0.5,
+            "port": 1234,
+            "include_response": True,
+        }
+        return {
+            "checked": True,
+            "experimental": True,
+            "command": "Ping",
+            "reachable": True,
+            "pong": True,
+            "response": {"SerialNumber": "<redacted>", "Command": "Pong"},
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_control_command", fake_run_purple_proxy_control_command)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "restore",
+            "purple-proxy-dict",
+            "--ping",
+            "--timeout",
+            "0.5",
+            "--control-port",
+            "1234",
+            "--include-response",
+            "--udid",
+            "sensitive-udid",
+            "--usbmux-address",
+            "/tmp/usbmux",
+        ],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["ping"]["pong"] is True
+    assert output["ping"]["response"] == {"SerialNumber": "<redacted>", "Command": "Pong"}
+    assert "sensitive-udid" not in result.output
+
+
+def test_restore_purple_proxy_dict_strict_fails_when_ping_is_not_pong(monkeypatch):
+    async def fake_run_purple_proxy_control_command(command, **kwargs):
+        return {
+            "checked": True,
+            "experimental": True,
+            "command": "Ping",
+            "reachable": True,
+            "pong": False,
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_control_command", fake_run_purple_proxy_control_command)
+
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-proxy-dict", "--ping", "--strict"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.output)["ping"]["pong"] is False
 
 
 def test_restore_purple_notify_help():

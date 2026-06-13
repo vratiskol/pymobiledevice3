@@ -42,9 +42,11 @@ from pymobiledevice3.restore.purple import (
 from pymobiledevice3.restore.purple_proxy import (
     PURPLE_PROXY_CONTROL_PORT,
     PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
+    PURPLE_PROXY_LOOPBACK_HOST,
     PURPLE_PROXY_NOTIFY_PORT,
     PURPLE_PROXY_SOCKS_PORT,
     PurpleProxyCommand,
+    build_purple_proxy_dictionary,
     run_purple_proxy_control_command,
     run_purple_proxy_notify_command,
 )
@@ -549,6 +551,10 @@ async def restore_purple_control(
         bool,
         typer.Option("--wait-socket", help="Send WaitSocket with ConnPort to the PurpleReverseProxy control port."),
     ] = False,
+    ping: Annotated[
+        bool,
+        typer.Option("--ping", help="Send Ping and validate a Pong response from the PurpleReverseProxy control port."),
+    ] = False,
     timeout: Annotated[
         float,
         typer.Option("--timeout", min=0.1, help="Timeout for connecting and waiting for a control reply."),
@@ -585,16 +591,18 @@ async def restore_purple_control(
     """
     Send experimental PurpleReverseProxy control messages without restoring a device.
     """
-    operation_count = int(hello) + int(begin) + int(wait_socket)
+    operation_count = int(hello) + int(begin) + int(wait_socket) + int(ping)
     if operation_count != 1:
-        raise click.ClickException("Choose exactly one control operation: --hello, --begin, or --wait-socket.")
+        raise click.ClickException("Choose exactly one control operation: --hello, --begin, --wait-socket, or --ping.")
 
     if hello:
         command = PurpleProxyCommand.HELLO_CONTROL
     elif begin:
         command = PurpleProxyCommand.BEGIN_CONTROL
-    else:
+    elif wait_socket:
         command = PurpleProxyCommand.WAIT_SOCKET
+    else:
+        command = PurpleProxyCommand.PING
 
     result = await run_purple_proxy_control_command(
         command,
@@ -607,7 +615,78 @@ async def restore_purple_control(
         include_response=include_response,
     )
     print_json(result, colored=False)
-    if strict and not result["reachable"]:
+    if strict and (not result["reachable"] or (command is PurpleProxyCommand.PING and not result.get("pong"))):
+        raise typer.Exit(1)
+
+
+@cli.command("purple-proxy-dict")
+@async_command
+async def restore_purple_proxy_dict(
+    url: Annotated[
+        str,
+        typer.Option("--url", help="URL passed to the modeled CopyProxyDictionaryWithOptions path."),
+    ] = "https://www.apple.com/",
+    socks_port: Annotated[
+        int,
+        typer.Option("--socks-port", min=1, max=0xFFFF, help="SOCKS port to place in the proxy dictionary."),
+    ] = PURPLE_PROXY_SOCKS_PORT,
+    proxy_host: Annotated[
+        str,
+        typer.Option("--proxy-host", help="SOCKS proxy host to place in the proxy dictionary."),
+    ] = PURPLE_PROXY_LOOPBACK_HOST,
+    no_test_reachability: Annotated[
+        bool,
+        typer.Option("--no-test-reachability", help="Model CopyProxyDictionaryWithOptions with TestReachability off."),
+    ] = False,
+    ping: Annotated[
+        bool,
+        typer.Option("--ping", help="Also send Ping to the PurpleReverseProxy control port."),
+    ] = False,
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", min=0.1, help="Timeout for the optional Ping operation."),
+    ] = 1.0,
+    control_port: Annotated[
+        int,
+        typer.Option("--control-port", min=1, max=0xFFFF, help="Device-side PurpleReverseProxy control port."),
+    ] = PURPLE_PROXY_CONTROL_PORT,
+    include_response: Annotated[
+        bool,
+        typer.Option("--include-response", help="Include the sanitized Ping response dictionary in JSON output."),
+    ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Exit non-zero when --ping is used and Ping is not reachable or not Pong."),
+    ] = False,
+    udid: Annotated[
+        Optional[str],
+        typer.Option("--udid", "--serial", help="Target device serial/UDID; never printed in command output."),
+    ] = None,
+    usbmux_address: Annotated[
+        Optional[str],
+        typer.Option("--usbmux-address", help="Address of the usbmuxd daemon (unix socket path or HOST:PORT)."),
+    ] = None,
+) -> None:
+    """
+    Model libReverseProxyDevice CopyProxyDictionaryWithOptions output for PurpleReverseProxy.
+    """
+    result = build_purple_proxy_dictionary(
+        url=url,
+        host=proxy_host,
+        socks_port=socks_port,
+        test_reachability=not no_test_reachability,
+    )
+    if ping:
+        result["ping"] = await run_purple_proxy_control_command(
+            PurpleProxyCommand.PING,
+            udid=udid,
+            usbmux_address=usbmux_address,
+            timeout=timeout,
+            port=control_port,
+            include_response=include_response,
+        )
+    print_json(result, colored=False)
+    if strict and ping and (not result["ping"]["reachable"] or not result["ping"].get("pong")):
         raise typer.Exit(1)
 
 
