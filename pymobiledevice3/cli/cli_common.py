@@ -24,7 +24,13 @@ from typing_extensions import ParamSpec
 
 from pymobiledevice3 import usbmux as usbmuxd
 from pymobiledevice3.exceptions import AccessDeniedError, DeviceNotFoundError, NoDeviceConnectedError
-from pymobiledevice3.lockdown import TcpLockdownClient, create_using_usbmux, get_mobdev2_lockdowns
+from pymobiledevice3.lockdown import (
+    SERVICE_PORT,
+    TcpLockdownClient,
+    create_using_tcp,
+    create_using_usbmux,
+    get_mobdev2_lockdowns,
+)
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.osu.os_utils import get_os_utils
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
@@ -231,6 +237,20 @@ def any_service_provider_dependency(
         Optional[RemoteServiceDiscoveryService],
         Depends(make_rsd_dependency(allow_none=True)),
     ] = None,
+    host: Annotated[
+        Optional[str],
+        typer.Option(
+            help="Connect to lockdownd over TCP at this host/IP instead of usbmux or Bonjour.",
+            rich_help_panel=DEVICE_OPTIONS_PANEL_TITLE,
+        ),
+    ] = None,
+    port: Annotated[
+        int,
+        typer.Option(
+            help="TCP lockdownd port to use with --host.",
+            rich_help_panel=DEVICE_OPTIONS_PANEL_TITLE,
+        ),
+    ] = SERVICE_PORT,
     mobdev2: Annotated[
         bool,
         typer.Option(
@@ -259,8 +279,20 @@ def any_service_provider_dependency(
         # prevent lockdown connection establishment when in autocomplete mode
         return  # type: ignore[return-value]
 
+    if host is None and port != SERVICE_PORT:
+        raise UsageError("Illegal usage: --port requires --host.")
+
     if rsd_service_provider is not None:
+        if host is not None:
+            raise UsageError("Illegal usage: --host is mutually exclusive with --rsd/--tunnel.")
         return rsd_service_provider
+
+    if host is not None:
+        if mobdev2:
+            raise UsageError("Illegal usage: --host is mutually exclusive with --mobdev2.")
+        if udid is None:
+            raise UsageError("Illegal usage: --host requires --udid to load the existing pair record.")
+        return cli_loop.run_until_complete(create_using_tcp(hostname=host, port=port, identifier=udid, autopair=False))
 
     if mobdev2:
         devices = cli_loop.run_until_complete(get_mobdev2_devices(udid=udid))
@@ -293,6 +325,20 @@ def no_autopair_service_provider_dependency(
         Optional[RemoteServiceDiscoveryService],
         Depends(make_rsd_dependency(allow_none=True)),
     ] = None,
+    host: Annotated[
+        Optional[str],
+        typer.Option(
+            help="Connect to lockdownd over TCP at this host/IP instead of usbmux or Bonjour.",
+            rich_help_panel=DEVICE_OPTIONS_PANEL_TITLE,
+        ),
+    ] = None,
+    port: Annotated[
+        int,
+        typer.Option(
+            help="TCP lockdownd port to use with --host.",
+            rich_help_panel=DEVICE_OPTIONS_PANEL_TITLE,
+        ),
+    ] = SERVICE_PORT,
     udid: Annotated[
         Optional[str],
         typer.Option(
@@ -306,8 +352,18 @@ def no_autopair_service_provider_dependency(
         # prevent lockdown connection establishment when in autocomplete mode
         return  # type: ignore[return-value]
 
+    if host is None and port != SERVICE_PORT:
+        raise UsageError("Illegal usage: --port requires --host.")
+
     if rsd_service_provider is not None:
+        if host is not None:
+            raise UsageError("Illegal usage: --host is mutually exclusive with --rsd/--tunnel.")
         return rsd_service_provider
+
+    if host is not None:
+        if udid is None:
+            raise UsageError("Illegal usage: --host requires --udid to load the existing pair record.")
+        return cli_loop.run_until_complete(create_using_tcp(hostname=host, port=port, identifier=udid, autopair=False))
 
     return cli_loop.run_until_complete(create_using_usbmux(serial=udid, autopair=False))
 

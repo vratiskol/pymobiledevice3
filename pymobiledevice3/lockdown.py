@@ -1520,7 +1520,8 @@ class TcpLockdownClient(LockdownClient):
         )
         self._keep_alive = keep_alive
         self.hostname = hostname
-        self.identifier = hostname
+        if identifier is None:
+            self.identifier = hostname
 
     async def create_service_connection(self, port: int) -> ServiceConnection:
         """Create service connection.
