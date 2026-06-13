@@ -425,13 +425,9 @@ class RemotePairingProtocol(StartTcpTunnel):
         await self.send_request(data)
         return await self.receive_response()
 
-    async def connect(self, autopair: bool = True) -> None:
-        await self._attempt_pair_verify()
-
-        if await self._validate_pairing():
-            # Pairing record validation succeeded, so we can just initiate the relevant session keys
-            self._init_client_server_main_encryption_keys()
-            return
+    async def connect(self, autopair: bool = True) -> bool:
+        if await self.verify_pairing():
+            return True
 
         if autopair:
             await self._pair()
@@ -439,6 +435,8 @@ class RemotePairingProtocol(StartTcpTunnel):
 
             # Once pairing is completed, the remote endpoint closes the connection, so it must be re-established
             raise RemotePairingCompletedError()
+
+        return False
 
     async def create_quic_listener(self, private_key: RSAPrivateKey) -> dict:
         request = {
@@ -757,6 +755,13 @@ class RemotePairingProtocol(StartTcpTunnel):
 
         return tlv
 
+    async def verify_pairing(self) -> bool:
+        await self._attempt_pair_verify()
+        if not await self._validate_pairing():
+            return False
+        self._init_client_server_main_encryption_keys()
+        return True
+
     def _init_client_server_main_encryption_keys(self) -> None:
         client_key = HKDF(
             algorithm=hashes.SHA512(),
@@ -1010,10 +1015,8 @@ class RemotePairingTunnelService(RemotePairingProtocol):
             raise
 
         try:
-            await self._attempt_pair_verify()
-            if not await self._validate_pairing():
+            if not await self.verify_pairing():
                 raise ConnectionTerminatedError()
-            self._init_client_server_main_encryption_keys()
         except Exception:
             await self.close()
             raise
@@ -1105,6 +1108,27 @@ class CoreDeviceTunnelProxy(StartTcpTunnel):
     async def close(self) -> None:
         if self._service is not None:
             await self._service.close()
+
+
+async def verify_remote_pairing_endpoint(remote_identifier: str, hostname: str, port: int) -> dict:
+    service = RemotePairingTunnelService(remote_identifier, hostname, port)
+    result = {
+        "identifier": remote_identifier,
+        "address": hostname,
+        "port": port,
+        "paired": False,
+    }
+    try:
+        await service.connect(autopair=False)
+        result["paired"] = True
+        if service.handshake_info is not None:
+            result["peer_info"] = service.handshake_info.get("peerDeviceInfo")
+    except Exception as e:
+        result["error_type"] = e.__class__.__name__
+        result["error"] = str(e)
+    finally:
+        await service.close()
+    return result
 
 
 async def create_core_device_tunnel_service_using_rsd(

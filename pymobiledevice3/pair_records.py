@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import logging
 import platform
 import plistlib
@@ -155,22 +157,147 @@ def get_remote_pairing_record_filename(identifier: str) -> str:
     return f"remote_{identifier}"
 
 
-def iter_remote_pair_records() -> Generator[Path, None, None]:
+def iter_remote_pair_records(pairing_records_cache_folder: Optional[Path] = None) -> Generator[Path, None, None]:
     """
     Iterate over the remote pairing records in the home folder.
 
     :return: A generator yielding paths to the remote pairing records.
     :rtype: Generator[Path, None, None]
     """
-    return get_home_folder().glob("remote_*")
+    pairing_records_cache_folder = (
+        get_home_folder() if pairing_records_cache_folder is None else pairing_records_cache_folder
+    )
+    return pairing_records_cache_folder.glob("remote_*")
 
 
-def iter_remote_paired_identifiers() -> Generator[str, None, None]:
+def iter_remote_paired_identifiers(pairing_records_cache_folder: Optional[Path] = None) -> Generator[str, None, None]:
     """
     Iterate over the identifiers of the remote paired devices.
 
     :return: A generator yielding the identifiers of the remote paired devices.
     :rtype: Generator[str, None, None]
     """
-    for file in iter_remote_pair_records():
+    for file in iter_remote_pair_records(pairing_records_cache_folder=pairing_records_cache_folder):
         yield file.parts[-1].split("remote_", 1)[1].split(".", 1)[0]
+
+
+def get_remote_pairing_record_path(identifier: str, pairing_records_cache_folder: Optional[Path] = None) -> Path:
+    pairing_records_cache_folder = (
+        get_home_folder() if pairing_records_cache_folder is None else pairing_records_cache_folder
+    )
+    return pairing_records_cache_folder / f"{get_remote_pairing_record_filename(identifier)}.{PAIRING_RECORD_EXT}"
+
+
+def _remote_pairing_record_identifier(path: Path) -> str:
+    return path.name.split("remote_", 1)[1].split(".", 1)[0]
+
+
+def _summarize_remote_pairing_value(value, include_value: bool = False) -> dict:
+    if isinstance(value, bytes):
+        summary = {
+            "type": "bytes",
+            "length": len(value),
+            "sha256": hashlib.sha256(value).hexdigest(),
+        }
+        if include_value:
+            summary["base64"] = base64.b64encode(value).decode()
+        return summary
+    summary = {"type": type(value).__name__}
+    if include_value:
+        summary["value"] = value
+    return summary
+
+
+def describe_remote_pairing_record(
+    path: Path,
+    include_secrets: bool = False,
+    include_path: bool = True,
+) -> dict:
+    identifier = _remote_pairing_record_identifier(path)
+    result = {
+        "identifier": identifier,
+        "exists": path.exists(),
+    }
+    if include_path:
+        result["path"] = str(path)
+    if not path.exists():
+        result["valid"] = False
+        result["error"] = "not found"
+        return result
+
+    try:
+        record = plistlib.loads(path.read_bytes())
+    except (OSError, plistlib.InvalidFileException) as e:
+        result["valid"] = False
+        result["error"] = str(e)
+        return result
+
+    public_key = record.get("public_key")
+    private_key = record.get("private_key")
+    remote_unlock_host_key = record.get("remote_unlock_host_key")
+
+    result.update({
+        "valid": True,
+        "keys": sorted(record.keys()),
+        "public_key": _summarize_remote_pairing_value(public_key) if public_key is not None else None,
+        "has_private_key": private_key is not None,
+        "private_key": _summarize_remote_pairing_value(private_key) if private_key is not None else None,
+        "has_remote_unlock_host_key": bool(remote_unlock_host_key),
+        "remote_unlock_host_key": _summarize_remote_pairing_value(remote_unlock_host_key)
+        if remote_unlock_host_key
+        else None,
+    })
+    if include_secrets:
+        result["record"] = {
+            key: _summarize_remote_pairing_value(value, include_value=True) for key, value in record.items()
+        }
+    return result
+
+
+def list_remote_pairing_record_summaries(
+    pairing_records_cache_folder: Optional[Path] = None,
+    include_secrets: bool = False,
+    include_path: bool = True,
+) -> list[dict]:
+    return [
+        describe_remote_pairing_record(path, include_secrets=include_secrets, include_path=include_path)
+        for path in sorted(iter_remote_pair_records(pairing_records_cache_folder=pairing_records_cache_folder))
+    ]
+
+
+def get_remote_pairing_record_summary(
+    identifier: str,
+    pairing_records_cache_folder: Optional[Path] = None,
+    include_secrets: bool = False,
+    include_path: bool = True,
+) -> dict:
+    return describe_remote_pairing_record(
+        get_remote_pairing_record_path(identifier, pairing_records_cache_folder=pairing_records_cache_folder),
+        include_secrets=include_secrets,
+        include_path=include_path,
+    )
+
+
+def delete_remote_pairing_record(
+    identifier: str,
+    pairing_records_cache_folder: Optional[Path] = None,
+    missing_ok: bool = False,
+    dry_run: bool = False,
+) -> dict:
+    path = get_remote_pairing_record_path(identifier, pairing_records_cache_folder=pairing_records_cache_folder)
+    result = {
+        "identifier": identifier,
+        "path": str(path),
+        "exists": path.exists(),
+        "deleted": False,
+        "dry_run": dry_run,
+    }
+    if not path.exists():
+        if missing_ok:
+            return result
+        raise FileNotFoundError(path)
+    if not dry_run:
+        path.unlink()
+        result["exists"] = False
+    result["deleted"] = not dry_run
+    return result

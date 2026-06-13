@@ -21,9 +21,12 @@ from pymobiledevice3.cli.cli_common import (
     sudo_required,
     user_requested_colored_output,
 )
-from pymobiledevice3.common import get_home_folder
 from pymobiledevice3.exceptions import NoDeviceConnectedError
-from pymobiledevice3.pair_records import PAIRING_RECORD_EXT, get_remote_pairing_record_filename
+from pymobiledevice3.pair_records import (
+    delete_remote_pairing_record,
+    get_remote_pairing_record_summary,
+    list_remote_pairing_record_summaries,
+)
 from pymobiledevice3.remote.common import ConnectionType, TunnelProtocol
 from pymobiledevice3.remote.module_imports import MAX_IDLE_TIMEOUT, start_tunnel, verify_tunnel_imports
 from pymobiledevice3.remote.remote_service_discovery import RSD_PORT
@@ -31,6 +34,7 @@ from pymobiledevice3.remote.tunnel_service import (
     RemotePairingManualPairingService,
     get_core_device_tunnel_services,
     get_remote_pairing_tunnel_services,
+    verify_remote_pairing_endpoint,
 )
 from pymobiledevice3.remote.utils import get_rsds
 from pymobiledevice3.tunneld.api import TUNNELD_DEFAULT_ADDRESS
@@ -344,11 +348,98 @@ async def cli_pair(
     await start_remote_pair_task(name)
 
 
+@cli.command("pair-records")
+def cli_pair_records(
+    pairing_records_cache_folder: Annotated[
+        Optional[Path],
+        typer.Option(help="Directory containing pymobiledevice3 remote pairing records."),
+    ] = None,
+    include_secrets: Annotated[
+        bool,
+        typer.Option(help="Include base64-encoded secret material in the JSON output."),
+    ] = False,
+    include_path: Annotated[
+        bool,
+        typer.Option("--include-path/--no-include-path", help="Include local filesystem paths in output."),
+    ] = True,
+) -> None:
+    """List local RemotePairing records."""
+    print_json(
+        list_remote_pairing_record_summaries(
+            pairing_records_cache_folder=pairing_records_cache_folder,
+            include_secrets=include_secrets,
+            include_path=include_path,
+        )
+    )
+
+
+@cli.command("pair-record")
+def cli_pair_record(
+    udid: str,
+    pairing_records_cache_folder: Annotated[
+        Optional[Path],
+        typer.Option(help="Directory containing pymobiledevice3 remote pairing records."),
+    ] = None,
+    include_secrets: Annotated[
+        bool,
+        typer.Option(help="Include base64-encoded secret material in the JSON output."),
+    ] = False,
+    include_path: Annotated[
+        bool,
+        typer.Option("--include-path/--no-include-path", help="Include local filesystem paths in output."),
+    ] = True,
+) -> None:
+    """Show one local RemotePairing record."""
+    print_json(
+        get_remote_pairing_record_summary(
+            udid,
+            pairing_records_cache_folder=pairing_records_cache_folder,
+            include_secrets=include_secrets,
+            include_path=include_path,
+        )
+    )
+
+
+@cli.command("pair-verify")
+@async_command
+async def cli_pair_verify(
+    udid: str,
+    host: Annotated[Optional[str], typer.Option(help="RemotePairing host to verify against.")] = None,
+    port: Annotated[Optional[int], typer.Option(help="RemotePairing TCP port to verify against.")] = None,
+    timeout: Annotated[float, typer.Option(help="Bonjour discovery timeout when host/port are omitted.")] = 3.0,
+) -> None:
+    """Verify whether a local RemotePairing record is trusted by a live endpoint."""
+    results = []
+    if host is not None or port is not None:
+        if host is None or port is None:
+            raise typer.BadParameter("--host and --port must be provided together")
+        results.append(await verify_remote_pairing_endpoint(udid, host, port))
+    else:
+        for answer in await browse_remotepairing(timeout=timeout):
+            for address in answer.addresses:
+                results.append(await verify_remote_pairing_endpoint(udid, address.full_ip, answer.port))
+    print_json(results)
+
+
 @cli.command("delete-pair")
-def cli_delete_pair(udid: str) -> None:
-    """Delete a pairing record"""
-    pair_record_path = get_home_folder() / f"{get_remote_pairing_record_filename(udid)}.{PAIRING_RECORD_EXT}"
-    pair_record_path.unlink()
+def cli_delete_pair(
+    udid: str,
+    pairing_records_cache_folder: Annotated[
+        Optional[Path],
+        typer.Option(help="Directory containing pymobiledevice3 remote pairing records."),
+    ] = None,
+    missing_ok: Annotated[bool, typer.Option(help="Do not fail if the record does not exist.")] = False,
+    dry_run: Annotated[bool, typer.Option(help="Report the record path without deleting it.")] = False,
+) -> None:
+    """Delete a local RemotePairing record."""
+    print_json(
+        delete_remote_pairing_record(
+            udid,
+            pairing_records_cache_folder=pairing_records_cache_folder,
+            missing_ok=missing_ok,
+            dry_run=dry_run,
+        )
+    )
 
 
 @cli.command("service")
