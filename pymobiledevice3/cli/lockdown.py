@@ -16,6 +16,7 @@ from pymobiledevice3.cli.cli_common import (
     NoAutoPairServiceProviderDep,
     ServiceProviderDep,
     async_command,
+    load_pair_record_file,
     print_json,
     sudo_required,
 )
@@ -85,6 +86,7 @@ async def diagnose_tcp_lockdown(
     port: int = SERVICE_PORT,
     udid: Optional[str] = None,
     pairing_records_cache_folder: Optional[Path] = None,
+    pair_record_file: Optional[Path] = None,
     timeout: float = 5.0,
     usbmux_address: Optional[str] = None,
 ) -> dict:
@@ -109,18 +111,25 @@ async def diagnose_tcp_lockdown(
         return output
 
     try:
-        if udid is None:
+        if pair_record_file is not None:
+            try:
+                pair_record = load_pair_record_file(pair_record_file)
+                output["pair_record"] = _pair_record_diagnostic("file", pair_record)
+            except Exception as e:
+                output["pair_record"] = {"source": "file", **_diagnose_error(e)}
+                return output
+        elif udid is None:
             output["pair_record"] = {"found": False, "source": None, "required": True, "error": "--udid is required"}
             return output
-
-        try:
-            source, pair_record = await _find_pair_record(
-                udid, pairing_records_cache_folder=pairing_records_cache_folder, usbmux_address=usbmux_address
-            )
-            output["pair_record"] = _pair_record_diagnostic(source, pair_record)
-        except Exception as e:
-            output["pair_record"] = _diagnose_error(e)
-            return output
+        else:
+            try:
+                source, pair_record = await _find_pair_record(
+                    udid, pairing_records_cache_folder=pairing_records_cache_folder, usbmux_address=usbmux_address
+                )
+                output["pair_record"] = _pair_record_diagnostic(source, pair_record)
+            except Exception as e:
+                output["pair_record"] = _diagnose_error(e)
+                return output
 
         client = TcpLockdownClient(
             service,
@@ -273,7 +282,7 @@ async def lockdown_diagnose(
     udid: Annotated[
         Optional[str],
         typer.Option(
-            help="Target device UDID. Required with --host to load the existing pair record.",
+            help="Target device UDID. Required with --host unless --pair-record is provided.",
             rich_help_panel=DEVICE_OPTIONS_PANEL_TITLE,
         ),
     ] = None,
@@ -289,9 +298,23 @@ async def lockdown_diagnose(
         Optional[Path],
         typer.Option(help="Directory containing pymobiledevice3 lockdown pairing records."),
     ] = None,
+    pair_record_file: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--pair-record",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Lockdown pair record plist to use with --host instead of cache lookup.",
+        ),
+    ] = None,
     timeout: Annotated[float, typer.Option(help="TCP connection timeout in seconds.")] = 5.0,
 ) -> None:
     """diagnose lockdown connectivity, discovery, and pair validation"""
+    if host is None and pair_record_file is not None:
+        raise typer.BadParameter("--pair-record requires --host")
+
     if host is None:
         if port != SERVICE_PORT:
             raise typer.BadParameter("--port requires --host")
@@ -308,6 +331,7 @@ async def lockdown_diagnose(
             port=port,
             udid=udid,
             pairing_records_cache_folder=pairing_records_cache_folder,
+            pair_record_file=pair_record_file,
             timeout=timeout,
             usbmux_address=usbmux,
         )

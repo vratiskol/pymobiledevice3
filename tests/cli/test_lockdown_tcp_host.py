@@ -1,3 +1,5 @@
+import plistlib
+
 import pytest
 from click import UsageError
 
@@ -77,9 +79,77 @@ def test_no_autopair_dependency_uses_explicit_tcp_host(monkeypatch: pytest.Monke
     }
 
 
+def test_service_provider_dependency_uses_explicit_pair_record_file(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    marker = object()
+    captured = {}
+    pair_record = {"HostID": "host-id", "SystemBUID": "system-buid"}
+    pair_record_file = tmp_path / "pair-record.plist"
+    pair_record_file.write_bytes(plistlib.dumps(pair_record))
+
+    async def fake_create_using_tcp(**kwargs):
+        captured.update(kwargs)
+        return marker
+
+    monkeypatch.setattr(cli_common, "create_using_tcp", fake_create_using_tcp)
+
+    result = cli_common.any_service_provider_dependency(host="192.0.2.1", pair_record_file=pair_record_file)
+
+    assert result is marker
+    assert captured == {
+        "hostname": "192.0.2.1",
+        "port": SERVICE_PORT,
+        "identifier": None,
+        "autopair": False,
+        "pair_record": pair_record,
+    }
+
+
+def test_no_autopair_dependency_uses_explicit_pair_record_file(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    marker = object()
+    captured = {}
+    pair_record = {"HostID": "host-id", "SystemBUID": "system-buid"}
+    pair_record_file = tmp_path / "pair-record.plist"
+    pair_record_file.write_bytes(plistlib.dumps(pair_record))
+
+    async def fake_create_using_tcp(**kwargs):
+        captured.update(kwargs)
+        return marker
+
+    monkeypatch.setattr(cli_common, "create_using_tcp", fake_create_using_tcp)
+
+    result = cli_common.no_autopair_service_provider_dependency(host="192.0.2.1", pair_record_file=pair_record_file)
+
+    assert result is marker
+    assert captured == {
+        "hostname": "192.0.2.1",
+        "port": SERVICE_PORT,
+        "identifier": None,
+        "autopair": False,
+        "pair_record": pair_record,
+    }
+
+
 def test_explicit_tcp_host_requires_udid() -> None:
-    with pytest.raises(UsageError, match="--host requires --udid"):
+    with pytest.raises(UsageError, match="--host requires --udid or --pair-record"):
         cli_common.any_service_provider_dependency(host="192.0.2.1")
+
+
+def test_pair_record_file_requires_host(tmp_path) -> None:
+    with pytest.raises(UsageError, match="--pair-record requires --host"):
+        cli_common.any_service_provider_dependency(pair_record_file=tmp_path / "pair-record.plist")
+
+
+def test_pair_record_file_rejects_missing_file(tmp_path) -> None:
+    with pytest.raises(UsageError, match="Pair record file not found"):
+        cli_common.any_service_provider_dependency(host="192.0.2.1", pair_record_file=tmp_path / "missing.plist")
+
+
+def test_pair_record_file_must_be_plist_dictionary(tmp_path) -> None:
+    pair_record_file = tmp_path / "pair-record.plist"
+    pair_record_file.write_bytes(plistlib.dumps(["not", "a", "dict"]))
+
+    with pytest.raises(UsageError, match="plist dictionary"):
+        cli_common.any_service_provider_dependency(host="192.0.2.1", pair_record_file=pair_record_file)
 
 
 def test_explicit_tcp_port_requires_host() -> None:

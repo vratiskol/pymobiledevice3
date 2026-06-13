@@ -3,11 +3,13 @@ import datetime
 import json
 import logging
 import os
+import plistlib
 import sys
 import uuid
 from collections.abc import Awaitable
 from contextlib import suppress
 from functools import wraps
+from pathlib import Path
 from textwrap import dedent
 from typing import Annotated, Any, Callable, Optional, TypeVar
 
@@ -140,6 +142,20 @@ def is_invoked_for_completion() -> bool:
 cli_loop = get_asyncio_loop()
 
 
+def load_pair_record_file(pair_record_file: Path) -> dict:
+    try:
+        pair_record = plistlib.loads(pair_record_file.read_bytes())
+    except FileNotFoundError as e:
+        raise UsageError(f"Pair record file not found: {pair_record_file}") from e
+    except (OSError, plistlib.InvalidFileException, ValueError) as e:
+        raise UsageError(f"Failed to read pair record file {pair_record_file}: {e}") from e
+
+    if not isinstance(pair_record, dict):
+        raise UsageError("Pair record file must contain a plist dictionary.")
+
+    return pair_record
+
+
 def async_command(func: Callable[P, Awaitable[R]]) -> Callable[P, R]:
     @wraps(func)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
@@ -251,6 +267,18 @@ def any_service_provider_dependency(
             rich_help_panel=DEVICE_OPTIONS_PANEL_TITLE,
         ),
     ] = SERVICE_PORT,
+    pair_record_file: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--pair-record",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Lockdown pair record plist to use with --host instead of cache lookup.",
+            rich_help_panel=DEVICE_OPTIONS_PANEL_TITLE,
+        ),
+    ] = None,
     mobdev2: Annotated[
         bool,
         typer.Option(
@@ -270,7 +298,7 @@ def any_service_provider_dependency(
         Optional[str],
         typer.Option(
             envvar=UDID_ENV_VAR,
-            help="Target device UDID (defaults to the first USB device).",
+            help="Target device UDID (defaults to the first USB device; required with --host unless --pair-record is provided).",
             rich_help_panel=DEVICE_OPTIONS_PANEL_TITLE,
         ),
     ] = None,
@@ -281,6 +309,8 @@ def any_service_provider_dependency(
 
     if host is None and port != SERVICE_PORT:
         raise UsageError("Illegal usage: --port requires --host.")
+    if host is None and pair_record_file is not None:
+        raise UsageError("Illegal usage: --pair-record requires --host.")
 
     if rsd_service_provider is not None:
         if host is not None:
@@ -290,9 +320,13 @@ def any_service_provider_dependency(
     if host is not None:
         if mobdev2:
             raise UsageError("Illegal usage: --host is mutually exclusive with --mobdev2.")
-        if udid is None:
-            raise UsageError("Illegal usage: --host requires --udid to load the existing pair record.")
-        return cli_loop.run_until_complete(create_using_tcp(hostname=host, port=port, identifier=udid, autopair=False))
+        pair_record = load_pair_record_file(pair_record_file) if pair_record_file is not None else None
+        if udid is None and pair_record is None:
+            raise UsageError("Illegal usage: --host requires --udid or --pair-record.")
+        kwargs: dict[str, Any] = {"hostname": host, "port": port, "identifier": udid, "autopair": False}
+        if pair_record is not None:
+            kwargs["pair_record"] = pair_record
+        return cli_loop.run_until_complete(create_using_tcp(**kwargs))
 
     if mobdev2:
         devices = cli_loop.run_until_complete(get_mobdev2_devices(udid=udid))
@@ -339,11 +373,23 @@ def no_autopair_service_provider_dependency(
             rich_help_panel=DEVICE_OPTIONS_PANEL_TITLE,
         ),
     ] = SERVICE_PORT,
+    pair_record_file: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--pair-record",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Lockdown pair record plist to use with --host instead of cache lookup.",
+            rich_help_panel=DEVICE_OPTIONS_PANEL_TITLE,
+        ),
+    ] = None,
     udid: Annotated[
         Optional[str],
         typer.Option(
             envvar=UDID_ENV_VAR,
-            help="Target device UDID (defaults to the first USB device).",
+            help="Target device UDID (defaults to the first USB device; required with --host unless --pair-record is provided).",
             rich_help_panel=DEVICE_OPTIONS_PANEL_TITLE,
         ),
     ] = None,
@@ -354,6 +400,8 @@ def no_autopair_service_provider_dependency(
 
     if host is None and port != SERVICE_PORT:
         raise UsageError("Illegal usage: --port requires --host.")
+    if host is None and pair_record_file is not None:
+        raise UsageError("Illegal usage: --pair-record requires --host.")
 
     if rsd_service_provider is not None:
         if host is not None:
@@ -361,9 +409,13 @@ def no_autopair_service_provider_dependency(
         return rsd_service_provider
 
     if host is not None:
-        if udid is None:
-            raise UsageError("Illegal usage: --host requires --udid to load the existing pair record.")
-        return cli_loop.run_until_complete(create_using_tcp(hostname=host, port=port, identifier=udid, autopair=False))
+        pair_record = load_pair_record_file(pair_record_file) if pair_record_file is not None else None
+        if udid is None and pair_record is None:
+            raise UsageError("Illegal usage: --host requires --udid or --pair-record.")
+        kwargs: dict[str, Any] = {"hostname": host, "port": port, "identifier": udid, "autopair": False}
+        if pair_record is not None:
+            kwargs["pair_record"] = pair_record
+        return cli_loop.run_until_complete(create_using_tcp(**kwargs))
 
     return cli_loop.run_until_complete(create_using_usbmux(serial=udid, autopair=False))
 
