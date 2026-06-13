@@ -28,7 +28,9 @@ from pymobiledevice3.pair_records import (
     generate_host_id,
     get_itunes_pairing_record,
     get_local_pairing_record,
+    get_lockdown_pairing_record_summary,
     get_usbmux_pairing_record,
+    list_lockdown_pairing_record_summaries,
 )
 from pymobiledevice3.remote.common import TunnelProtocol
 from pymobiledevice3.remote.tunnel_service import CoreDeviceTunnelProxy
@@ -369,6 +371,68 @@ async def lockdown_unpair(service_provider: NoAutoPairServiceProviderDep, host_i
 async def lockdown_pair(service_provider: NoAutoPairServiceProviderDep) -> None:
     """pair device"""
     await service_provider.pair()
+
+
+@cli.command("pair-records")
+def lockdown_pair_records(
+    pairing_records_cache_folder: Annotated[
+        Optional[Path],
+        typer.Option(help="Directory containing pymobiledevice3 lockdown pairing records."),
+    ] = None,
+    include_itunes: Annotated[
+        bool,
+        typer.Option("--include-itunes/--no-include-itunes", help="Include iTunes/libimobiledevice pair records."),
+    ] = True,
+    include_secrets: Annotated[
+        bool,
+        typer.Option(help="Include base64-encoded secret material in the JSON output."),
+    ] = False,
+    include_path: Annotated[
+        bool,
+        typer.Option("--include-path/--no-include-path", help="Include local filesystem paths in output."),
+    ] = True,
+) -> None:
+    """list local lockdown pair records"""
+    print_json(
+        list_lockdown_pairing_record_summaries(
+            pairing_records_cache_folder=pairing_records_cache_folder,
+            include_itunes=include_itunes,
+            include_secrets=include_secrets,
+            include_path=include_path,
+        )
+    )
+
+
+@cli.command("pair-record")
+def lockdown_pair_record(
+    udid: str,
+    pairing_records_cache_folder: Annotated[
+        Optional[Path],
+        typer.Option(help="Directory containing pymobiledevice3 lockdown pairing records."),
+    ] = None,
+    include_itunes: Annotated[
+        bool,
+        typer.Option("--include-itunes/--no-include-itunes", help="Include iTunes/libimobiledevice pair records."),
+    ] = True,
+    include_secrets: Annotated[
+        bool,
+        typer.Option(help="Include base64-encoded secret material in the JSON output."),
+    ] = False,
+    include_path: Annotated[
+        bool,
+        typer.Option("--include-path/--no-include-path", help="Include local filesystem paths in output."),
+    ] = True,
+) -> None:
+    """show local lockdown pair records for a device"""
+    print_json(
+        get_lockdown_pairing_record_summary(
+            udid,
+            pairing_records_cache_folder=pairing_records_cache_folder,
+            include_itunes=include_itunes,
+            include_secrets=include_secrets,
+            include_path=include_path,
+        )
+    )
 
 
 @cli.command("pair-supervised")
