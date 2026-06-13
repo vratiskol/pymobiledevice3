@@ -25,7 +25,12 @@ from typer_injector import Depends
 from typing_extensions import ParamSpec
 
 from pymobiledevice3 import usbmux as usbmuxd
-from pymobiledevice3.exceptions import AccessDeniedError, DeviceNotFoundError, NoDeviceConnectedError
+from pymobiledevice3.exceptions import (
+    AccessDeniedError,
+    ConnectionTerminatedError,
+    DeviceNotFoundError,
+    NoDeviceConnectedError,
+)
 from pymobiledevice3.lockdown import (
     SERVICE_PORT,
     TcpLockdownClient,
@@ -154,6 +159,29 @@ def load_pair_record_file(pair_record_file: Path) -> dict:
         raise UsageError("Pair record file must contain a plist dictionary.")
 
     return pair_record
+
+
+def _format_tcp_lockdown_connection_error(host: str, port: int, error: Exception) -> str:
+    reason = str(error) or error.__class__.__name__
+    return f"Failed to establish TCP lockdown connection to {host}:{port}: {reason}"
+
+
+def _exit_with_tcp_lockdown_connection_error(host: str, port: int, error: Exception) -> None:
+    click.echo(f"Error: {_format_tcp_lockdown_connection_error(host, port, error)}", err=True)
+    raise typer.Exit(code=1) from None
+
+
+def _create_tcp_lockdown_service_provider(
+    host: str, port: int, udid: Optional[str], pair_record: Optional[dict]
+) -> LockdownServiceProvider:
+    kwargs: dict[str, Any] = {"hostname": host, "port": port, "identifier": udid, "autopair": False}
+    if pair_record is not None:
+        kwargs["pair_record"] = pair_record
+
+    try:
+        return cli_loop.run_until_complete(create_using_tcp(**kwargs))
+    except (OSError, ConnectionTerminatedError) as e:
+        _exit_with_tcp_lockdown_connection_error(host, port, e)
 
 
 def async_command(func: Callable[P, Awaitable[R]]) -> Callable[P, R]:
@@ -323,10 +351,7 @@ def any_service_provider_dependency(
         pair_record = load_pair_record_file(pair_record_file) if pair_record_file is not None else None
         if udid is None and pair_record is None:
             raise UsageError("Illegal usage: --host requires --udid or --pair-record.")
-        kwargs: dict[str, Any] = {"hostname": host, "port": port, "identifier": udid, "autopair": False}
-        if pair_record is not None:
-            kwargs["pair_record"] = pair_record
-        return cli_loop.run_until_complete(create_using_tcp(**kwargs))
+        return _create_tcp_lockdown_service_provider(host, port, udid, pair_record)
 
     if mobdev2:
         devices = cli_loop.run_until_complete(get_mobdev2_devices(udid=udid))
@@ -412,10 +437,7 @@ def no_autopair_service_provider_dependency(
         pair_record = load_pair_record_file(pair_record_file) if pair_record_file is not None else None
         if udid is None and pair_record is None:
             raise UsageError("Illegal usage: --host requires --udid or --pair-record.")
-        kwargs: dict[str, Any] = {"hostname": host, "port": port, "identifier": udid, "autopair": False}
-        if pair_record is not None:
-            kwargs["pair_record"] = pair_record
-        return cli_loop.run_until_complete(create_using_tcp(**kwargs))
+        return _create_tcp_lockdown_service_provider(host, port, udid, pair_record)
 
     return cli_loop.run_until_complete(create_using_usbmux(serial=udid, autopair=False))
 

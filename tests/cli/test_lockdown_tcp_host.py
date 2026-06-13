@@ -1,6 +1,7 @@
 import plistlib
 
 import pytest
+import typer
 from click import UsageError
 
 from pymobiledevice3.cli import cli_common
@@ -127,6 +128,50 @@ def test_no_autopair_dependency_uses_explicit_pair_record_file(monkeypatch: pyte
         "autopair": False,
         "pair_record": pair_record,
     }
+
+
+def test_explicit_tcp_host_maps_connection_reset_to_clean_exit(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_create_using_tcp(**kwargs):
+        raise ConnectionResetError(104, "Connection reset by peer")
+
+    monkeypatch.setattr(cli_common, "create_using_tcp", fake_create_using_tcp)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        cli_common.any_service_provider_dependency(host="192.0.2.1", port=12345, udid="device-udid")
+
+    assert exc_info.value.exit_code == 1
+    assert capsys.readouterr().err == (
+        "Error: Failed to establish TCP lockdown connection to 192.0.2.1:12345: [Errno 104] Connection reset by peer\n"
+    )
+
+
+def test_no_autopair_explicit_tcp_host_maps_os_errors_to_clean_exit(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_create_using_tcp(**kwargs):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(cli_common, "create_using_tcp", fake_create_using_tcp)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        cli_common.no_autopair_service_provider_dependency(host="192.0.2.1", udid="device-udid")
+
+    assert exc_info.value.exit_code == 1
+    assert capsys.readouterr().err == (
+        "Error: Failed to establish TCP lockdown connection to 192.0.2.1:62078: [Errno 1] Operation not permitted\n"
+    )
+
+
+def test_explicit_tcp_host_does_not_map_unexpected_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_create_using_tcp(**kwargs):
+        raise RuntimeError("programming error")
+
+    monkeypatch.setattr(cli_common, "create_using_tcp", fake_create_using_tcp)
+
+    with pytest.raises(RuntimeError, match="programming error"):
+        cli_common.any_service_provider_dependency(host="192.0.2.1", udid="device-udid")
 
 
 def test_explicit_tcp_host_requires_udid() -> None:
