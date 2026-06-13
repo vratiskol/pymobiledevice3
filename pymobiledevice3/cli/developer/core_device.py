@@ -61,6 +61,240 @@ cli = InjectingTyper(
 )
 
 
+CORE_DEVICE_DIAGNOSTIC_SERVICES = (
+    {
+        "label": "device-info",
+        "name": DeviceInfoService.SERVICE_NAME,
+        "category": "core",
+        "capabilities": ("device-info", "display-info", "mobilegestalt", "lockstate"),
+    },
+    {
+        "label": "app-service",
+        "name": AppServiceService.SERVICE_NAME,
+        "category": "core",
+        "capabilities": ("apps", "processes", "launch", "uninstall"),
+    },
+    {
+        "label": "file-control",
+        "name": FileServiceService.CTRL_SERVICE_NAME,
+        "category": "file-service",
+        "capabilities": ("list-directory", "read-file", "write-file"),
+    },
+    {
+        "label": "file-data",
+        "name": "com.apple.coredevice.fileservice.data",
+        "category": "file-service",
+        "capabilities": ("file-transfer",),
+    },
+    {
+        "label": "diagnostics",
+        "name": DiagnosticsServiceService.SERVICE_NAME,
+        "category": "diagnostics",
+        "capabilities": ("sysdiagnose",),
+    },
+    {
+        "label": "screen-capture",
+        "name": ScreenCaptureService.SERVICE_NAME,
+        "category": "remote-control",
+        "capabilities": ("screenshot",),
+    },
+    {
+        "label": "display",
+        "name": DisplayService.SERVICE_NAME,
+        "category": "remote-control",
+        "capabilities": ("media-support", "stream-status", "video-stream", "audio-stream"),
+    },
+    {
+        "label": "hid-indigo",
+        "name": IndigoHIDService.SERVICE_NAME,
+        "category": "remote-control",
+        "capabilities": ("hardware-buttons",),
+    },
+    {
+        "label": "universal-hid",
+        "name": UniversalHIDServiceService.SERVICE_NAME,
+        "category": "remote-control",
+        "capabilities": ("touch", "raw-hid", "connected-hid-services"),
+    },
+    {
+        "label": "location",
+        "name": LocationService.SERVICE_NAME,
+        "category": "location",
+        "capabilities": ("location-simulation",),
+    },
+)
+
+
+def _core_device_service_info(service_provider: RemoteServiceDiscoveryService, service_name: str) -> Optional[dict]:
+    return (service_provider.peer_info or {}).get("Services", {}).get(service_name)
+
+
+def _core_device_service_entry(service_provider: RemoteServiceDiscoveryService, service_definition: dict) -> dict:
+    service_info = _core_device_service_info(service_provider, service_definition["name"])
+    service_properties = (service_info or {}).get("Properties", {})
+    return {
+        "label": service_definition["label"],
+        "name": service_definition["name"],
+        "category": service_definition["category"],
+        "capabilities": list(service_definition["capabilities"]),
+        "advertised": service_info is not None,
+        "port": service_info.get("Port") if service_info else None,
+        "uses_remote_xpc": service_properties.get("UsesRemoteXPC"),
+        "connectable": None,
+        "error": None,
+    }
+
+
+def _core_device_capabilities(services: list[dict]) -> dict[str, dict[str, object]]:
+    advertised = {service["name"] for service in services if service["advertised"]}
+
+    def has(*service_names: str) -> bool:
+        return all(name in advertised for name in service_names)
+
+    return {
+        "core": {
+            "ready": has(DeviceInfoService.SERVICE_NAME, AppServiceService.SERVICE_NAME),
+            "services": [DeviceInfoService.SERVICE_NAME, AppServiceService.SERVICE_NAME],
+        },
+        "file_service": {
+            "ready": has(FileServiceService.CTRL_SERVICE_NAME, "com.apple.coredevice.fileservice.data"),
+            "services": [FileServiceService.CTRL_SERVICE_NAME, "com.apple.coredevice.fileservice.data"],
+        },
+        "diagnostics": {
+            "ready": has(DiagnosticsServiceService.SERVICE_NAME),
+            "services": [DiagnosticsServiceService.SERVICE_NAME],
+        },
+        "screen_capture": {
+            "ready": has(ScreenCaptureService.SERVICE_NAME),
+            "services": [ScreenCaptureService.SERVICE_NAME],
+        },
+        "streaming": {
+            "ready": has(DisplayService.SERVICE_NAME),
+            "services": [DisplayService.SERVICE_NAME],
+        },
+        "remote_control": {
+            "ready": has(
+                DisplayService.SERVICE_NAME,
+                IndigoHIDService.SERVICE_NAME,
+                UniversalHIDServiceService.SERVICE_NAME,
+            ),
+            "services": [
+                DisplayService.SERVICE_NAME,
+                IndigoHIDService.SERVICE_NAME,
+                UniversalHIDServiceService.SERVICE_NAME,
+            ],
+        },
+        "location": {
+            "ready": has(LocationService.SERVICE_NAME),
+            "services": [LocationService.SERVICE_NAME],
+        },
+    }
+
+
+async def _probe_core_device_service(
+    service_provider: RemoteServiceDiscoveryService, service_name: str, timeout: float
+) -> dict[str, object]:
+    service = None
+    try:
+        service = await asyncio.wait_for(service_provider.start_service(service_name), timeout=timeout)
+    except Exception as e:
+        return {
+            "connectable": False,
+            "error": {
+                "type": e.__class__.__name__,
+                "message": str(e),
+            },
+        }
+    else:
+        return {"connectable": True, "error": None}
+    finally:
+        if service is not None:
+            try:
+                await asyncio.wait_for(service.close(), timeout=timeout)
+            except Exception:
+                logger.debug("failed to close CoreDevice diagnostic probe for %s", service_name, exc_info=True)
+
+
+async def build_core_device_diagnose_payload(
+    service_provider: RemoteServiceDiscoveryService, probe: bool = True, timeout: float = 2.0
+) -> dict:
+    """Build a non-destructive CoreDevice/RSD readiness report."""
+    peer_info = service_provider.peer_info or {}
+    properties = peer_info.get("Properties", {})
+    advertised_services = peer_info.get("Services", {})
+    services = [_core_device_service_entry(service_provider, service) for service in CORE_DEVICE_DIAGNOSTIC_SERVICES]
+
+    if probe:
+        for service in services:
+            if not service["advertised"]:
+                continue
+            probe_result = await _probe_core_device_service(service_provider, service["name"], timeout)
+            service.update(probe_result)
+
+    advertised_count = sum(1 for service in services if service["advertised"])
+    connectable_count = sum(1 for service in services if service["connectable"] is True)
+    failed_probes = [service for service in services if service["connectable"] is False]
+    missing_services = [service for service in services if not service["advertised"]]
+    capabilities = _core_device_capabilities(services)
+
+    return {
+        "rsd": {
+            "address": getattr(service_provider.service, "address", None),
+            "name": service_provider.name,
+            "peer": {
+                "UniqueDeviceID": properties.get("UniqueDeviceID"),
+                "ProductType": properties.get("ProductType"),
+                "OSVersion": properties.get("OSVersion"),
+                "BuildVersion": properties.get("BuildVersion"),
+                "UniqueChipID": properties.get("UniqueChipID"),
+            },
+            "lockdown": {
+                "available": service_provider.lockdown is not None,
+                "all_values_available": service_provider.all_values is not None,
+            },
+        },
+        "summary": {
+            "probe": probe,
+            "timeout": timeout,
+            "advertised_services_total": len(advertised_services),
+            "known_core_device_services": len(services),
+            "known_core_device_services_advertised": advertised_count,
+            "known_core_device_services_missing": len(missing_services),
+            "known_core_device_services_connectable": connectable_count if probe else None,
+            "known_core_device_service_probe_failures": len(failed_probes) if probe else None,
+            "ok": capabilities["core"]["ready"] and (not failed_probes if probe else True),
+        },
+        "capabilities": capabilities,
+        "services": services,
+    }
+
+
+async def core_device_diagnose_task(
+    service_provider: RemoteServiceDiscoveryService, probe: bool, timeout: float
+) -> None:
+    print_json(await build_core_device_diagnose_payload(service_provider, probe=probe, timeout=timeout))
+
+
+@cli.command("diagnose")
+@async_command
+async def core_device_diagnose(
+    service_provider: RSDServiceProviderDep,
+    probe: Annotated[
+        bool,
+        typer.Option(
+            "--probe/--no-probe",
+            help="Open and close advertised CoreDevice services to check connectivity.",
+        ),
+    ] = True,
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", min=0.1, help="Per-service probe timeout in seconds."),
+    ] = 2.0,
+) -> None:
+    """Report CoreDevice/RSD service readiness for debugging remote-control failures."""
+    await core_device_diagnose_task(service_provider, probe, timeout)
+
+
 async def core_device_list_directory_task(
     service_provider: RemoteServiceDiscoveryService, domain: str, path: str, identifier: str
 ) -> None:
