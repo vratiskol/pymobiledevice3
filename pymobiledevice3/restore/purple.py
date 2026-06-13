@@ -12,6 +12,11 @@ from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.restore.restored_client import RestoredClient
 from pymobiledevice3.service_connection import ServiceConnection
 
+PURPLE_REVERSE_PROXY_ENABLE_OPTION = "UsePurpleReverseProxy"
+PURPLE_REVERSE_PROXY_DISABLE_OPTION = "DisableReverseProxy"
+PURPLE_REVERSE_PROXY_LOG_LEVEL_OPTION = "PRPLogLevel"
+PURPLE_REVERSE_PROXY_SOCKS_HOST_OPTION = "SOCKSHost"
+PURPLE_REVERSE_PROXY_SOCKS_PORT_OPTION = "SOCKSPort"
 PURPLE_REVERSE_PROXY_LAUNCHD_PATH = Path("System/Library/LaunchDaemons/com.apple.PurpleReverseProxy.ramdisk.plist")
 PURPLE_REVERSE_PROXY_EXECUTABLE_PATH = Path("usr/libexec/PurpleReverseProxy")
 PURPLE_REVERSE_PROXY_DEVICE_LIBRARY_PATH = Path("usr/lib/libReverseProxyDevice.dylib")
@@ -81,6 +86,7 @@ PURPLE_REVERSE_PROXY_STRING_MARKERS = {
         "DataRequestMsg",
         "AsyncDataRequestMsg",
         "PreviousRestoreLogMsg",
+        "PRPLogLevel",
     ],
     "fdr_library": [
         "_AMFDRHttpCopyPurpleReverseProxyInformation",
@@ -92,6 +98,9 @@ PURPLE_REVERSE_PROXY_STRING_MARKERS = {
     ],
     "aru_service": [
         "DisableReverseProxy",
+        "SOCKSHost",
+        "SOCKSPort",
+        "RestoreOptions",
         "com.apple.private.PurpleReverseProxy.allowed",
     ],
 }
@@ -111,8 +120,11 @@ PURPLE_REVERSE_PROXY_CATALOG = {
         "com.apple.libReverseProxyDevice",
     ],
     "restore_options": {
-        "enable": "UsePurpleReverseProxy",
-        "disable": "DisableReverseProxy",
+        "enable": PURPLE_REVERSE_PROXY_ENABLE_OPTION,
+        "disable": PURPLE_REVERSE_PROXY_DISABLE_OPTION,
+        "log_level": PURPLE_REVERSE_PROXY_LOG_LEVEL_OPTION,
+        "socks_host": PURPLE_REVERSE_PROXY_SOCKS_HOST_OPTION,
+        "socks_port": PURPLE_REVERSE_PROXY_SOCKS_PORT_OPTION,
         "disable_when_socks_host_is_set": True,
     },
     "fdr_symbols": [
@@ -139,6 +151,58 @@ PURPLE_REVERSE_PROXY_CATALOG = {
         "device_library": str(PURPLE_REVERSE_PROXY_DEVICE_LIBRARY_PATH),
     },
 }
+
+
+def build_purple_reverse_proxy_restore_options(
+    *,
+    enable: bool = False,
+    disable: bool = False,
+    log_level: Optional[int] = None,
+    socks_host: Optional[str] = None,
+    socks_port: Optional[int] = None,
+) -> dict[str, Any]:
+    if enable and disable:
+        raise ValueError("UsePurpleReverseProxy and DisableReverseProxy are mutually exclusive")
+    if socks_port is not None and socks_host is None:
+        raise ValueError("SOCKSPort requires SOCKSHost")
+    if log_level is not None and not 0 <= log_level <= 7:
+        raise ValueError("PRPLogLevel must be between 0 and 7")
+
+    restore_options: dict[str, Any] = {}
+    notes = []
+    if enable:
+        restore_options[PURPLE_REVERSE_PROXY_ENABLE_OPTION] = True
+    if disable:
+        restore_options[PURPLE_REVERSE_PROXY_DISABLE_OPTION] = True
+    if log_level is not None:
+        restore_options[PURPLE_REVERSE_PROXY_LOG_LEVEL_OPTION] = log_level
+    if socks_host is not None:
+        restore_options[PURPLE_REVERSE_PROXY_SOCKS_HOST_OPTION] = socks_host
+        restore_options[PURPLE_REVERSE_PROXY_SOCKS_PORT_OPTION] = socks_port if socks_port is not None else 1081
+        restore_options[PURPLE_REVERSE_PROXY_DISABLE_OPTION] = True
+        notes.append("SOCKSHost disables PurpleReverseProxy according to ARUService RestoreOptions evidence.")
+
+    return {
+        "checked": True,
+        "experimental": True,
+        "restore_options": restore_options,
+        "evidence": {
+            "enable": "libamsupport UsePurpleReverseProxy / _kAMSupportHttpOptionUsePurpleReverseProxy",
+            "disable": "ARUService DisableReverseProxy",
+            "log_level": "restored_update PRPLogLevel",
+            "socks": "ARUService SOCKSHost / SOCKSPort",
+            "fdr": "libFDR _AMFDRHttpCopyPurpleReverseProxyInformation",
+        },
+        "notes": notes,
+    }
+
+
+def apply_purple_reverse_proxy_restore_options(restore_options: Any, options: dict[str, Any]) -> None:
+    if isinstance(restore_options, dict):
+        restore_options.update(options)
+        return
+    for key, value in options.items():
+        setattr(restore_options, key, value)
 
 
 def _error_result(e: BaseException) -> dict[str, Any]:
@@ -392,6 +456,9 @@ def inspect_purple_reverse_proxy_root_deep(root: Path) -> dict[str, Any]:
         "proxy_dictionary_evidence": strings["device_library"]["markers"].get("CopyProxyDictionaryWithOptions") is True
         and strings["device_library"]["markers"].get("Ping") is True
         and strings["device_library"]["markers"].get("Pong") is True,
+        "restore_options_evidence": strings["amsupport_library"]["markers"].get("UsePurpleReverseProxy") is True
+        and strings["restored_update"]["markers"].get("PRPLogLevel") is True
+        and strings["aru_service"]["markers"].get("DisableReverseProxy") is True,
         "entitlement_evidence": bool(entitlement_components),
         "active_live_probe_required": True,
     }

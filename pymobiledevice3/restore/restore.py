@@ -28,6 +28,7 @@ from pymobiledevice3.restore.device import Device
 from pymobiledevice3.restore.fdr import FDRClient, fdr_type, start_fdr_task
 from pymobiledevice3.restore.ftab import Ftab
 from pymobiledevice3.restore.mbn import mbn_mav25_stitch, mbn_stitch
+from pymobiledevice3.restore.purple import apply_purple_reverse_proxy_restore_options
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore_options import RestoreOptions
 from pymobiledevice3.restore.restored_client import RestoredClient
@@ -48,7 +49,15 @@ known_errors = {
 
 
 class Restore(BaseRestore):
-    def __init__(self, ipsw: IPSW, device: Device, tss=None, behavior: Behavior = Behavior.Update, ignore_fdr=False):
+    def __init__(
+        self,
+        ipsw: IPSW,
+        device: Device,
+        tss=None,
+        behavior: Behavior = Behavior.Update,
+        ignore_fdr=False,
+        purple_restore_options: Optional[dict] = None,
+    ):
         super().__init__(ipsw, device, tss, behavior)
         self.recovery = Recovery(ipsw, device, tss=tss, behavior=behavior)
         self.bbtss: Optional[TSSResponse] = None
@@ -59,6 +68,7 @@ class Restore(BaseRestore):
         # perform an FDR communication, but without really establishing any
         self._fdr: Optional[ServiceConnection] = None
         self._ignore_fdr = ignore_fdr
+        self._purple_restore_options = purple_restore_options or {}
 
         # queried in update(), while device is still in normal mode.
         self._preflight_info = None
@@ -1351,6 +1361,8 @@ class Restore(BaseRestore):
             restore_behavior=self.build_identity.restore_behavior,
             msp=self.build_identity.minimum_system_partition,
         )
+        if self._purple_restore_options:
+            apply_purple_reverse_proxy_restore_options(opts, self._purple_restore_options)
 
         # start the restore process
         await self._restored.start_restore(opts)

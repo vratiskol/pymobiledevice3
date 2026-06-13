@@ -36,6 +36,7 @@ from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.restore.device import Device
 from pymobiledevice3.restore.purple import (
     build_purple_reverse_proxy_info,
+    build_purple_reverse_proxy_restore_options,
     collect_live_purple_reverse_proxy_probe,
     collect_live_purple_reverse_proxy_status,
 )
@@ -200,13 +201,27 @@ def query_ipswme(identifier: str) -> str:
     return firmwares[idx]["url"]
 
 
-async def restore_update_task(device: Device, ipsw: IPSW, tss: Optional[dict], erase: bool, ignore_fdr: bool) -> None:
+async def restore_update_task(
+    device: Device,
+    ipsw: IPSW,
+    tss: Optional[dict],
+    erase: bool,
+    ignore_fdr: bool,
+    purple_restore_options: Optional[dict[str, Any]] = None,
+) -> None:
     behavior = Behavior.Update
     if erase:
         behavior = Behavior.Erase
 
     try:
-        await Restore(ipsw, device, tss=tss, behavior=behavior, ignore_fdr=ignore_fdr).update()
+        await Restore(
+            ipsw,
+            device,
+            tss=tss,
+            behavior=behavior,
+            ignore_fdr=ignore_fdr,
+            purple_restore_options=purple_restore_options,
+        ).update()
     except Exception:
         # click may "swallow" several exception types so we try to catch them all here
         traceback.print_exc()
@@ -767,6 +782,46 @@ async def restore_purple_notify(
         raise typer.Exit(1)
 
 
+@cli.command("purple-restore-options")
+@async_command
+async def restore_purple_restore_options(
+    enable: Annotated[
+        bool,
+        typer.Option("--enable", help="Set UsePurpleReverseProxy in the modeled RestoreOptions patch."),
+    ] = False,
+    disable: Annotated[
+        bool,
+        typer.Option("--disable", help="Set DisableReverseProxy in the modeled RestoreOptions patch."),
+    ] = False,
+    log_level: Annotated[
+        Optional[int],
+        typer.Option("--log-level", min=0, max=7, help="Set restored_update PRPLogLevel in RestoreOptions."),
+    ] = None,
+    socks_host: Annotated[
+        Optional[str],
+        typer.Option("--socks-host", help="Set ARUService SOCKSHost in RestoreOptions."),
+    ] = None,
+    socks_port: Annotated[
+        Optional[int],
+        typer.Option("--socks-port", min=1, max=0xFFFF, help="Set ARUService SOCKSPort in RestoreOptions."),
+    ] = None,
+) -> None:
+    """
+    Build the experimental PurpleReverseProxy RestoreOptions patch without restoring a device.
+    """
+    try:
+        result = build_purple_reverse_proxy_restore_options(
+            enable=enable,
+            disable=disable,
+            log_level=log_level,
+            socks_host=socks_host,
+            socks_port=socks_port,
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from None
+    print_json(result, colored=False)
+
+
 @cli.command("update")
 @async_command
 async def restore_update(
@@ -781,9 +836,53 @@ async def restore_update(
         bool,
         typer.Option(help="Connect to the FDR service only (debug mode; no traffic proxying)."),
     ] = False,
+    use_purple_reverse_proxy: Annotated[
+        bool,
+        typer.Option(
+            "--use-purple-reverse-proxy",
+            help="Set UsePurpleReverseProxy in RestoreOptions (experimental; iOS 27 RestoreOS evidence).",
+        ),
+    ] = False,
+    disable_purple_reverse_proxy: Annotated[
+        bool,
+        typer.Option(
+            "--disable-purple-reverse-proxy",
+            help="Set DisableReverseProxy in RestoreOptions (experimental; iOS 27 RestoreOS evidence).",
+        ),
+    ] = False,
+    purple_log_level: Annotated[
+        Optional[int],
+        typer.Option("--purple-log-level", min=0, max=7, help="Set restored_update PRPLogLevel in RestoreOptions."),
+    ] = None,
+    purple_socks_host: Annotated[
+        Optional[str],
+        typer.Option("--purple-socks-host", help="Set ARUService SOCKSHost in RestoreOptions."),
+    ] = None,
+    purple_socks_port: Annotated[
+        Optional[int],
+        typer.Option("--purple-socks-port", min=1, max=0xFFFF, help="Set ARUService SOCKSPort in RestoreOptions."),
+    ] = None,
 ) -> None:
     """
     Update or restore the device using an IPSW (local path or URL).
     """
+    purple_restore_options = None
+    if (
+        use_purple_reverse_proxy
+        or disable_purple_reverse_proxy
+        or purple_log_level is not None
+        or purple_socks_host is not None
+        or purple_socks_port is not None
+    ):
+        try:
+            purple_restore_options = build_purple_reverse_proxy_restore_options(
+                enable=use_purple_reverse_proxy,
+                disable=disable_purple_reverse_proxy,
+                log_level=purple_log_level,
+                socks_host=purple_socks_host,
+                socks_port=purple_socks_port,
+            )["restore_options"]
+        except ValueError as e:
+            raise click.ClickException(str(e)) from None
     with ipsw_ctx as ipsw:
-        await restore_update_task(device, ipsw, tss, erase, ignore_fdr)
+        await restore_update_task(device, ipsw, tss, erase, ignore_fdr, purple_restore_options=purple_restore_options)

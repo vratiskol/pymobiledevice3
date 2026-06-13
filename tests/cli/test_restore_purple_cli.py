@@ -11,7 +11,9 @@ from pymobiledevice3.cli import restore as restore_cli
 from pymobiledevice3.restore.purple import (
     PURPLE_REVERSE_PROXY_CATALOG,
     PURPLE_REVERSE_PROXY_LAUNCHD_PATH,
+    apply_purple_reverse_proxy_restore_options,
     build_purple_reverse_proxy_info,
+    build_purple_reverse_proxy_restore_options,
     collect_live_purple_reverse_proxy_probe,
     parse_purple_reverse_proxy_launchd,
 )
@@ -61,7 +63,14 @@ def test_purple_reverse_proxy_catalog_exposes_restoreos_identifiers():
     assert PURPLE_REVERSE_PROXY_CATALOG["availability"] == "restoreos_ramdisk"
     assert PURPLE_REVERSE_PROXY_CATALOG["launchd_label"] == "com.apple.PurpleReverseProxy.ramdisk"
     assert "com.apple.PurpleReverseProxy.transaction" in PURPLE_REVERSE_PROXY_CATALOG["lockdown_services"]
-    assert PURPLE_REVERSE_PROXY_CATALOG["restore_options"]["enable"] == "UsePurpleReverseProxy"
+    assert PURPLE_REVERSE_PROXY_CATALOG["restore_options"] == {
+        "enable": "UsePurpleReverseProxy",
+        "disable": "DisableReverseProxy",
+        "log_level": "PRPLogLevel",
+        "socks_host": "SOCKSHost",
+        "socks_port": "SOCKSPort",
+        "disable_when_socks_host_is_set": True,
+    }
     assert PURPLE_REVERSE_PROXY_CATALOG["notify_commands"] == ["RegisterNotify", "SetLogLevel"]
     assert PURPLE_REVERSE_PROXY_CATALOG["proxy_dictionary"] == {
         "function": "CopyProxyDictionaryWithOptions",
@@ -162,13 +171,13 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
             b"_kCFStreamPropertySOCKSProxyHost _kCFStreamPropertySOCKSProxyPort "
             b"RegisterNotify SetLogLevel Level RPSocketReadDictionary com.apple.PurpleReverseProxy.RPSocket"
         ),
-        "usr/local/bin/restored_update": b"/usr/lib/libReverseProxyDevice.dylib FDRSubmit",
+        "usr/local/bin/restored_update": b"/usr/lib/libReverseProxyDevice.dylib FDRSubmit PRPLogLevel",
         "usr/lib/libFDR.dylib": b"_AMFDRHttpCopyPurpleReverseProxyInformation",
         "usr/lib/libamsupport.dylib": (
             b"UsePurpleReverseProxy DisableReverseProxy _kAMSupportHttpOptionUsePurpleReverseProxy"
         ),
         "System/Library/PrivateFrameworks/AppleRestoreUtils.framework/XPCServices/ARUService.xpc/ARUService": (
-            b"com.apple.private.PurpleReverseProxy.allowed"
+            b"DisableReverseProxy SOCKSHost SOCKSPort RestoreOptions com.apple.private.PurpleReverseProxy.allowed"
         ),
     }
     for relative_path, data in files.items():
@@ -187,6 +196,8 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
     assert deep["strings"]["device_library"]["markers"]["CopyProxyDictionaryWithOptions"] is True
     assert deep["strings"]["device_library"]["markers"]["Ping"] is True
     assert deep["strings"]["device_library"]["markers"]["Pong"] is True
+    assert deep["strings"]["restored_update"]["markers"]["PRPLogLevel"] is True
+    assert deep["strings"]["aru_service"]["markers"]["SOCKSHost"] is True
     assert deep["strings"]["amsupport_library"]["markers"]["UsePurpleReverseProxy"] is True
     assert deep["strings"]["fdr_library"]["markers"]["_AMFDRHttpCopyPurpleReverseProxyInformation"] is True
     assert deep["entitlements"]["com.apple.private.PurpleReverseProxy.allowed"]["present"] is True
@@ -198,9 +209,47 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
         "control_protocol_evidence": True,
         "notify_protocol_evidence": True,
         "proxy_dictionary_evidence": True,
+        "restore_options_evidence": True,
         "entitlement_evidence": True,
         "active_live_probe_required": True,
     }
+
+
+def test_build_purple_reverse_proxy_restore_options_enables_prp():
+    result = build_purple_reverse_proxy_restore_options(enable=True, log_level=7)
+
+    assert result["restore_options"] == {
+        "UsePurpleReverseProxy": True,
+        "PRPLogLevel": 7,
+    }
+    assert result["evidence"]["fdr"] == "libFDR _AMFDRHttpCopyPurpleReverseProxyInformation"
+
+
+def test_build_purple_reverse_proxy_restore_options_socks_disables_prp():
+    result = build_purple_reverse_proxy_restore_options(socks_host="127.0.0.1", socks_port=4321)
+
+    assert result["restore_options"] == {
+        "SOCKSHost": "127.0.0.1",
+        "SOCKSPort": 4321,
+        "DisableReverseProxy": True,
+    }
+    assert result["notes"] == ["SOCKSHost disables PurpleReverseProxy according to ARUService RestoreOptions evidence."]
+
+
+def test_build_purple_reverse_proxy_restore_options_rejects_conflicts():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        build_purple_reverse_proxy_restore_options(enable=True, disable=True)
+
+
+def test_apply_purple_reverse_proxy_restore_options_updates_object():
+    class FakeRestoreOptions:
+        pass
+
+    options = FakeRestoreOptions()
+    apply_purple_reverse_proxy_restore_options(options, {"UsePurpleReverseProxy": True, "PRPLogLevel": 7})
+
+    assert options.UsePurpleReverseProxy is True
+    assert options.PRPLogLevel == 7
 
 
 def test_restore_purple_info_help():
@@ -505,6 +554,92 @@ def test_restore_purple_proxy_dict_strict_fails_when_ping_is_not_pong(monkeypatc
 
     assert result.exit_code == 1
     assert json.loads(result.output)["ping"]["pong"] is False
+
+
+def test_restore_purple_restore_options_help():
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-restore-options", "--help"])
+
+    assert result.exit_code == 0
+    assert "--enable" in result.output
+    assert "--disable" in result.output
+    assert "--log-level" in result.output
+    assert "--socks-host" in result.output
+    assert "--socks-port" in result.output
+
+
+def test_restore_purple_restore_options_prints_patch_json():
+    result = CliRunner().invoke(
+        __main__.app,
+        ["restore", "purple-restore-options", "--enable", "--log-level", "7"],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["restore_options"] == {
+        "UsePurpleReverseProxy": True,
+        "PRPLogLevel": 7,
+    }
+    assert output["evidence"]["log_level"] == "restored_update PRPLogLevel"
+
+
+def test_restore_purple_restore_options_rejects_conflicting_flags():
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-restore-options", "--enable", "--disable"])
+
+    assert result.exit_code != 0
+    assert "mutually exclusive" in str(result.exception)
+
+
+def test_restore_update_help_exposes_purple_flags():
+    result = CliRunner().invoke(__main__.app, ["restore", "update", "--help"], env={"COLUMNS": "200"})
+
+    assert result.exit_code == 0
+    assert "--use-purple-reverse-proxy" in result.output
+    assert "--disable-purple-reverse-proxy" in result.output
+    assert "--purple-log-level" in result.output
+    assert "--purple-socks-host" in result.output
+    assert "--purple-socks-port" in result.output
+
+
+@pytest.mark.asyncio
+async def test_restore_update_task_passes_purple_restore_options(monkeypatch):
+    calls = []
+
+    class FakeRestore:
+        def __init__(self, ipsw, device, tss=None, behavior=None, ignore_fdr=False, purple_restore_options=None):
+            calls.append({
+                "ipsw": ipsw,
+                "device": device,
+                "tss": tss,
+                "behavior": behavior,
+                "ignore_fdr": ignore_fdr,
+                "purple_restore_options": purple_restore_options,
+            })
+
+        async def update(self):
+            calls[-1]["updated"] = True
+
+    monkeypatch.setattr(restore_cli, "Restore", FakeRestore)
+
+    await restore_cli.restore_update_task(
+        "fake-device",
+        "fake-ipsw",
+        {"tss": True},
+        erase=False,
+        ignore_fdr=False,
+        purple_restore_options={"UsePurpleReverseProxy": True},
+    )
+
+    assert calls == [
+        {
+            "ipsw": "fake-ipsw",
+            "device": "fake-device",
+            "tss": {"tss": True},
+            "behavior": restore_cli.Behavior.Update,
+            "ignore_fdr": False,
+            "purple_restore_options": {"UsePurpleReverseProxy": True},
+            "updated": True,
+        }
+    ]
 
 
 def test_restore_purple_notify_help():
