@@ -131,6 +131,7 @@ class LockdownClient(ABC, LockdownServiceProvider):
         self.unique_chip_id = None
         self.device_public_key = None
         self.product_type = None
+        self._reestablishing_connection = False
 
     @classmethod
     async def create(
@@ -1217,12 +1218,16 @@ class LockdownClient(ABC, LockdownServiceProvider):
                 # ServiceConnection streams are loop-bound; reconnect if this client was created in another loop.
                 if isinstance(e, RuntimeError) and "different event loop" not in str(e):
                     raise
+                if self._reestablishing_connection:
+                    raise
                 await self.areestablish_connection()
                 response = await self.service.send_recv_plist(message)
             try:
                 return self._verify_request_response(request, response, verify_request=verify_request)
             except (InvalidConnectionError, LockdownError) as e:
                 if not (isinstance(e, InvalidConnectionError) or str(e) == "SessionInactive"):
+                    raise
+                if self._reestablishing_connection:
                     raise
                 await self.areestablish_connection()
                 response = await self.service.send_recv_plist(message)
@@ -1351,12 +1356,19 @@ class LockdownClient(ABC, LockdownServiceProvider):
 
         :return: None
         """
-        await self.close()
-        self.session_id = None
-        self.service = await self.create_service_connection(self.port)
-        self.paired = False
-        if self.pair_record is not None:
-            await self.validate_pairing()
+        if self._reestablishing_connection:
+            raise ConnectionTerminatedError()
+
+        self._reestablishing_connection = True
+        try:
+            await self.close()
+            self.session_id = None
+            self.service = await self.create_service_connection(self.port)
+            self.paired = False
+            if self.pair_record is not None:
+                await self.validate_pairing()
+        finally:
+            self._reestablishing_connection = False
 
 
 class UsbmuxLockdownClient(LockdownClient):
