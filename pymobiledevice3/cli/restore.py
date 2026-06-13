@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import logging
 import plistlib
@@ -5,7 +6,7 @@ import tempfile
 import traceback
 from collections.abc import Iterator
 from pathlib import Path
-from typing import IO, Annotated, Optional, Union
+from typing import IO, Annotated, Any, Optional, Union
 
 import click
 import requests
@@ -23,11 +24,18 @@ from pymobiledevice3.cli.cli_common import (
     prompt_selection,
 )
 from pymobiledevice3.exceptions import ConnectionFailedError, ConnectionFailedToUsbmuxdError, IncorrectModeError
-from pymobiledevice3.irecv import IRecv
+from pymobiledevice3.irecv import (
+    IBOOT_FLAG_EFFECTIVE_PRODUCTION_MODE,
+    IBOOT_FLAG_EFFECTIVE_SECURITY_MODE,
+    IBOOT_FLAG_IMAGE4_AWARE,
+    IRecv,
+)
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.restore.device import Device
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore import Restore
+from pymobiledevice3.restore.restored_client import RestoredClient
+from pymobiledevice3.service_connection import ServiceConnection
 from pymobiledevice3.services.diagnostics import DiagnosticsService
 from pymobiledevice3.utils import file_download, start_ipython_shell
 
@@ -162,6 +170,264 @@ BehaviorOption = Annotated[
     Behavior,
     typer.Option(help="Restore behavior to use when selecting the BuildIdentity."),
 ]
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _int_info(value: Optional[int]) -> Optional[dict]:
+    if value is None:
+        return None
+    return {
+        "decimal": value,
+        "hex": f"0x{value:x}",
+    }
+
+
+def _parse_ecid(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    value = value.strip()
+    if value.lower().startswith("0x"):
+        return int(value, 16)
+    try:
+        return int(value, 10)
+    except ValueError:
+        return int(value, 16)
+
+
+def _error_info(error: Exception) -> dict:
+    return {
+        "type": error.__class__.__name__,
+        "message": str(error),
+    }
+
+
+def _matches_ecid(ecid: Optional[int], found_ecid: Optional[int]) -> bool:
+    return ecid is None or found_ecid == ecid
+
+
+def _lockdown_restore_info(lockdown, connection_type: str) -> dict:
+    all_values = lockdown.all_values
+    ap_parameters = all_values.get("ApParameters") or {}
+    unique_chip_id = all_values.get("UniqueChipID")
+    return {
+        "source": "lockdown",
+        "mode": "normal",
+        "transport": connection_type,
+        "identifier": lockdown.udid or all_values.get("UniqueDeviceID"),
+        "ecid": _int_info(unique_chip_id),
+        "product": {
+            "type": lockdown.product_type or all_values.get("ProductType"),
+            "version": all_values.get("ProductVersion"),
+            "build_version": all_values.get("BuildVersion"),
+        },
+        "hardware": {
+            "model": all_values.get("HardwareModel"),
+            "platform": all_values.get("HardwarePlatform"),
+            "device_class": all_values.get("DeviceClass"),
+            "image4_supported": all_values.get("Image4Supported"),
+        },
+        "nonces": {
+            "ap_nonce": _json_safe(ap_parameters.get("ApNonce") or all_values.get("ApNonce")),
+            "sep_nonce": _json_safe(ap_parameters.get("SepNonce") or all_values.get("SEPNonce")),
+        },
+        "preflight": {
+            "ap_parameters_available": bool(ap_parameters),
+            "firmware_preflight_info_available": "FirmwarePreflightInfo" in all_values,
+        },
+    }
+
+
+def _irecv_restore_info(irecv: IRecv) -> dict:
+    mode = irecv.mode
+    iboot_flags = irecv.ibfl
+    return {
+        "source": "irecv",
+        "mode": {
+            "name": mode.name,
+            "value": f"0x{mode.value:04x}",
+            "is_recovery": mode.is_recovery,
+        },
+        "ecid": _int_info(irecv.ecid),
+        "product": {
+            "type": irecv.product_type,
+            "hardware_model": irecv.hardware_model,
+            "display_name": irecv.display_name,
+        },
+        "hardware": {
+            "chip_id": _int_info(irecv.chip_id),
+            "board_id": _int_info(irecv.board_id),
+            "serial_number": irecv.serial_number,
+        },
+        "iboot": {
+            "version": irecv.iboot_version,
+            "image4_supported": bool(irecv.is_image4_supported),
+            "flags": {
+                "raw": _int_info(iboot_flags),
+                "image4_aware": bool(iboot_flags & IBOOT_FLAG_IMAGE4_AWARE),
+                "effective_security_mode": bool(iboot_flags & IBOOT_FLAG_EFFECTIVE_SECURITY_MODE),
+                "effective_production_mode": bool(iboot_flags & IBOOT_FLAG_EFFECTIVE_PRODUCTION_MODE),
+            },
+        },
+        "nonces": {
+            "ap_nonce": _json_safe(irecv.ap_nonce),
+            "sep_nonce": _json_safe(irecv.sep_nonce),
+        },
+    }
+
+
+def _restored_restore_info(
+    restored_client: RestoredClient, query_type: dict, connection_type: Optional[str]
+) -> dict:
+    return {
+        "source": "restored",
+        "mode": "restored",
+        "transport": connection_type,
+        "identifier": restored_client.udid,
+        "ecid": _int_info(restored_client.ecid),
+        "restore_protocol_version": restored_client.version,
+        "query_type": _json_safe(query_type),
+        "hardware_info": _json_safe(restored_client.hardware_info),
+        "saved_debug_info": _json_safe(restored_client.saved_debug_info),
+    }
+
+
+async def _inspect_lockdown_devices(ecid: Optional[int], include_errors: bool) -> tuple[list[dict], list[dict]]:
+    devices = []
+    errors = []
+    try:
+        mux_devices = await usbmux.list_devices()
+    except Exception as e:
+        return [], [{"source": "usbmux", "error": _error_info(e)}] if include_errors else []
+
+    for mux_device in mux_devices:
+        if mux_device.connection_type != "USB":
+            continue
+        lockdown = None
+        try:
+            lockdown = await create_using_usbmux(
+                serial=mux_device.serial,
+                connection_type=mux_device.connection_type,
+                autopair=False,
+            )
+            unique_chip_id = lockdown.all_values.get("UniqueChipID")
+            if _matches_ecid(ecid, unique_chip_id):
+                devices.append(_lockdown_restore_info(lockdown, mux_device.connection_type))
+        except Exception as e:
+            if include_errors:
+                errors.append({
+                    "source": "lockdown",
+                    "identifier": mux_device.serial,
+                    "error": _error_info(e),
+                })
+        finally:
+            if lockdown is not None:
+                await lockdown.close()
+    return devices, errors
+
+
+async def _inspect_restored_devices(
+    ecid: Optional[int], include_errors: bool, timeout: float
+) -> tuple[list[dict], list[dict]]:
+    devices = []
+    errors = []
+    try:
+        mux_devices = await usbmux.list_devices()
+    except Exception as e:
+        return [], [{"source": "usbmux", "error": _error_info(e)}] if include_errors else []
+
+    for mux_device in mux_devices:
+        if mux_device.connection_type != "USB":
+            continue
+        service = None
+        try:
+            service = await asyncio.wait_for(
+                ServiceConnection.create_using_usbmux(
+                    mux_device.serial,
+                    RestoredClient.SERVICE_PORT,
+                    connection_type=mux_device.connection_type,
+                ),
+                timeout=timeout,
+            )
+            await asyncio.wait_for(service.start(), timeout=timeout)
+            query_type = await asyncio.wait_for(service.send_recv_plist({"Request": "QueryType"}), timeout=timeout)
+            if query_type.get("Type") != "com.apple.mobile.restored":
+                continue
+            restored_client = RestoredClient(mux_device.serial, query_type.get("RestoreProtocolVersion"), service)
+            await asyncio.wait_for(restored_client._connect(), timeout=timeout)
+            if _matches_ecid(ecid, restored_client.ecid):
+                devices.append(_restored_restore_info(restored_client, query_type, mux_device.connection_type))
+        except Exception as e:
+            if include_errors:
+                errors.append({
+                    "source": "restored",
+                    "identifier": mux_device.serial,
+                    "error": _error_info(e),
+                })
+        finally:
+            if service is not None:
+                await service.close()
+    return devices, errors
+
+
+def _inspect_irecv_device(ecid: Optional[int], include_errors: bool, timeout: float) -> tuple[list[dict], list[dict]]:
+    try:
+        irecv = IRecv(ecid=ecid, timeout=timeout)
+    except Exception as e:
+        return [], [{"source": "irecv", "error": _error_info(e)}] if include_errors else []
+
+    if not _matches_ecid(ecid, irecv.ecid):
+        return [], []
+    return [_irecv_restore_info(irecv)], []
+
+
+async def restore_info_task(ecid: Optional[str], wait: float, include_errors: bool) -> None:
+    parsed_ecid = _parse_ecid(ecid)
+    timeout = max(wait, 0.1)
+    lockdown_devices, lockdown_errors = await _inspect_lockdown_devices(parsed_ecid, include_errors)
+    restored_devices, restored_errors = await _inspect_restored_devices(parsed_ecid, include_errors, timeout)
+    irecv_devices, irecv_errors = _inspect_irecv_device(parsed_ecid, include_errors, timeout)
+    devices = lockdown_devices + restored_devices + irecv_devices
+    print_json({
+        "ecid_filter": _int_info(parsed_ecid),
+        "summary": {
+            "devices": len(devices),
+            "normal": sum(1 for device in devices if device["source"] == "lockdown"),
+            "restored": sum(1 for device in devices if device["source"] == "restored"),
+            "irecv": sum(1 for device in devices if device["source"] == "irecv"),
+            "errors": len(lockdown_errors + restored_errors + irecv_errors),
+        },
+        "devices": devices,
+        "errors": lockdown_errors + restored_errors + irecv_errors,
+    })
+
+
+@cli.command("info")
+@async_command
+async def restore_info(
+    ecid: Annotated[
+        Optional[str],
+        typer.Option(help="Target ECID as decimal, 0xHEX, or plain hex."),
+    ] = None,
+    wait: Annotated[
+        float,
+        typer.Option("--wait", min=0.0, help="Seconds to wait while scanning for Recovery/DFU USB mode."),
+    ] = 0.1,
+    include_errors: Annotated[
+        bool,
+        typer.Option("--include-errors", help="Include per-transport discovery errors in the JSON output."),
+    ] = False,
+) -> None:
+    """Inspect normal, restored, Recovery, or DFU restore-mode state without changing the device."""
+    await restore_info_task(ecid, wait, include_errors)
 
 
 def query_ipswme(identifier: str) -> str:
