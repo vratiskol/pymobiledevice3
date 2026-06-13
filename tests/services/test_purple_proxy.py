@@ -11,6 +11,7 @@ from pymobiledevice3.restore.purple_proxy import (
     PurpleProxyClient,
     PurpleProxyCommand,
     probe_purple_proxy_hello,
+    run_purple_proxy_control_command,
     sanitize_purple_proxy_response,
 )
 
@@ -41,6 +42,14 @@ class FakePurpleProxyClient:
 
     async def hello_control(self, protocol_version=1):
         assert protocol_version == 2
+        return self.response
+
+    async def begin_control(self, protocol_version=1):
+        assert protocol_version == 2
+        return self.response
+
+    async def wait_socket(self, conn_port=PURPLE_PROXY_SOCKS_PORT):
+        assert conn_port == 4321
         return self.response
 
     async def close(self):
@@ -92,12 +101,12 @@ async def test_control_command_helpers_use_firmware_command_names():
     service = FakeService(responses=[{"Status": "OK"}, {"SocketReady": True}, {"Pong": True}])
     client = PurpleProxyClient(service)
 
-    assert await client.begin_control(CtrlConn=True) == {"Status": "OK"}
-    assert await client.wait_socket(ConnPort=1081) == {"SocketReady": True}
+    assert await client.begin_control(protocol_version=2, CtrlConn=True) == {"Status": "OK"}
+    assert await client.wait_socket(conn_port=1081) == {"SocketReady": True}
     assert await client.send_ping() == {"Pong": True}
 
     assert service.sent == [
-        {"Command": "BeginCtrl", "CtrlConn": True},
+        {"Command": "BeginCtrl", "CtrlProtoVersion": 2, "CtrlConn": True},
         {"Command": "WaitSocket", "ConnPort": 1081},
         {"Command": "Ping"},
     ]
@@ -236,6 +245,75 @@ async def test_probe_purple_proxy_hello_returns_sanitized_response(monkeypatch):
     ]
     assert fake_client.closed is True
     assert "sensitive" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_run_purple_proxy_control_command_begin_returns_sanitized_response(monkeypatch):
+    fake_client = FakePurpleProxyClient({
+        "Status": "OK",
+        "SerialNumber": "sensitive",
+        "CtrlProtoVersion": 2,
+    })
+
+    async def fake_connect_control(udid=None, **kwargs):
+        return fake_client
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_control", staticmethod(fake_connect_control))
+
+    result = await run_purple_proxy_control_command(
+        PurpleProxyCommand.BEGIN_CONTROL,
+        timeout=0.1,
+        protocol_version=2,
+        include_response=True,
+    )
+
+    assert result == {
+        "checked": True,
+        "experimental": True,
+        "command": "BeginCtrl",
+        "port": PURPLE_PROXY_CONTROL_PORT,
+        "include_response": True,
+        "protocol_version": 2,
+        "reachable": True,
+        "response_keys": ["CtrlProtoVersion", "SerialNumber", "Status"],
+        "response": {
+            "Status": "OK",
+            "SerialNumber": "<redacted>",
+            "CtrlProtoVersion": 2,
+        },
+    }
+    assert fake_client.closed is True
+    assert "sensitive" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_run_purple_proxy_control_command_wait_socket_sends_conn_port(monkeypatch):
+    fake_client = FakePurpleProxyClient({"SocketReady": True})
+
+    async def fake_connect_control(udid=None, **kwargs):
+        return fake_client
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_control", staticmethod(fake_connect_control))
+
+    result = await run_purple_proxy_control_command(
+        PurpleProxyCommand.WAIT_SOCKET,
+        timeout=0.1,
+        conn_port=4321,
+        include_response=True,
+    )
+
+    assert result == {
+        "checked": True,
+        "experimental": True,
+        "command": "WaitSocket",
+        "port": PURPLE_PROXY_CONTROL_PORT,
+        "include_response": True,
+        "conn_port": 4321,
+        "reachable": True,
+        "response_keys": ["SocketReady"],
+        "response": {"SocketReady": True},
+    }
+    assert fake_client.closed is True
 
 
 @pytest.mark.asyncio

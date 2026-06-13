@@ -10,6 +10,11 @@ PURPLE_PROXY_SOCKS_PORT = 1081
 PURPLE_PROXY_CONTROL_PORT = 1082
 PURPLE_PROXY_NOTIFY_PORT = 1084
 PURPLE_PROXY_CONTROL_PROTOCOL_VERSION = 1
+PURPLE_PROXY_COMMAND_KEY = "Command"
+PURPLE_PROXY_CTRL_PROTO_VERSION_KEY = "CtrlProtoVersion"
+PURPLE_PROXY_CONN_PORT_KEY = "ConnPort"
+PURPLE_PROXY_CONN_PROTO_VERSION_KEY = "ConnProtoVersion"
+PURPLE_PROXY_IDENTIFIER_KEY = "Identifier"
 SENSITIVE_PURPLE_PROXY_KEYS = (
     "ecid",
     "serial",
@@ -137,7 +142,7 @@ class PurpleProxyClient:
     async def send_control_message(self, command: Union[str, PurpleProxyCommand], **fields: Any) -> None:
         if isinstance(command, PurpleProxyCommand):
             command = command.value
-        message = {"Command": command}
+        message = {PURPLE_PROXY_COMMAND_KEY: command}
         message.update(fields)
         await self.write_dictionary(message)
 
@@ -153,15 +158,33 @@ class PurpleProxyClient:
     ) -> dict[str, Any]:
         return await self.send_recv_control_message(
             PurpleProxyCommand.HELLO_CONTROL,
-            CtrlProtoVersion=protocol_version,
+            **{PURPLE_PROXY_CTRL_PROTO_VERSION_KEY: protocol_version},
             **fields,
         )
 
-    async def begin_control(self, **fields: Any) -> dict[str, Any]:
-        return await self.send_recv_control_message(PurpleProxyCommand.BEGIN_CONTROL, **fields)
+    async def begin_control(
+        self,
+        *,
+        protocol_version: int = PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
+        **fields: Any,
+    ) -> dict[str, Any]:
+        return await self.send_recv_control_message(
+            PurpleProxyCommand.BEGIN_CONTROL,
+            **{PURPLE_PROXY_CTRL_PROTO_VERSION_KEY: protocol_version},
+            **fields,
+        )
 
-    async def wait_socket(self, **fields: Any) -> dict[str, Any]:
-        return await self.send_recv_control_message(PurpleProxyCommand.WAIT_SOCKET, **fields)
+    async def wait_socket(
+        self,
+        *,
+        conn_port: int = PURPLE_PROXY_SOCKS_PORT,
+        **fields: Any,
+    ) -> dict[str, Any]:
+        return await self.send_recv_control_message(
+            PurpleProxyCommand.WAIT_SOCKET,
+            **{PURPLE_PROXY_CONN_PORT_KEY: conn_port},
+            **fields,
+        )
 
     async def send_ping(self, **fields: Any) -> dict[str, Any]:
         return await self.send_recv_control_message(PurpleProxyCommand.PING, **fields)
@@ -177,15 +200,46 @@ async def probe_purple_proxy_hello(
     connection_type: str = "USB",
     include_response: bool = False,
 ) -> dict[str, Any]:
+    return await run_purple_proxy_control_command(
+        PurpleProxyCommand.HELLO_CONTROL,
+        udid=udid,
+        usbmux_address=usbmux_address,
+        timeout=timeout,
+        port=port,
+        protocol_version=protocol_version,
+        connection_type=connection_type,
+        include_response=include_response,
+    )
+
+
+async def run_purple_proxy_control_command(
+    command: Union[str, PurpleProxyCommand],
+    *,
+    udid: Optional[str] = None,
+    usbmux_address: Optional[str] = None,
+    timeout: float = 1.0,
+    port: int = PURPLE_PROXY_CONTROL_PORT,
+    protocol_version: int = PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
+    conn_port: int = PURPLE_PROXY_SOCKS_PORT,
+    connection_type: str = "USB",
+    include_response: bool = False,
+) -> dict[str, Any]:
+    if isinstance(command, str):
+        command = PurpleProxyCommand(command)
+
     client = None
     result: dict[str, Any] = {
         "checked": True,
         "experimental": True,
-        "command": PurpleProxyCommand.HELLO_CONTROL.value,
+        "command": command.value,
         "port": port,
-        "protocol_version": protocol_version,
         "include_response": include_response,
     }
+    if command in (PurpleProxyCommand.HELLO_CONTROL, PurpleProxyCommand.BEGIN_CONTROL):
+        result["protocol_version"] = protocol_version
+    if command is PurpleProxyCommand.WAIT_SOCKET:
+        result["conn_port"] = conn_port
+
     try:
         client = await asyncio.wait_for(
             PurpleProxyClient.connect_control(
@@ -196,7 +250,14 @@ async def probe_purple_proxy_hello(
             ),
             timeout=timeout,
         )
-        response = await asyncio.wait_for(client.hello_control(protocol_version=protocol_version), timeout=timeout)
+        if command is PurpleProxyCommand.HELLO_CONTROL:
+            response = await asyncio.wait_for(client.hello_control(protocol_version=protocol_version), timeout=timeout)
+        elif command is PurpleProxyCommand.BEGIN_CONTROL:
+            response = await asyncio.wait_for(client.begin_control(protocol_version=protocol_version), timeout=timeout)
+        elif command is PurpleProxyCommand.WAIT_SOCKET:
+            response = await asyncio.wait_for(client.wait_socket(conn_port=conn_port), timeout=timeout)
+        else:
+            response = await asyncio.wait_for(client.send_ping(), timeout=timeout)
     except Exception as e:
         result.update({
             "reachable": False,

@@ -205,7 +205,10 @@ def test_restore_purple_control_help():
 
     assert result.exit_code == 0
     assert "--hello" in result.output
+    assert "--begin" in result.output
+    assert "--wait-socket" in result.output
     assert "--timeout" in result.output
+    assert "--conn-port" in result.output
     assert "--include-response" in result.output
     assert "--strict" in result.output
 
@@ -214,17 +217,26 @@ def test_restore_purple_control_requires_operation():
     result = CliRunner().invoke(__main__.app, ["restore", "purple-control"])
 
     assert result.exit_code != 0
-    assert "Only --hello is currently supported." in str(result.exception)
+    assert "Choose exactly one control operation" in str(result.exception)
+
+
+def test_restore_purple_control_rejects_multiple_operations():
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-control", "--hello", "--begin"])
+
+    assert result.exit_code != 0
+    assert "Choose exactly one control operation" in str(result.exception)
 
 
 def test_restore_purple_control_hello_prints_redacted_json(monkeypatch):
-    async def fake_probe_purple_proxy_hello(**kwargs):
+    async def fake_run_purple_proxy_control_command(command, **kwargs):
+        assert command.value == "HelloCtrl"
         assert kwargs == {
             "udid": "sensitive-udid",
             "usbmux_address": "/tmp/usbmux",
             "timeout": 0.5,
             "port": 1234,
             "protocol_version": 2,
+            "conn_port": 1081,
             "include_response": True,
         }
         return {
@@ -235,7 +247,7 @@ def test_restore_purple_control_hello_prints_redacted_json(monkeypatch):
             "response": {"SerialNumber": "<redacted>", "Status": "OK"},
         }
 
-    monkeypatch.setattr(restore_cli, "probe_purple_proxy_hello", fake_probe_purple_proxy_hello)
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_control_command", fake_run_purple_proxy_control_command)
 
     result = CliRunner().invoke(
         __main__.app,
@@ -264,8 +276,54 @@ def test_restore_purple_control_hello_prints_redacted_json(monkeypatch):
     assert "sensitive-udid" not in result.output
 
 
+def test_restore_purple_control_begin_prints_json(monkeypatch):
+    async def fake_run_purple_proxy_control_command(command, **kwargs):
+        assert command.value == "BeginCtrl"
+        assert kwargs["protocol_version"] == 3
+        return {
+            "checked": True,
+            "experimental": True,
+            "command": "BeginCtrl",
+            "protocol_version": 3,
+            "reachable": True,
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_control_command", fake_run_purple_proxy_control_command)
+
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-control", "--begin", "--protocol-version", "3"])
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["command"] == "BeginCtrl"
+    assert output["protocol_version"] == 3
+    assert output["reachable"] is True
+
+
+def test_restore_purple_control_wait_socket_prints_json(monkeypatch):
+    async def fake_run_purple_proxy_control_command(command, **kwargs):
+        assert command.value == "WaitSocket"
+        assert kwargs["conn_port"] == 4321
+        return {
+            "checked": True,
+            "experimental": True,
+            "command": "WaitSocket",
+            "conn_port": 4321,
+            "reachable": True,
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_control_command", fake_run_purple_proxy_control_command)
+
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-control", "--wait-socket", "--conn-port", "4321"])
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["command"] == "WaitSocket"
+    assert output["conn_port"] == 4321
+    assert output["reachable"] is True
+
+
 def test_restore_purple_control_strict_fails_when_unreachable(monkeypatch):
-    async def fake_probe_purple_proxy_hello(**kwargs):
+    async def fake_run_purple_proxy_control_command(command, **kwargs):
         return {
             "checked": True,
             "experimental": True,
@@ -274,7 +332,7 @@ def test_restore_purple_control_strict_fails_when_unreachable(monkeypatch):
             "error_type": "OSError",
         }
 
-    monkeypatch.setattr(restore_cli, "probe_purple_proxy_hello", fake_probe_purple_proxy_hello)
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_control_command", fake_run_purple_proxy_control_command)
 
     result = CliRunner().invoke(__main__.app, ["restore", "purple-control", "--hello", "--strict"])
 

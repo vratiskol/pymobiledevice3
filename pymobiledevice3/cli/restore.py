@@ -42,7 +42,9 @@ from pymobiledevice3.restore.purple import (
 from pymobiledevice3.restore.purple_proxy import (
     PURPLE_PROXY_CONTROL_PORT,
     PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
-    probe_purple_proxy_hello,
+    PURPLE_PROXY_SOCKS_PORT,
+    PurpleProxyCommand,
+    run_purple_proxy_control_command,
 )
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore import Restore
@@ -532,7 +534,18 @@ async def restore_purple_probe(
 async def restore_purple_control(
     hello: Annotated[
         bool,
-        typer.Option("--hello", help="Send an experimental HelloCtrl message to the PurpleReverseProxy control port."),
+        typer.Option(
+            "--hello",
+            help="Send the legacy experimental HelloCtrl message to the PurpleReverseProxy control port.",
+        ),
+    ] = False,
+    begin: Annotated[
+        bool,
+        typer.Option("--begin", help="Send BeginCtrl with CtrlProtoVersion to the PurpleReverseProxy control port."),
+    ] = False,
+    wait_socket: Annotated[
+        bool,
+        typer.Option("--wait-socket", help="Send WaitSocket with ConnPort to the PurpleReverseProxy control port."),
     ] = False,
     timeout: Annotated[
         float,
@@ -544,8 +557,12 @@ async def restore_purple_control(
     ] = PURPLE_PROXY_CONTROL_PORT,
     protocol_version: Annotated[
         int,
-        typer.Option("--protocol-version", min=0, help="CtrlProtoVersion value to send with HelloCtrl."),
+        typer.Option("--protocol-version", min=0, help="CtrlProtoVersion value to send with HelloCtrl or BeginCtrl."),
     ] = PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
+    conn_port: Annotated[
+        int,
+        typer.Option("--conn-port", min=1, max=0xFFFF, help="ConnPort value to send with WaitSocket."),
+    ] = PURPLE_PROXY_SOCKS_PORT,
     include_response: Annotated[
         bool,
         typer.Option("--include-response", help="Include the sanitized response dictionary in JSON output."),
@@ -566,15 +583,25 @@ async def restore_purple_control(
     """
     Send experimental PurpleReverseProxy control messages without restoring a device.
     """
-    if not hello:
-        raise click.ClickException("Only --hello is currently supported.")
+    operation_count = int(hello) + int(begin) + int(wait_socket)
+    if operation_count != 1:
+        raise click.ClickException("Choose exactly one control operation: --hello, --begin, or --wait-socket.")
 
-    result = await probe_purple_proxy_hello(
+    if hello:
+        command = PurpleProxyCommand.HELLO_CONTROL
+    elif begin:
+        command = PurpleProxyCommand.BEGIN_CONTROL
+    else:
+        command = PurpleProxyCommand.WAIT_SOCKET
+
+    result = await run_purple_proxy_control_command(
+        command,
         udid=udid,
         usbmux_address=usbmux_address,
         timeout=timeout,
         port=port,
         protocol_version=protocol_version,
+        conn_port=conn_port,
         include_response=include_response,
     )
     print_json(result, colored=False)
