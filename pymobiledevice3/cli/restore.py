@@ -1,11 +1,13 @@
+import asyncio
 import contextlib
 import logging
 import plistlib
 import tempfile
+import time
 import traceback
 from collections.abc import Iterator
 from pathlib import Path
-from typing import IO, Annotated, Optional, Union
+from typing import IO, Annotated, Any, Optional, Union
 
 import click
 import requests
@@ -22,13 +24,30 @@ from pymobiledevice3.cli.cli_common import (
     print_json,
     prompt_selection,
 )
-from pymobiledevice3.exceptions import ConnectionFailedError, ConnectionFailedToUsbmuxdError, IncorrectModeError
+from pymobiledevice3.exceptions import (
+    ConnectionFailedError,
+    ConnectionFailedToUsbmuxdError,
+    IncorrectModeError,
+    IRecvNoDeviceConnectedError,
+    PyMobileDevice3Exception,
+)
 from pymobiledevice3.irecv import IRecv
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.restore.device import Device
-from pymobiledevice3.restore.purple import build_purple_reverse_proxy_info, collect_live_purple_reverse_proxy_status
+from pymobiledevice3.restore.purple import (
+    build_purple_reverse_proxy_info,
+    collect_live_purple_reverse_proxy_probe,
+    collect_live_purple_reverse_proxy_status,
+)
+from pymobiledevice3.restore.purple_proxy import (
+    PURPLE_PROXY_CONTROL_PORT,
+    PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
+    probe_purple_proxy_hello,
+)
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore import Restore
+from pymobiledevice3.restore.restored_client import RestoredClient
+from pymobiledevice3.service_connection import ServiceConnection
 from pymobiledevice3.services.diagnostics import DiagnosticsService
 from pymobiledevice3.utils import file_download, start_ipython_shell
 
@@ -164,6 +183,8 @@ BehaviorOption = Annotated[
     typer.Option(help="Restore behavior to use when selecting the BuildIdentity."),
 ]
 
+RestoreExitState = dict[str, Any]
+
 
 def query_ipswme(identifier: str) -> str:
     resp = requests.get(IPSWME_API + identifier, headers={"Accept": "application/json"})
@@ -186,6 +207,142 @@ async def restore_update_task(device: Device, ipsw: IPSW, tss: Optional[dict], e
         raise
 
 
+def _lockdown_public_state(lockdown: Any) -> RestoreExitState:
+    state: RestoreExitState = {"state": "normal"}
+    for attr, key in (
+        ("product_type", "product_type"),
+        ("product_version", "product_version"),
+        ("build_version", "build_version"),
+    ):
+        value = getattr(lockdown, attr, None)
+        if value:
+            state[key] = value
+    return state
+
+
+def _irecv_public_state() -> Optional[RestoreExitState]:
+    try:
+        irecv = IRecv(timeout=0.2)
+    except IRecvNoDeviceConnectedError:
+        return None
+    except Exception:
+        logger.debug("failed to probe irecv state", exc_info=True)
+        return None
+
+    mode = irecv.mode
+    if mode is None:
+        return None
+
+    state: RestoreExitState = {
+        "state": "recovery" if mode.is_recovery else "dfu",
+        "mode": mode.name,
+    }
+    with contextlib.suppress(Exception):
+        state["product_type"] = irecv.product_type
+    return state
+
+
+async def _usbmux_query_type_state(device: Any) -> Optional[RestoreExitState]:
+    service: Optional[ServiceConnection] = None
+    try:
+        service = await ServiceConnection.create_using_usbmux(
+            device.serial,
+            RestoredClient.SERVICE_PORT,
+            connection_type=device.connection_type,
+        )
+        await service.start()
+        query_type = await service.send_recv_plist({"Request": "QueryType"})
+    except Exception:
+        logger.debug("failed to query usbmux QueryType state", exc_info=True)
+        return None
+    finally:
+        if service is not None:
+            with contextlib.suppress(Exception):
+                await service.close()
+
+    response_type = query_type.get("Type")
+    if response_type == "com.apple.mobile.restored":
+        return {
+            "state": "restored",
+            "restore_protocol_version": query_type.get("RestoreProtocolVersion"),
+        }
+    if response_type == "com.apple.mobile.lockdown":
+        return {"state": "normal"}
+
+    return None
+
+
+async def detect_restore_exit_state() -> RestoreExitState:
+    """
+    Return a redacted post-exit device state.
+
+    Recovery/DFU devices are not visible through usbmuxd, so both irecv and usbmuxd
+    are probed. Identifiers such as UDID, serial number, and ECID are intentionally
+    omitted from the returned structure.
+    """
+    irecv_state = _irecv_public_state()
+    if irecv_state is not None:
+        return irecv_state
+
+    try:
+        devices = [device for device in await usbmux.list_devices() if device.connection_type == "USB"]
+    except ConnectionFailedToUsbmuxdError:
+        return {"state": "not_seen", "reason": "usbmuxd_unavailable"}
+    except OSError as e:
+        return {"state": "not_seen", "reason": f"usbmuxd_error:{e.__class__.__name__}"}
+
+    for device in devices:
+        query_type_state = await _usbmux_query_type_state(device)
+        if query_type_state is None:
+            continue
+        if query_type_state["state"] == "restored":
+            return query_type_state
+
+        try:
+            lockdown = await create_using_usbmux(
+                serial=device.serial,
+                connection_type="USB",
+                autopair=False,
+            )
+        except (PyMobileDevice3Exception, OSError) as e:
+            query_type_state["lockdown_available"] = False
+            query_type_state["reason"] = f"lockdown_error:{e.__class__.__name__}"
+            return query_type_state
+        return _lockdown_public_state(lockdown)
+
+    for device in devices:
+        try:
+            lockdown = await create_using_usbmux(
+                serial=device.serial,
+                connection_type="USB",
+                autopair=False,
+            )
+        except (PyMobileDevice3Exception, OSError):
+            continue
+        return _lockdown_public_state(lockdown)
+
+    return {"state": "not_seen", "usb_device_count": len(devices)}
+
+
+async def wait_for_restore_exit_state(timeout: float, poll_interval: float = 1.0) -> RestoreExitState:
+    start = time.monotonic()
+    deadline = start + timeout
+    last_state: RestoreExitState = {"state": "not_seen"}
+
+    while time.monotonic() < deadline:
+        last_state = await detect_restore_exit_state()
+        if last_state["state"] not in ("not_seen", "not_seen_timeout"):
+            last_state["elapsed"] = round(time.monotonic() - start, 3)
+            return last_state
+        await asyncio.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+
+    return {
+        "state": "not_seen_timeout",
+        "timeout": timeout,
+        "last_probe": last_state,
+    }
+
+
 @cli.command("shell")
 def restore_shell(device: DeviceDep) -> None:
     """create an IPython shell for interacting with iBoot"""
@@ -206,11 +363,48 @@ async def restore_enter(device: DeviceDep) -> None:
 
 
 @cli.command("exit")
-def restore_exit() -> None:
+def restore_exit(
+    wait: Annotated[
+        bool,
+        typer.Option("--wait", help="Wait for the device to reappear and report its post-exit mode."),
+    ] = False,
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", min=1.0, help="Maximum seconds to wait when --wait is used."),
+    ] = 120.0,
+    poll_interval: Annotated[
+        float,
+        typer.Option("--poll-interval", min=0.1, help="Seconds between post-exit state probes."),
+    ] = 1.0,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print a machine-readable result."),
+    ] = False,
+) -> None:
     """exit Recovery mode"""
+    result: RestoreExitState = {
+        "command": "restore exit",
+        "reboot_command_sent": False,
+        "waited": wait,
+    }
+
     irecv = IRecv()
     irecv.set_autoboot(True)
     irecv.reboot()
+    result["reboot_command_sent"] = True
+
+    if wait:
+        result["post_exit"] = cli_loop.run_until_complete(
+            wait_for_restore_exit_state(timeout=timeout, poll_interval=poll_interval)
+        )
+
+    if json_output:
+        print_json(result, colored=False)
+    elif wait:
+        click.echo(result["post_exit"]["state"])
+
+    if wait and result["post_exit"]["state"] == "not_seen_timeout":
+        raise typer.Exit(1)
 
 
 @cli.command("restart")
@@ -278,6 +472,10 @@ async def restore_purple_info(
         bool,
         typer.Option("--no-device", help="Skip live usbmux inspection and print only static/firmware information."),
     ] = False,
+    deep: Annotated[
+        bool,
+        typer.Option("--deep", help="Include hashes, Mach-O UUIDs, and grouped PurpleReverseProxy string evidence."),
+    ] = False,
     ecid: Annotated[
         Optional[str],
         typer.Option(help="Filter live USB inspection to a specific device ECID."),
@@ -290,12 +488,98 @@ async def restore_purple_info(
     """
     Inspect PurpleReverseProxy RestoreOS ramdisk support without booting or restoring a device.
     """
-    info = build_purple_reverse_proxy_info(firmware_root=firmware_root)
+    info = build_purple_reverse_proxy_info(firmware_root=firmware_root, deep=deep)
     if no_device:
         info["live"] = {"checked": False, "reason": "--no-device was provided."}
     else:
         info["live"] = await collect_live_purple_reverse_proxy_status(ecid=ecid, usbmux_address=usbmux_address)
     print_json(info)
+
+
+@cli.command("purple-probe")
+@async_command
+async def restore_purple_probe(
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", min=0.1, help="Per-connection timeout for usbmux port and QueryType probes."),
+    ] = 1.0,
+    include_services: Annotated[
+        bool,
+        typer.Option(
+            "--include-services",
+            help="Also try starting PurpleReverseProxy lockdown service names when lockdownd is reachable.",
+        ),
+    ] = False,
+    usbmux_address: Annotated[
+        Optional[str],
+        typer.Option("--usbmux-address", help="Address of the usbmuxd daemon (unix socket path or HOST:PORT)."),
+    ] = None,
+) -> None:
+    """
+    Probe PurpleReverseProxy RestoreOS ports through usbmux without restoring a device.
+    """
+    print_json(
+        await collect_live_purple_reverse_proxy_probe(
+            usbmux_address=usbmux_address,
+            timeout=timeout,
+            include_services=include_services,
+        )
+    )
+
+
+@cli.command("purple-control")
+@async_command
+async def restore_purple_control(
+    hello: Annotated[
+        bool,
+        typer.Option("--hello", help="Send an experimental HelloCtrl message to the PurpleReverseProxy control port."),
+    ] = False,
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", min=0.1, help="Timeout for connecting and waiting for a control reply."),
+    ] = 1.0,
+    port: Annotated[
+        int,
+        typer.Option("--port", min=1, max=0xFFFF, help="Device-side PurpleReverseProxy control port."),
+    ] = PURPLE_PROXY_CONTROL_PORT,
+    protocol_version: Annotated[
+        int,
+        typer.Option("--protocol-version", min=0, help="CtrlProtoVersion value to send with HelloCtrl."),
+    ] = PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
+    include_response: Annotated[
+        bool,
+        typer.Option("--include-response", help="Include the sanitized response dictionary in JSON output."),
+    ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Exit non-zero when the control operation is not reachable."),
+    ] = False,
+    udid: Annotated[
+        Optional[str],
+        typer.Option("--udid", "--serial", help="Target device serial/UDID; never printed in command output."),
+    ] = None,
+    usbmux_address: Annotated[
+        Optional[str],
+        typer.Option("--usbmux-address", help="Address of the usbmuxd daemon (unix socket path or HOST:PORT)."),
+    ] = None,
+) -> None:
+    """
+    Send experimental PurpleReverseProxy control messages without restoring a device.
+    """
+    if not hello:
+        raise click.ClickException("Only --hello is currently supported.")
+
+    result = await probe_purple_proxy_hello(
+        udid=udid,
+        usbmux_address=usbmux_address,
+        timeout=timeout,
+        port=port,
+        protocol_version=protocol_version,
+        include_response=include_response,
+    )
+    print_json(result, colored=False)
+    if strict and not result["reachable"]:
+        raise typer.Exit(1)
 
 
 @cli.command("update")
