@@ -42,9 +42,11 @@ from pymobiledevice3.restore.purple import (
 from pymobiledevice3.restore.purple_proxy import (
     PURPLE_PROXY_CONTROL_PORT,
     PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
+    PURPLE_PROXY_NOTIFY_PORT,
     PURPLE_PROXY_SOCKS_PORT,
     PurpleProxyCommand,
     run_purple_proxy_control_command,
+    run_purple_proxy_notify_command,
 )
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore import Restore
@@ -603,6 +605,83 @@ async def restore_purple_control(
         protocol_version=protocol_version,
         conn_port=conn_port,
         include_response=include_response,
+    )
+    print_json(result, colored=False)
+    if strict and not result["reachable"]:
+        raise typer.Exit(1)
+
+
+@cli.command("purple-notify")
+@async_command
+async def restore_purple_notify(
+    register: Annotated[
+        bool,
+        typer.Option("--register", help="Send RegisterNotify to the PurpleReverseProxy notify port."),
+    ] = False,
+    set_log_level: Annotated[
+        Optional[int],
+        typer.Option("--set-log-level", min=0, max=7, help="Send SetLogLevel with a firmware log level value."),
+    ] = None,
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", min=0.1, help="Timeout for connecting and sending the notify command."),
+    ] = 1.0,
+    port: Annotated[
+        int,
+        typer.Option("--port", min=1, max=0xFFFF, help="Device-side PurpleReverseProxy notify port."),
+    ] = PURPLE_PROXY_NOTIFY_PORT,
+    include_response: Annotated[
+        bool,
+        typer.Option(
+            "--include-response", help="Include sanitized response or notification dictionaries in JSON output."
+        ),
+    ] = False,
+    expect_response: Annotated[
+        bool,
+        typer.Option("--expect-response", help="Wait for one immediate response dictionary after sending the command."),
+    ] = False,
+    listen_timeout: Annotated[
+        float,
+        typer.Option(
+            "--listen-timeout", min=0.0, help="Seconds to collect asynchronous notify dictionaries after send."
+        ),
+    ] = 0.0,
+    max_messages: Annotated[
+        int,
+        typer.Option("--max-messages", min=1, help="Maximum notify dictionaries to collect when listening."),
+    ] = 8,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Exit non-zero when the notify operation is not reachable."),
+    ] = False,
+    udid: Annotated[
+        Optional[str],
+        typer.Option("--udid", "--serial", help="Target device serial/UDID; never printed in command output."),
+    ] = None,
+    usbmux_address: Annotated[
+        Optional[str],
+        typer.Option("--usbmux-address", help="Address of the usbmuxd daemon (unix socket path or HOST:PORT)."),
+    ] = None,
+) -> None:
+    """
+    Send experimental PurpleReverseProxy notify/logging messages without restoring a device.
+    """
+    operation_count = int(register) + int(set_log_level is not None)
+    if operation_count != 1:
+        raise click.ClickException("Choose exactly one notify operation: --register or --set-log-level.")
+
+    command = PurpleProxyCommand.REGISTER_NOTIFY if register else PurpleProxyCommand.SET_LOG_LEVEL
+    result = await run_purple_proxy_notify_command(
+        command,
+        level=set_log_level,
+        udid=udid,
+        usbmux_address=usbmux_address,
+        timeout=timeout,
+        port=port,
+        include_response=include_response,
+        expect_response=expect_response,
+        listen_timeout=listen_timeout,
+        max_messages=max_messages,
     )
     print_json(result, colored=False)
     if strict and not result["reachable"]:

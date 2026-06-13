@@ -62,6 +62,7 @@ def test_purple_reverse_proxy_catalog_exposes_restoreos_identifiers():
     assert PURPLE_REVERSE_PROXY_CATALOG["launchd_label"] == "com.apple.PurpleReverseProxy.ramdisk"
     assert "com.apple.PurpleReverseProxy.transaction" in PURPLE_REVERSE_PROXY_CATALOG["lockdown_services"]
     assert PURPLE_REVERSE_PROXY_CATALOG["restore_options"]["enable"] == "UsePurpleReverseProxy"
+    assert PURPLE_REVERSE_PROXY_CATALOG["notify_commands"] == ["RegisterNotify", "SetLogLevel"]
 
 
 def test_parse_purple_reverse_proxy_launchd(tmp_path):
@@ -143,11 +144,14 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
 
     purple_proxy = _macho64_with_uuid(
         TEST_UUID,
-        b"HelloCtrl BeginCtrl CtrlProtoVersion WaitSocket com.apple.private.PurpleReverseProxy.allowed",
+        b"HelloCtrl BeginCtrl CtrlProtoVersion WaitSocket NotifyConn RegisterNotify SetLogLevel Level "
+        b"com.apple.private.PurpleReverseProxy.allowed",
     )
     files = {
         "usr/libexec/PurpleReverseProxy": purple_proxy,
-        "usr/lib/libReverseProxyDevice.dylib": b"RPSocketReadDictionary com.apple.PurpleReverseProxy.RPSocket",
+        "usr/lib/libReverseProxyDevice.dylib": (
+            b"RegisterNotify SetLogLevel Level RPSocketReadDictionary com.apple.PurpleReverseProxy.RPSocket"
+        ),
         "usr/local/bin/restored_update": b"/usr/lib/libReverseProxyDevice.dylib FDRSubmit",
         "usr/lib/libFDR.dylib": b"_AMFDRHttpCopyPurpleReverseProxyInformation",
         "usr/lib/libamsupport.dylib": (
@@ -168,6 +172,8 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
     assert deep["files"]["purple_reverse_proxy"]["sha256"] == hashlib.sha256(purple_proxy).hexdigest()
     assert deep["files"]["purple_reverse_proxy"]["macho"]["uuids"] == [{"uuid": "00112233-4455-6677-8899-aabbccddeeff"}]
     assert deep["strings"]["purple_reverse_proxy"]["markers"]["HelloCtrl"] is True
+    assert deep["strings"]["purple_reverse_proxy"]["markers"]["RegisterNotify"] is True
+    assert deep["strings"]["device_library"]["markers"]["SetLogLevel"] is True
     assert deep["strings"]["amsupport_library"]["markers"]["UsePurpleReverseProxy"] is True
     assert deep["strings"]["fdr_library"]["markers"]["_AMFDRHttpCopyPurpleReverseProxyInformation"] is True
     assert deep["entitlements"]["com.apple.private.PurpleReverseProxy.allowed"]["present"] is True
@@ -177,6 +183,7 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
         "disable_option_evidence": True,
         "fdr_evidence": True,
         "control_protocol_evidence": True,
+        "notify_protocol_evidence": True,
         "entitlement_evidence": True,
         "active_live_probe_required": True,
     }
@@ -335,6 +342,128 @@ def test_restore_purple_control_strict_fails_when_unreachable(monkeypatch):
     monkeypatch.setattr(restore_cli, "run_purple_proxy_control_command", fake_run_purple_proxy_control_command)
 
     result = CliRunner().invoke(__main__.app, ["restore", "purple-control", "--hello", "--strict"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.output)["reachable"] is False
+
+
+def test_restore_purple_notify_help():
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-notify", "--help"])
+
+    assert result.exit_code == 0
+    assert "--register" in result.output
+    assert "--set-log-level" in result.output
+    assert "--listen-timeout" in result.output
+    assert "--max-messages" in result.output
+    assert "--expect-response" in result.output
+
+
+def test_restore_purple_notify_requires_operation():
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-notify"])
+
+    assert result.exit_code != 0
+    assert "Choose exactly one notify operation" in str(result.exception)
+
+
+def test_restore_purple_notify_rejects_multiple_operations():
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-notify", "--register", "--set-log-level", "7"])
+
+    assert result.exit_code != 0
+    assert "Choose exactly one notify operation" in str(result.exception)
+
+
+def test_restore_purple_notify_register_prints_redacted_json(monkeypatch):
+    async def fake_run_purple_proxy_notify_command(command, **kwargs):
+        assert command.value == "RegisterNotify"
+        assert kwargs == {
+            "level": None,
+            "udid": "sensitive-udid",
+            "usbmux_address": "/tmp/usbmux",
+            "timeout": 0.5,
+            "port": 1234,
+            "include_response": True,
+            "expect_response": False,
+            "listen_timeout": 0.2,
+            "max_messages": 2,
+        }
+        return {
+            "checked": True,
+            "experimental": True,
+            "command": "RegisterNotify",
+            "reachable": True,
+            "sent": True,
+            "messages": [{"SerialNumber": "<redacted>", "Event": "ProxyOnline"}],
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_notify_command", fake_run_purple_proxy_notify_command)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "restore",
+            "purple-notify",
+            "--register",
+            "--timeout",
+            "0.5",
+            "--port",
+            "1234",
+            "--include-response",
+            "--listen-timeout",
+            "0.2",
+            "--max-messages",
+            "2",
+            "--udid",
+            "sensitive-udid",
+            "--usbmux-address",
+            "/tmp/usbmux",
+        ],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["command"] == "RegisterNotify"
+    assert output["reachable"] is True
+    assert output["messages"] == [{"SerialNumber": "<redacted>", "Event": "ProxyOnline"}]
+    assert "sensitive-udid" not in result.output
+
+
+def test_restore_purple_notify_set_log_level_prints_json(monkeypatch):
+    async def fake_run_purple_proxy_notify_command(command, **kwargs):
+        assert command.value == "SetLogLevel"
+        assert kwargs["level"] == 7
+        return {
+            "checked": True,
+            "experimental": True,
+            "command": "SetLogLevel",
+            "level": 7,
+            "reachable": True,
+            "sent": True,
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_notify_command", fake_run_purple_proxy_notify_command)
+
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-notify", "--set-log-level", "7"])
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["command"] == "SetLogLevel"
+    assert output["level"] == 7
+    assert output["sent"] is True
+
+
+def test_restore_purple_notify_strict_fails_when_unreachable(monkeypatch):
+    async def fake_run_purple_proxy_notify_command(command, **kwargs):
+        return {
+            "checked": True,
+            "experimental": True,
+            "command": "RegisterNotify",
+            "reachable": False,
+            "error_type": "OSError",
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_notify_command", fake_run_purple_proxy_notify_command)
+
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-notify", "--register", "--strict"])
 
     assert result.exit_code == 1
     assert json.loads(result.output)["reachable"] is False

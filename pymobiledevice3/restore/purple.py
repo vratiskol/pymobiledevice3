@@ -43,6 +43,10 @@ PURPLE_REVERSE_PROXY_STRING_MARKERS = {
         "CtrlProtoVersion",
         "WaitSocket",
         "ConnPort",
+        "NotifyConn",
+        "RegisterNotify",
+        "SetLogLevel",
+        "Level",
         "sendPingMessage",
         "sendProxyControlMessage",
         "RPSocketReadDictionary",
@@ -54,6 +58,9 @@ PURPLE_REVERSE_PROXY_STRING_MARKERS = {
         "com.apple.private.PurpleReverseProxy.allowed",
     ],
     "device_library": [
+        "RegisterNotify",
+        "SetLogLevel",
+        "Level",
         "RPSocketReadDictionary",
         "RPSocketWriteDictionary",
         "com.apple.PurpleReverseProxy.FDQueue",
@@ -105,6 +112,10 @@ PURPLE_REVERSE_PROXY_CATALOG = {
     ],
     "amsupport_symbols": [
         "_kAMSupportHttpOptionUsePurpleReverseProxy",
+    ],
+    "notify_commands": [
+        "RegisterNotify",
+        "SetLogLevel",
     ],
     "expected_ramdisk_paths": {
         "launchd_plist": str(PURPLE_REVERSE_PROXY_LAUNCHD_PATH),
@@ -360,6 +371,8 @@ def inspect_purple_reverse_proxy_root_deep(root: Path) -> dict[str, Any]:
         "fdr_evidence": strings["fdr_library"]["markers"].get("_AMFDRHttpCopyPurpleReverseProxyInformation") is True,
         "control_protocol_evidence": strings["purple_reverse_proxy"]["markers"].get("HelloCtrl") is True
         or strings["purple_reverse_proxy"]["markers"].get("BeginCtrl") is True,
+        "notify_protocol_evidence": strings["purple_reverse_proxy"]["markers"].get("RegisterNotify") is True
+        or strings["purple_reverse_proxy"]["markers"].get("SetLogLevel") is True,
         "entitlement_evidence": bool(entitlement_components),
         "active_live_probe_required": True,
     }

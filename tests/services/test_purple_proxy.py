@@ -12,6 +12,7 @@ from pymobiledevice3.restore.purple_proxy import (
     PurpleProxyCommand,
     probe_purple_proxy_hello,
     run_purple_proxy_control_command,
+    run_purple_proxy_notify_command,
     sanitize_purple_proxy_response,
 )
 
@@ -36,8 +37,10 @@ class FakeService:
 
 
 class FakePurpleProxyClient:
-    def __init__(self, response):
-        self.response = response
+    def __init__(self, response=None, messages=None):
+        self.response = response or {}
+        self.messages = list(messages or [])
+        self.sent = []
         self.closed = False
 
     async def hello_control(self, protocol_version=1):
@@ -51,6 +54,15 @@ class FakePurpleProxyClient:
     async def wait_socket(self, conn_port=PURPLE_PROXY_SOCKS_PORT):
         assert conn_port == 4321
         return self.response
+
+    async def register_notify(self):
+        self.sent.append({"Command": "RegisterNotify"})
+
+    async def set_log_level(self, level):
+        self.sent.append({"Command": "SetLogLevel", "Level": level})
+
+    async def read_dictionary(self):
+        return self.messages.pop(0)
 
     async def close(self):
         self.closed = True
@@ -109,6 +121,20 @@ async def test_control_command_helpers_use_firmware_command_names():
         {"Command": "BeginCtrl", "CtrlProtoVersion": 2, "CtrlConn": True},
         {"Command": "WaitSocket", "ConnPort": 1081},
         {"Command": "Ping"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_notify_command_helpers_use_firmware_command_names():
+    service = FakeService()
+    client = PurpleProxyClient(service)
+
+    await client.register_notify()
+    await client.set_log_level(7)
+
+    assert service.sent == [
+        {"Command": "RegisterNotify"},
+        {"Command": "SetLogLevel", "Level": 7},
     ]
 
 
@@ -314,6 +340,120 @@ async def test_run_purple_proxy_control_command_wait_socket_sends_conn_port(monk
         "response": {"SocketReady": True},
     }
     assert fake_client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_run_purple_proxy_notify_command_register_collects_sanitized_messages(monkeypatch):
+    fake_client = FakePurpleProxyClient(
+        messages=[
+            {
+                "Event": "ProxyOnline",
+                "SerialNumber": "sensitive",
+            }
+        ]
+    )
+    calls = []
+
+    async def fake_connect_notify(udid=None, **kwargs):
+        calls.append({"udid": udid, **kwargs})
+        return fake_client
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_notify", staticmethod(fake_connect_notify))
+
+    result = await run_purple_proxy_notify_command(
+        PurpleProxyCommand.REGISTER_NOTIFY,
+        udid="sensitive-udid",
+        usbmux_address="/tmp/usbmux",
+        timeout=0.1,
+        port=1234,
+        include_response=True,
+        listen_timeout=0.1,
+        max_messages=1,
+    )
+
+    assert result == {
+        "checked": True,
+        "experimental": True,
+        "command": "RegisterNotify",
+        "port": 1234,
+        "include_response": True,
+        "expect_response": False,
+        "listen_timeout": 0.1,
+        "max_messages": 1,
+        "reachable": True,
+        "sent": True,
+        "message_count": 1,
+        "message_keys": [["Event", "SerialNumber"]],
+        "messages": [{"Event": "ProxyOnline", "SerialNumber": "<redacted>"}],
+    }
+    assert fake_client.sent == [{"Command": "RegisterNotify"}]
+    assert calls == [
+        {
+            "udid": "sensitive-udid",
+            "connection_type": "USB",
+            "usbmux_address": "/tmp/usbmux",
+            "port": 1234,
+        }
+    ]
+    assert fake_client.closed is True
+    assert "sensitive" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_run_purple_proxy_notify_command_set_log_level_sends_level(monkeypatch):
+    fake_client = FakePurpleProxyClient()
+
+    async def fake_connect_notify(udid=None, **kwargs):
+        return fake_client
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_notify", staticmethod(fake_connect_notify))
+
+    result = await run_purple_proxy_notify_command(
+        PurpleProxyCommand.SET_LOG_LEVEL,
+        level=7,
+        timeout=0.1,
+    )
+
+    assert result == {
+        "checked": True,
+        "experimental": True,
+        "command": "SetLogLevel",
+        "port": PURPLE_PROXY_NOTIFY_PORT,
+        "include_response": False,
+        "expect_response": False,
+        "level": 7,
+        "reachable": True,
+        "sent": True,
+    }
+    assert fake_client.sent == [{"Command": "SetLogLevel", "Level": 7}]
+    assert fake_client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_run_purple_proxy_notify_command_requires_level_for_set_log_level():
+    with pytest.raises(ValueError, match="level is required"):
+        await run_purple_proxy_notify_command(PurpleProxyCommand.SET_LOG_LEVEL)
+
+
+@pytest.mark.asyncio
+async def test_run_purple_proxy_notify_command_reports_connect_error(monkeypatch):
+    async def fake_connect_notify(udid=None, **kwargs):
+        raise OSError("closed")
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_notify", staticmethod(fake_connect_notify))
+
+    result = await run_purple_proxy_notify_command(PurpleProxyCommand.REGISTER_NOTIFY, timeout=0.1)
+
+    assert result == {
+        "checked": True,
+        "experimental": True,
+        "command": "RegisterNotify",
+        "port": PURPLE_PROXY_NOTIFY_PORT,
+        "include_response": False,
+        "expect_response": False,
+        "reachable": False,
+        "error_type": "OSError",
+    }
 
 
 @pytest.mark.asyncio

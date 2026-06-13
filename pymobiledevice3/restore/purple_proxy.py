@@ -15,6 +15,7 @@ PURPLE_PROXY_CTRL_PROTO_VERSION_KEY = "CtrlProtoVersion"
 PURPLE_PROXY_CONN_PORT_KEY = "ConnPort"
 PURPLE_PROXY_CONN_PROTO_VERSION_KEY = "ConnProtoVersion"
 PURPLE_PROXY_IDENTIFIER_KEY = "Identifier"
+PURPLE_PROXY_LEVEL_KEY = "Level"
 SENSITIVE_PURPLE_PROXY_KEYS = (
     "ecid",
     "serial",
@@ -31,6 +32,8 @@ class PurpleProxyCommand(str, Enum):
     HELLO_CONTROL = "HelloCtrl"
     BEGIN_CONTROL = "BeginCtrl"
     WAIT_SOCKET = "WaitSocket"
+    REGISTER_NOTIFY = "RegisterNotify"
+    SET_LOG_LEVEL = "SetLogLevel"
     PING = "Ping"
 
 
@@ -139,16 +142,22 @@ class PurpleProxyClient:
     async def write_dictionary(self, message: dict[str, Any]) -> None:
         await self.service.send_plist(message, endianity=self.endianity, fmt=plistlib.FMT_XML)
 
-    async def send_control_message(self, command: Union[str, PurpleProxyCommand], **fields: Any) -> None:
+    async def send_command_message(self, command: Union[str, PurpleProxyCommand], **fields: Any) -> None:
         if isinstance(command, PurpleProxyCommand):
             command = command.value
         message = {PURPLE_PROXY_COMMAND_KEY: command}
         message.update(fields)
         await self.write_dictionary(message)
 
-    async def send_recv_control_message(self, command: Union[str, PurpleProxyCommand], **fields: Any) -> dict[str, Any]:
-        await self.send_control_message(command, **fields)
+    async def send_recv_command_message(self, command: Union[str, PurpleProxyCommand], **fields: Any) -> dict[str, Any]:
+        await self.send_command_message(command, **fields)
         return await self.read_dictionary()
+
+    async def send_control_message(self, command: Union[str, PurpleProxyCommand], **fields: Any) -> None:
+        await self.send_command_message(command, **fields)
+
+    async def send_recv_control_message(self, command: Union[str, PurpleProxyCommand], **fields: Any) -> dict[str, Any]:
+        return await self.send_recv_command_message(command, **fields)
 
     async def hello_control(
         self,
@@ -188,6 +197,12 @@ class PurpleProxyClient:
 
     async def send_ping(self, **fields: Any) -> dict[str, Any]:
         return await self.send_recv_control_message(PurpleProxyCommand.PING, **fields)
+
+    async def register_notify(self, **fields: Any) -> None:
+        await self.send_command_message(PurpleProxyCommand.REGISTER_NOTIFY, **fields)
+
+    async def set_log_level(self, level: int, **fields: Any) -> None:
+        await self.send_command_message(PurpleProxyCommand.SET_LOG_LEVEL, **{PURPLE_PROXY_LEVEL_KEY: level}, **fields)
 
 
 async def probe_purple_proxy_hello(
@@ -276,4 +291,123 @@ async def run_purple_proxy_control_command(
     })
     if include_response:
         result["response"] = sanitized_response
+    return result
+
+
+async def collect_purple_proxy_notify_messages(
+    client: PurpleProxyClient,
+    *,
+    listen_timeout: float,
+    max_messages: int,
+) -> list[dict[str, Any]]:
+    messages = []
+    deadline = asyncio.get_running_loop().time() + listen_timeout
+    while len(messages) < max_messages:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        try:
+            messages.append(await asyncio.wait_for(client.read_dictionary(), timeout=remaining))
+        except asyncio.TimeoutError:
+            break
+    return messages
+
+
+async def run_purple_proxy_notify_command(
+    command: Union[str, PurpleProxyCommand],
+    *,
+    level: Optional[int] = None,
+    udid: Optional[str] = None,
+    usbmux_address: Optional[str] = None,
+    timeout: float = 1.0,
+    port: int = PURPLE_PROXY_NOTIFY_PORT,
+    connection_type: str = "USB",
+    include_response: bool = False,
+    expect_response: bool = False,
+    listen_timeout: float = 0.0,
+    max_messages: int = 8,
+) -> dict[str, Any]:
+    if isinstance(command, str):
+        command = PurpleProxyCommand(command)
+    if command is PurpleProxyCommand.SET_LOG_LEVEL and level is None:
+        raise ValueError("level is required for SetLogLevel")
+
+    client = None
+    result: dict[str, Any] = {
+        "checked": True,
+        "experimental": True,
+        "command": command.value,
+        "port": port,
+        "include_response": include_response,
+        "expect_response": expect_response,
+    }
+    if command is PurpleProxyCommand.SET_LOG_LEVEL:
+        result["level"] = level
+    if listen_timeout > 0:
+        result.update({
+            "listen_timeout": listen_timeout,
+            "max_messages": max_messages,
+        })
+
+    try:
+        client = await asyncio.wait_for(
+            PurpleProxyClient.connect_notify(
+                udid,
+                connection_type=connection_type,
+                usbmux_address=usbmux_address,
+                port=port,
+            ),
+            timeout=timeout,
+        )
+        if command is PurpleProxyCommand.REGISTER_NOTIFY:
+            await asyncio.wait_for(client.register_notify(), timeout=timeout)
+        elif command is PurpleProxyCommand.SET_LOG_LEVEL:
+            await asyncio.wait_for(client.set_log_level(level), timeout=timeout)
+        else:
+            await asyncio.wait_for(client.send_command_message(command), timeout=timeout)
+
+        result.update({
+            "reachable": True,
+            "sent": True,
+        })
+
+        if expect_response:
+            response = await asyncio.wait_for(client.read_dictionary(), timeout=timeout)
+            sanitized_response = sanitize_purple_proxy_response(response)
+            result["response_keys"] = sorted(str(key) for key in sanitized_response)
+            if include_response:
+                result["response"] = sanitized_response
+        elif listen_timeout > 0:
+            messages = await collect_purple_proxy_notify_messages(
+                client,
+                listen_timeout=listen_timeout,
+                max_messages=max_messages,
+            )
+            sanitized_messages = [sanitize_purple_proxy_response(message) for message in messages]
+            result["message_count"] = len(sanitized_messages)
+            result["message_keys"] = [sorted(str(key) for key in message) for message in sanitized_messages]
+            if include_response:
+                result["messages"] = sanitized_messages
+    except asyncio.TimeoutError as e:
+        if result.get("sent"):
+            result.update({
+                "response_timeout": True,
+            })
+        else:
+            result.update({
+                "reachable": False,
+                "error_type": e.__class__.__name__,
+            })
+        return result
+    except Exception as e:
+        result.update({
+            "reachable": False,
+            "error_type": e.__class__.__name__,
+        })
+        return result
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.close()
+
     return result
