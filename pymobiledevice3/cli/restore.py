@@ -26,6 +26,7 @@ from pymobiledevice3.exceptions import ConnectionFailedError, ConnectionFailedTo
 from pymobiledevice3.irecv import IRecv
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.restore.device import Device
+from pymobiledevice3.restore.purple import build_purple_reverse_proxy_info, collect_live_purple_reverse_proxy_status
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore import Restore
 from pymobiledevice3.services.diagnostics import DiagnosticsService
@@ -261,6 +262,40 @@ async def restore_ramdisk(device: DeviceDep, ipsw_ctx: IPSWCtxDep) -> None:
     Boot only the update ramdisk without performing a restore (IPSW path or URL accepted).
     """
     await restore_ramdisk_task(device, ipsw_ctx)
+
+
+@cli.command("purple-info")
+@async_command
+async def restore_purple_info(
+    firmware_root: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--firmware-root",
+            help="Path to an extracted RestoreOS ramdisk root to inspect for PurpleReverseProxy artifacts.",
+        ),
+    ] = None,
+    no_device: Annotated[
+        bool,
+        typer.Option("--no-device", help="Skip live usbmux inspection and print only static/firmware information."),
+    ] = False,
+    ecid: Annotated[
+        Optional[str],
+        typer.Option(help="Filter live USB inspection to a specific device ECID."),
+    ] = None,
+    usbmux_address: Annotated[
+        Optional[str],
+        typer.Option("--usbmux-address", help="Address of the usbmuxd daemon (unix socket path or HOST:PORT)."),
+    ] = None,
+) -> None:
+    """
+    Inspect PurpleReverseProxy RestoreOS ramdisk support without booting or restoring a device.
+    """
+    info = build_purple_reverse_proxy_info(firmware_root=firmware_root)
+    if no_device:
+        info["live"] = {"checked": False, "reason": "--no-device was provided."}
+    else:
+        info["live"] = await collect_live_purple_reverse_proxy_status(ecid=ecid, usbmux_address=usbmux_address)
+    print_json(info)
 
 
 @cli.command("update")
