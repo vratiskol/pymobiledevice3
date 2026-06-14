@@ -562,11 +562,15 @@ async def restore_purple_capabilities(
     if no_live:
         result["live_probe"] = {"checked": False, "reason": "--no-live was provided."}
     else:
-        live_probe = await collect_live_purple_reverse_proxy_probe(
-            usbmux_address=usbmux_address,
-            timeout=timeout,
-            include_services=include_services,
-        )
+        probe_kwargs = {
+            "usbmux_address": usbmux_address,
+            "timeout": timeout,
+            "include_services": include_services,
+        }
+        port_config = result.get("port_config")
+        if port_config is not None:
+            probe_kwargs["ports"] = port_config["probe_ports"]
+        live_probe = await collect_live_purple_reverse_proxy_probe(**probe_kwargs)
         result["live_probe"] = live_probe
         result["summary"].update({
             "live_probe_mode": live_probe.get("mode"),

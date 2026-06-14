@@ -404,6 +404,38 @@ def test_restore_purple_capabilities_adds_redacted_live_probe(monkeypatch):
     assert output["summary"]["live_probe_device_count"] == 1
 
 
+def test_restore_purple_capabilities_uses_firmware_ports(tmp_path, monkeypatch):
+    root = _write_purple_launchd_root(tmp_path)
+
+    async def fake_collect_live_purple_reverse_proxy_probe(**kwargs):
+        assert {port["name"]: port["port"] for port in kwargs["ports"]} == {
+            "restore": 62078,
+            "socks": 2081,
+            "ctrl": 2082,
+            "notify": 2084,
+        }
+        return {
+            "checked": True,
+            "mode": "no_usb_device",
+            "device_count": 0,
+            "ports": kwargs["ports"],
+        }
+
+    monkeypatch.setattr(
+        restore_cli, "collect_live_purple_reverse_proxy_probe", fake_collect_live_purple_reverse_proxy_probe
+    )
+
+    result = CliRunner().invoke(
+        __main__.app,
+        ["restore", "purple-capabilities", "--firmware-root", str(root), "--timeout", "0.5"],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["port_config"]["ports"]["socks"] == 2081
+    assert output["live_probe"]["ports"][1]["port"] == 2081
+
+
 def test_restore_purple_probe_help():
     result = CliRunner().invoke(__main__.app, ["restore", "purple-probe", "--help"])
 
