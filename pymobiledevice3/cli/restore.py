@@ -17,6 +17,8 @@ from typer_injector import Depends, InjectingTyper
 
 from pymobiledevice3 import usbmux
 from pymobiledevice3.cli.cli_common import (
+    USBMUX_ENV_VARS,
+    USBMUX_OPTION_HELP,
     async_command,
     cli_loop,
     is_invoked_for_completion,
@@ -32,6 +34,7 @@ from pymobiledevice3.irecv import (
 )
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.restore.device import Device
+from pymobiledevice3.restore.protocol import collect_restore_protocol_info
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore import Restore
 from pymobiledevice3.restore.restored_client import RestoredClient
@@ -284,9 +287,7 @@ def _irecv_restore_info(irecv: IRecv) -> dict:
     }
 
 
-def _restored_restore_info(
-    restored_client: RestoredClient, query_type: dict, connection_type: Optional[str]
-) -> dict:
+def _restored_restore_info(restored_client: RestoredClient, query_type: dict, connection_type: Optional[str]) -> dict:
     return {
         "source": "restored",
         "mode": "restored",
@@ -487,6 +488,54 @@ async def restore_restart(device: DeviceDep) -> None:
             await diagnostics.restart()
     else:
         device.irecv.reboot()
+
+
+@cli.command("protocol-info")
+@async_command
+async def restore_protocol_info(
+    udid: Annotated[
+        Optional[str],
+        typer.Option("--udid", "-u", help="Target usbmux UDID; defaults to all connected USB devices."),
+    ] = None,
+    usbmux_address: Annotated[
+        Optional[str],
+        typer.Option("--usbmux-address", envvar=USBMUX_ENV_VARS, help=USBMUX_OPTION_HELP),
+    ] = None,
+    timeout: Annotated[float, typer.Option(help="Timeout, in seconds, for each restored plist request.")] = 1.0,
+    include_values: Annotated[
+        bool,
+        typer.Option(help="Also query common restored values such as HardwareInfo and SavedDebugInfo."),
+    ] = False,
+    query_key: Annotated[
+        Optional[list[str]],
+        typer.Option("--query-key", "-q", help="Additional restored QueryValue key to request."),
+    ] = None,
+    include_identifiers: Annotated[
+        bool,
+        typer.Option(help="Include raw device identifiers and nonce-like values in the JSON output."),
+    ] = False,
+    trace: Annotated[
+        bool,
+        typer.Option(help="Include sanitized request/response trace records."),
+    ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option(help="Exit with status 1 unless a restored-mode device is detected."),
+    ] = False,
+) -> None:
+    """Probe the restored protocol over usbmux port 62078."""
+    output = await collect_restore_protocol_info(
+        udid=udid,
+        usbmux_address=usbmux_address,
+        timeout=timeout,
+        include_values=include_values,
+        query_keys=query_key,
+        include_identifiers=include_identifiers,
+        include_trace=trace,
+    )
+    print_json(output, colored=False)
+    if strict and not any(device.get("mode") == "restored" for device in output["devices"]):
+        raise typer.Exit(1)
 
 
 async def restore_tss_task(
