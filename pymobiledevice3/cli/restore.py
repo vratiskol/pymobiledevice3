@@ -5,6 +5,7 @@ import logging
 import plistlib
 import tempfile
 import traceback
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import IO, Annotated, Any, Optional, Union
@@ -35,9 +36,15 @@ from pymobiledevice3.irecv import (
 )
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.restore.device import Device
-from pymobiledevice3.restore.protocol import build_restore_message_report, collect_restore_protocol_info
+from pymobiledevice3.restore.protocol import (
+    PYMOBILEDEVICE3_DATA_REQUEST_HANDLERS,
+    PYMOBILEDEVICE3_RESTORE_MESSAGE_HANDLERS,
+    build_restore_message_report,
+    collect_restore_protocol_info,
+)
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore import Restore
+from pymobiledevice3.restore.restore_options import SUPPORTED_DATA_TYPES, SUPPORTED_MESSAGE_TYPES, RestoreOptions
 from pymobiledevice3.restore.restored_client import RestoredClient
 from pymobiledevice3.service_connection import ServiceConnection
 from pymobiledevice3.services.diagnostics import DiagnosticsService
@@ -52,6 +59,34 @@ SHELL_USAGE = """
 print(irecv.getenv('build-version'))
 """
 IPSWME_API = "https://api.ipsw.me/v4/device/"
+DEFAULT_IBOOT_ENV_KEYS = (
+    "auto-boot",
+    "boot-args",
+    "build-version",
+    "build-style",
+    "debug-uarts",
+    "radio-error",
+    "radio-error-string",
+)
+SENSITIVE_IBOOT_ENV_KEYS = {
+    "ecid",
+    "nonce",
+    "serial-number",
+    "srnm",
+    "unique-chip-id",
+    "unique-device-id",
+}
+RESTORE_OPTION_IPSW_COMPONENTS = (
+    "iBoot",
+    "iBEC",
+    "iBSS",
+    "LLB",
+    "SEP",
+    "RestoreRamDisk",
+    "OS",
+    "SystemVolume",
+    "SystemVolumeCanonicalMetadata",
+)
 
 
 cli = InjectingTyper(
@@ -238,6 +273,195 @@ def _restore_messages_from_document(document: Any) -> list[dict]:
     if not all(isinstance(message, dict) for message in messages):
         raise typer.BadParameter("all restore messages must be dictionaries")
     return messages
+
+
+def _decode_irecv_getenv_value(value: Optional[bytes]) -> Optional[str]:
+    if value is None:
+        return None
+    raw = bytes(value).split(b"\x00", 1)[0]
+    if not raw:
+        return ""
+    return raw.decode(errors="replace")
+
+
+def _is_sensitive_irecv_env_key(key: str) -> bool:
+    normalized = key.lower()
+    return any(sensitive in normalized for sensitive in SENSITIVE_IBOOT_ENV_KEYS)
+
+
+def _irecv_environment_info(
+    irecv: IRecv,
+    keys: list[str],
+    *,
+    include_identifiers: bool = False,
+) -> dict:
+    environment = {}
+    for key in keys:
+        value = _decode_irecv_getenv_value(irecv.getenv(key))
+        environment[key] = {
+            "available": value is not None,
+            "value": "<redacted>"
+            if value is not None and _is_sensitive_irecv_env_key(key) and not include_identifiers
+            else value,
+        }
+
+    return {
+        "source": "irecv",
+        "mode": {
+            "name": irecv.mode.name,
+            "value": f"0x{irecv.mode.value:04x}",
+            "is_recovery": irecv.mode.is_recovery,
+        },
+        "product": {
+            "type": irecv.product_type,
+            "hardware_model": irecv.hardware_model,
+            "display_name": irecv.display_name,
+        },
+        "iboot": {
+            "version": irecv.iboot_version,
+            "image4_supported": bool(irecv.is_image4_supported),
+        },
+        "environment": environment,
+    }
+
+
+def _load_plist_from_ipsw_or_file(path: Path, plist_name: str) -> Optional[dict]:
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as archive:
+            try:
+                return plistlib.loads(archive.read(plist_name))
+            except KeyError:
+                return None
+
+    if path.name == plist_name or path.suffix == ".plist":
+        try:
+            with path.open("rb") as f:
+                return plistlib.load(f)
+        except Exception:
+            return None
+
+    return None
+
+
+def _build_identity_component_paths(identity: dict) -> dict:
+    manifest = identity.get("Manifest") or {}
+    components = {}
+    for component in RESTORE_OPTION_IPSW_COMPONENTS:
+        info = (manifest.get(component) or {}).get("Info") or {}
+        if info:
+            components[component] = {
+                "path": info.get("Path"),
+                "personalize": info.get("Personalize"),
+                "loaded_by_iboot": info.get("IsLoadedByiBoot"),
+                "loaded_by_iboot_stage1": info.get("IsLoadedByiBootStage1"),
+            }
+    return components
+
+
+def _build_manifest_restore_options_info(manifest: Optional[dict]) -> Optional[dict]:
+    if manifest is None:
+        return None
+
+    identities = []
+    restore_behaviors = set()
+    restore_attestation_modes = set()
+    for index, identity in enumerate(manifest.get("BuildIdentities") or []):
+        info = identity.get("Info") or {}
+        restore_behavior = info.get("RestoreBehavior")
+        if restore_behavior is not None:
+            restore_behaviors.add(restore_behavior)
+        if info.get("RestoreAttestationMode") is not None:
+            restore_attestation_modes.add(info["RestoreAttestationMode"])
+        identities.append({
+            "index": index,
+            "variant": info.get("Variant"),
+            "restore_behavior": restore_behavior,
+            "device_class": info.get("DeviceClass"),
+            "content_encoding": info.get("ContentEncoding"),
+            "mobile_device_min_version": info.get("MobileDeviceMinVersion"),
+            "minimum_system_partition": info.get("MinimumSystemPartition"),
+            "system_partition_padding": info.get("SystemPartitionPadding"),
+            "os_var_content_size": info.get("OSVarContentSize"),
+            "recovery_variant": info.get("RecoveryVariant"),
+            "restore_attestation_mode": info.get("RestoreAttestationMode"),
+            "components": _build_identity_component_paths(identity),
+        })
+
+    return {
+        "product": {
+            "version": manifest.get("ProductVersion"),
+            "build_version": manifest.get("ProductBuildVersion"),
+            "supported_product_types": manifest.get("SupportedProductTypes"),
+        },
+        "build_identities": identities,
+        "observations": {
+            "restore_behaviors": sorted(restore_behaviors),
+            "restore_attestation_modes": sorted(restore_attestation_modes),
+        },
+    }
+
+
+def _restore_plist_info(restore_plist: Optional[dict]) -> Optional[dict]:
+    if restore_plist is None:
+        return None
+    return {
+        "product": {
+            "version": restore_plist.get("ProductVersion"),
+            "build_version": restore_plist.get("ProductBuildVersion"),
+            "supported_product_types": restore_plist.get("SupportedProductTypes"),
+            "supported_product_type_ids": restore_plist.get("SupportedProductTypeIDs"),
+        },
+        "system_restore_image_file_systems": restore_plist.get("SystemRestoreImageFileSystems"),
+    }
+
+
+def build_restore_options_info(ipsw: Optional[Path] = None, include_defaults: bool = False) -> dict:
+    default_options = RestoreOptions().to_dict()
+    default_option_keys = sorted(key for key in default_options if key != "UUID")
+    data_type_gaps = sorted(set(SUPPORTED_DATA_TYPES) - set(PYMOBILEDEVICE3_DATA_REQUEST_HANDLERS))
+    message_type_gaps = sorted(set(SUPPORTED_MESSAGE_TYPES) - set(PYMOBILEDEVICE3_RESTORE_MESSAGE_HANDLERS))
+    output = {
+        "python": {
+            "default_option_keys": default_option_keys,
+            "supported_data_types": SUPPORTED_DATA_TYPES,
+            "supported_message_types": SUPPORTED_MESSAGE_TYPES,
+            "implemented_data_request_handlers": sorted(PYMOBILEDEVICE3_DATA_REQUEST_HANDLERS),
+            "implemented_message_handlers": sorted(PYMOBILEDEVICE3_RESTORE_MESSAGE_HANDLERS),
+        },
+        "gaps": {
+            "supported_data_types_without_handler": data_type_gaps,
+            "supported_message_types_without_handler": message_type_gaps,
+            "implemented_data_handlers_not_advertised": sorted(
+                set(PYMOBILEDEVICE3_DATA_REQUEST_HANDLERS) - set(SUPPORTED_DATA_TYPES)
+            ),
+            "implemented_message_handlers_not_advertised": sorted(
+                set(PYMOBILEDEVICE3_RESTORE_MESSAGE_HANDLERS) - set(SUPPORTED_MESSAGE_TYPES)
+            ),
+        },
+    }
+    if include_defaults:
+        defaults = dict(default_options)
+        defaults.pop("UUID", None)
+        output["python"]["default_options"] = _json_safe(defaults)
+
+    if ipsw is not None:
+        build_manifest = _load_plist_from_ipsw_or_file(ipsw, "BuildManifest.plist")
+        restore_plist = _load_plist_from_ipsw_or_file(ipsw, "Restore.plist")
+        output["ipsw"] = {
+            "path": str(ipsw),
+            "build_manifest": _build_manifest_restore_options_info(build_manifest),
+            "restore_plist": _restore_plist_info(restore_plist),
+        }
+        manifest_observations = (output["ipsw"]["build_manifest"] or {}).get("observations", {})
+        output["gaps"]["manifest_restore_behavior_not_in_default_options"] = bool(
+            manifest_observations.get("restore_behaviors") and "AuthInstallRestoreBehavior" not in default_option_keys
+        )
+        output["gaps"]["manifest_restore_attestation_mode_not_in_default_options"] = bool(
+            manifest_observations.get("restore_attestation_modes")
+            and "RestoreAttestationMode" not in default_option_keys
+        )
+
+    return output
 
 
 def _matches_ecid(ecid: Optional[int], found_ecid: Optional[int]) -> bool:
@@ -456,6 +680,47 @@ async def restore_info(
 ) -> None:
     """Inspect normal, restored, Recovery, or DFU restore-mode state without changing the device."""
     await restore_info_task(ecid, wait, include_errors)
+
+
+@cli.command("iboot-env")
+@async_command
+async def restore_iboot_env(
+    device: DeviceDep,
+    key: Annotated[
+        Optional[list[str]],
+        typer.Argument(help="iBoot environment keys to query; defaults to common diagnostic keys."),
+    ] = None,
+    include_identifiers: Annotated[
+        bool,
+        typer.Option(help="Include raw identifier-like environment values instead of redacting them."),
+    ] = False,
+) -> None:
+    """Read iBoot environment variables from a Recovery/DFU device."""
+    if not await device.get_is_irecv():
+        raise click.ClickException("iBoot environment is only available while the device is in Recovery/DFU mode")
+    print_json(
+        _irecv_environment_info(
+            device.irecv,
+            list(key or DEFAULT_IBOOT_ENV_KEYS),
+            include_identifiers=include_identifiers,
+        ),
+        colored=False,
+    )
+
+
+@cli.command("options-info")
+def restore_options_info(
+    ipsw: Annotated[
+        Optional[Path],
+        typer.Option("--ipsw", "-i", exists=True, dir_okay=False, readable=True, help="IPSW or plist to compare."),
+    ] = None,
+    include_defaults: Annotated[
+        bool,
+        typer.Option(help="Include generated default RestoreOptions values, excluding the random UUID."),
+    ] = False,
+) -> None:
+    """Show pymobiledevice3 RestoreOptions coverage and optional IPSW restore metadata."""
+    print_json(build_restore_options_info(ipsw=ipsw, include_defaults=include_defaults), colored=False)
 
 
 def query_ipswme(identifier: str) -> str:
