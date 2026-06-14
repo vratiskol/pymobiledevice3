@@ -1237,6 +1237,7 @@ def test_restore_purple_evidence_help():
     assert "--wait-poll-interval" in result.output
     assert "--include-response" in result.output
     assert "--include-identifiers" in result.output
+    assert "--trace" in result.output
     assert "--probe-socks" in result.output
     assert "--include-services" in result.output
     assert "--strict" in result.output
@@ -1424,6 +1425,62 @@ def test_restore_purple_evidence_collects_raw_output(tmp_path, monkeypatch):
     ]
     assert output["port_config"]["ports"]["ctrl"] == 2082
     assert "fake-sensitive-serial" in result.output
+
+
+def test_restore_purple_evidence_can_include_trace(monkeypatch):
+    async def fake_collect_live_purple_reverse_proxy_probe(**kwargs):
+        return {
+            "checked": True,
+            "mode": "restored",
+            "device_count": 1,
+            "devices": [{"index": 0, "mode": "restored", "ports": [{"name": "ctrl", "reachable": True}]}],
+        }
+
+    async def fake_run_purple_proxy_session(**kwargs):
+        assert kwargs["trace"] is True
+        return {
+            "checked": True,
+            "experimental": True,
+            "trace": {
+                "enabled": True,
+                "event_count": 2,
+                "duration": 0.2,
+                "events": [
+                    {"index": 0, "event": "session_start"},
+                    {"index": 1, "event": "session_end", "duration": 0.2},
+                ],
+            },
+            "phases": {
+                "register_notify": {"checked": True, "reachable": True},
+                "begin_control": {"checked": True, "reachable": True},
+                "ping": {"checked": True, "reachable": True, "pong": True},
+                "wait_socket": {"checked": True, "reachable": True},
+                "proxy_dictionary": {"checked": True},
+                "socks_probe": {"checked": True, "summary": {"ok": True}},
+            },
+            "summary": {
+                "control_reachable": True,
+                "ping_pong": True,
+                "wait_socket_reachable": True,
+                "notify_registered": True,
+                "set_log_level_sent": True,
+                "socks_probe_ok": True,
+                "proxy_dictionary_ready": True,
+                "ok": True,
+            },
+        }
+
+    monkeypatch.setattr(
+        restore_cli, "collect_live_purple_reverse_proxy_probe", fake_collect_live_purple_reverse_proxy_probe
+    )
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_session", fake_run_purple_proxy_session)
+
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-evidence", "--trace"])
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["trace_enabled"] is True
+    assert output["trace"]["events"][0]["event"] == "session_start"
 
 
 def test_restore_purple_evidence_waits_for_restoreos(tmp_path, monkeypatch):

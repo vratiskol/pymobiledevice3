@@ -165,6 +165,26 @@ def _visible_purple_proxy_response(value: Any, *, include_identifiers: bool) -> 
     return sanitize_purple_proxy_response(value)
 
 
+def _trace_time() -> float:
+    return round(asyncio.get_running_loop().time(), 6)
+
+
+def _trace_duration(start: float) -> float:
+    return round(asyncio.get_running_loop().time() - start, 6)
+
+
+def _trace_append(trace: Optional[list[dict[str, Any]]], event: str, **fields: Any) -> None:
+    if trace is None:
+        return
+    entry = {
+        "index": len(trace),
+        "time": _trace_time(),
+        "event": event,
+    }
+    entry.update(fields)
+    trace.append(entry)
+
+
 def _mark_identifier_output(result: dict[str, Any], *, include_identifiers: bool) -> None:
     if include_identifiers:
         result["include_identifiers"] = True
@@ -278,7 +298,12 @@ async def _run_connected_control_phase(
     conn_port: int,
     include_response: bool,
     include_identifiers: bool = False,
+    trace: Optional[list[dict[str, Any]]] = None,
+    phase_name: Optional[str] = None,
 ) -> dict[str, Any]:
+    phase = phase_name or command.value
+    start = asyncio.get_running_loop().time()
+    _trace_append(trace, "phase_start", phase=phase, channel="control", command=command.value, port=port)
     result = _purple_proxy_control_phase_result(
         command,
         port=port,
@@ -296,7 +321,20 @@ async def _run_connected_control_phase(
         else:
             raise ValueError(f"unsupported PurpleReverseProxy session control command: {command.value}")
     except Exception as e:
-        return _purple_proxy_unreachable_phase(result, e)
+        result = _purple_proxy_unreachable_phase(result, e)
+        if trace is not None:
+            result["trace_timing"] = {"duration": _trace_duration(start)}
+        _trace_append(
+            trace,
+            "phase_end",
+            phase=phase,
+            channel="control",
+            command=command.value,
+            reachable=False,
+            error_type=e.__class__.__name__,
+            duration=result.get("trace_timing", {}).get("duration"),
+        )
+        return result
 
     _mark_identifier_output(result, include_identifiers=include_identifiers)
     visible_response = _visible_purple_proxy_response(response, include_identifiers=include_identifiers)
@@ -308,6 +346,17 @@ async def _run_connected_control_phase(
         result["pong"] = is_purple_proxy_pong_response(visible_response)
     if include_response:
         result["response"] = visible_response
+    if trace is not None:
+        result["trace_timing"] = {"duration": _trace_duration(start)}
+    _trace_append(
+        trace,
+        "phase_end",
+        phase=phase,
+        channel="control",
+        command=command.value,
+        reachable=True,
+        duration=result.get("trace_timing", {}).get("duration"),
+    )
     return result
 
 
@@ -322,7 +371,12 @@ async def _run_connected_notify_phase(
     listen_timeout: float = 0.0,
     max_messages: int = 8,
     include_identifiers: bool = False,
+    trace: Optional[list[dict[str, Any]]] = None,
+    phase_name: Optional[str] = None,
 ) -> dict[str, Any]:
+    phase = phase_name or command.value
+    start = asyncio.get_running_loop().time()
+    _trace_append(trace, "phase_start", phase=phase, channel="notify", command=command.value, port=port)
     result = _purple_proxy_notify_phase_result(
         command,
         port=port,
@@ -341,13 +395,37 @@ async def _run_connected_notify_phase(
         else:
             await asyncio.wait_for(client.send_command_message(command), timeout=timeout)
     except Exception as e:
-        return _purple_proxy_unreachable_phase(result, e)
+        result = _purple_proxy_unreachable_phase(result, e)
+        if trace is not None:
+            result["trace_timing"] = {"duration": _trace_duration(start)}
+        _trace_append(
+            trace,
+            "phase_end",
+            phase=phase,
+            channel="notify",
+            command=command.value,
+            reachable=False,
+            error_type=e.__class__.__name__,
+            duration=result.get("trace_timing", {}).get("duration"),
+        )
+        return result
 
     _mark_identifier_output(result, include_identifiers=include_identifiers)
     result.update({
         "reachable": True,
         "sent": True,
     })
+    if trace is not None:
+        result["trace_timing"] = {"duration": _trace_duration(start)}
+    _trace_append(
+        trace,
+        "phase_end",
+        phase=phase,
+        channel="notify",
+        command=command.value,
+        reachable=True,
+        duration=result.get("trace_timing", {}).get("duration"),
+    )
     return result
 
 
@@ -422,9 +500,20 @@ class PurpleProxyClient:
     live validation.
     """
 
-    def __init__(self, service: ServiceConnection, *, endianity: str = ">") -> None:
+    def __init__(
+        self,
+        service: ServiceConnection,
+        *,
+        endianity: str = ">",
+        trace: Optional[list[dict[str, Any]]] = None,
+        trace_channel: Optional[str] = None,
+        include_identifiers: bool = False,
+    ) -> None:
         self.service = service
         self.endianity = endianity
+        self.trace = trace
+        self.trace_channel = trace_channel
+        self.include_identifiers = include_identifiers
 
     @classmethod
     async def connect_control(
@@ -435,6 +524,8 @@ class PurpleProxyClient:
         usbmux_address: Optional[str] = None,
         port: int = PURPLE_PROXY_CONTROL_PORT,
         endianity: str = ">",
+        trace: Optional[list[dict[str, Any]]] = None,
+        include_identifiers: bool = False,
     ) -> "PurpleProxyClient":
         return cls(
             await ServiceConnection.create_using_usbmux(
@@ -444,6 +535,9 @@ class PurpleProxyClient:
                 usbmux_address=usbmux_address,
             ),
             endianity=endianity,
+            trace=trace,
+            trace_channel="control",
+            include_identifiers=include_identifiers,
         )
 
     @classmethod
@@ -455,6 +549,8 @@ class PurpleProxyClient:
         usbmux_address: Optional[str] = None,
         port: int = PURPLE_PROXY_SOCKS_PORT,
         endianity: str = ">",
+        trace: Optional[list[dict[str, Any]]] = None,
+        include_identifiers: bool = False,
     ) -> "PurpleProxyClient":
         return cls(
             await ServiceConnection.create_using_usbmux(
@@ -464,6 +560,9 @@ class PurpleProxyClient:
                 usbmux_address=usbmux_address,
             ),
             endianity=endianity,
+            trace=trace,
+            trace_channel="socks",
+            include_identifiers=include_identifiers,
         )
 
     @classmethod
@@ -475,6 +574,8 @@ class PurpleProxyClient:
         usbmux_address: Optional[str] = None,
         port: int = PURPLE_PROXY_NOTIFY_PORT,
         endianity: str = ">",
+        trace: Optional[list[dict[str, Any]]] = None,
+        include_identifiers: bool = False,
     ) -> "PurpleProxyClient":
         return cls(
             await ServiceConnection.create_using_usbmux(
@@ -484,6 +585,9 @@ class PurpleProxyClient:
                 usbmux_address=usbmux_address,
             ),
             endianity=endianity,
+            trace=trace,
+            trace_channel="notify",
+            include_identifiers=include_identifiers,
         )
 
     async def close(self) -> None:
@@ -493,13 +597,59 @@ class PurpleProxyClient:
         await self.close()
 
     async def read_dictionary(self) -> dict[str, Any]:
-        response = await self.service.recv_plist(endianity=self.endianity)
+        start = asyncio.get_running_loop().time()
+        try:
+            response = await self.service.recv_plist(endianity=self.endianity)
+        except Exception as e:
+            _trace_append(
+                self.trace,
+                "recv_plist_error",
+                channel=self.trace_channel,
+                duration=_trace_duration(start),
+                error_type=e.__class__.__name__,
+            )
+            raise
         if not isinstance(response, dict):
+            _trace_append(
+                self.trace,
+                "recv_plist_error",
+                channel=self.trace_channel,
+                duration=_trace_duration(start),
+                response_type=type(response).__name__,
+            )
             raise TypeError(f"expected PurpleReverseProxy dictionary, got {type(response).__name__}")
+        _trace_append(
+            self.trace,
+            "recv_plist",
+            channel=self.trace_channel,
+            duration=_trace_duration(start),
+            response=_visible_purple_proxy_response(response, include_identifiers=self.include_identifiers),
+            response_keys=sorted(str(key) for key in response),
+        )
         return response
 
     async def write_dictionary(self, message: dict[str, Any]) -> None:
-        await self.service.send_plist(message, endianity=self.endianity, fmt=plistlib.FMT_XML)
+        start = asyncio.get_running_loop().time()
+        try:
+            await self.service.send_plist(message, endianity=self.endianity, fmt=plistlib.FMT_XML)
+        except Exception as e:
+            _trace_append(
+                self.trace,
+                "send_plist_error",
+                channel=self.trace_channel,
+                duration=_trace_duration(start),
+                error_type=e.__class__.__name__,
+                message=_visible_purple_proxy_response(message, include_identifiers=self.include_identifiers),
+            )
+            raise
+        _trace_append(
+            self.trace,
+            "send_plist",
+            channel=self.trace_channel,
+            duration=_trace_duration(start),
+            message=_visible_purple_proxy_response(message, include_identifiers=self.include_identifiers),
+            message_keys=sorted(str(key) for key in message),
+        )
 
     async def send_command_message(self, command: Union[str, PurpleProxyCommand], **fields: Any) -> None:
         if isinstance(command, PurpleProxyCommand):
@@ -791,9 +941,13 @@ async def run_purple_proxy_socks_probe(
     connect_port: int = 443,
     connection_type: str = "USB",
     include_response: bool = False,
+    include_identifiers: bool = False,
+    trace: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     _validate_socks_port(port)
 
+    phase_start = asyncio.get_running_loop().time()
+    _trace_append(trace, "phase_start", phase="socks_probe", channel="socks", port=port)
     result: dict[str, Any] = {
         "checked": True,
         "experimental": True,
@@ -804,14 +958,30 @@ async def run_purple_proxy_socks_probe(
     client = None
 
     try:
+        connect_start = asyncio.get_running_loop().time()
+        connect_kwargs = {
+            "connection_type": connection_type,
+            "usbmux_address": usbmux_address,
+            "port": port,
+        }
+        if trace is not None:
+            connect_kwargs["trace"] = trace
+        if include_identifiers:
+            connect_kwargs["include_identifiers"] = True
         client = await asyncio.wait_for(
             PurpleProxyClient.connect_socks(
                 udid,
-                connection_type=connection_type,
-                usbmux_address=usbmux_address,
-                port=port,
+                **connect_kwargs,
             ),
             timeout=timeout,
+        )
+        _trace_append(
+            trace,
+            "connect",
+            phase="socks_probe",
+            channel="socks",
+            port=port,
+            duration=_trace_duration(connect_start),
         )
     except Exception as e:
         result.update({
@@ -823,6 +993,24 @@ async def run_purple_proxy_socks_probe(
                 "ok": False,
             },
         })
+        if trace is not None:
+            result["trace_timing"] = {"duration": _trace_duration(phase_start)}
+        _trace_append(
+            trace,
+            "connect_error",
+            phase="socks_probe",
+            channel="socks",
+            port=port,
+            error_type=e.__class__.__name__,
+        )
+        _trace_append(
+            trace,
+            "phase_end",
+            phase="socks_probe",
+            channel="socks",
+            reachable=False,
+            duration=result.get("trace_timing", {}).get("duration"),
+        )
         return result
 
     try:
@@ -831,8 +1019,28 @@ async def run_purple_proxy_socks_probe(
             1,
             PURPLE_PROXY_SOCKS_NO_AUTHENTICATION,
         ])
+        send_start = asyncio.get_running_loop().time()
         await asyncio.wait_for(client.service.sendall(greeting), timeout=timeout)
+        _trace_append(
+            trace,
+            "send_bytes",
+            phase="socks_probe",
+            channel="socks",
+            step="greeting",
+            duration=_trace_duration(send_start),
+            bytes_hex=greeting.hex(),
+        )
+        recv_start = asyncio.get_running_loop().time()
         method_response = await asyncio.wait_for(client.service.recvall(2), timeout=timeout)
+        _trace_append(
+            trace,
+            "recv_bytes",
+            phase="socks_probe",
+            channel="socks",
+            step="greeting",
+            duration=_trace_duration(recv_start),
+            bytes_hex=method_response.hex(),
+        )
         version, method = method_response
         handshake_ok = version == PURPLE_PROXY_SOCKS_VERSION and method == PURPLE_PROXY_SOCKS_NO_AUTHENTICATION
         result.update({
@@ -864,6 +1072,17 @@ async def run_purple_proxy_socks_probe(
         if client is not None:
             with contextlib.suppress(Exception):
                 await client.close()
+        if trace is not None:
+            result["trace_timing"] = {"duration": _trace_duration(phase_start)}
+        _trace_append(
+            trace,
+            "phase_end",
+            phase="socks_probe",
+            channel="socks",
+            reachable=True,
+            duration=result.get("trace_timing", {}).get("duration"),
+            error_type=e.__class__.__name__,
+        )
         return result
     finally:
         if client is not None and connect_host is None:
@@ -877,6 +1096,16 @@ async def run_purple_proxy_socks_probe(
             "connect_succeeded": None,
             "ok": handshake_ok,
         }
+        if trace is not None:
+            result["trace_timing"] = {"duration": _trace_duration(phase_start)}
+        _trace_append(
+            trace,
+            "phase_end",
+            phase="socks_probe",
+            channel="socks",
+            reachable=True,
+            duration=result.get("trace_timing", {}).get("duration"),
+        )
         return result
 
     try:
@@ -886,6 +1115,8 @@ async def run_purple_proxy_socks_probe(
             "target_address_type": target_address_type,
             "target_port": connect_port,
         }
+        if include_identifiers:
+            connect_phase["target_host"] = connect_host
         if not handshake_ok:
             connect_phase.update({
                 "sent": False,
@@ -898,7 +1129,21 @@ async def run_purple_proxy_socks_probe(
                 "ok": False,
             }
         else:
+            send_start = asyncio.get_running_loop().time()
             await asyncio.wait_for(client.service.sendall(connect_request), timeout=timeout)
+            _trace_append(
+                trace,
+                "send_bytes",
+                phase="socks_probe",
+                channel="socks",
+                step="connect",
+                duration=_trace_duration(send_start),
+                bytes_hex=connect_request.hex(),
+                target_address_type=target_address_type,
+                target_port=connect_port,
+                **({"target_host": connect_host} if include_identifiers else {}),
+            )
+            recv_start = asyncio.get_running_loop().time()
             response_header = await asyncio.wait_for(client.service.recvall(4), timeout=timeout)
             response_version, reply, reserved, address_type = response_header
             if address_type == PURPLE_PROXY_SOCKS_ATYP_IPV4:
@@ -914,6 +1159,16 @@ async def run_purple_proxy_socks_probe(
             else:
                 raise ValueError(f"unsupported SOCKS5 bind address type: {address_type}")
             bound_port = int.from_bytes(await asyncio.wait_for(client.service.recvall(2), timeout=timeout), "big")
+            response_bytes = response_header + bound_address + bound_port.to_bytes(2, "big")
+            _trace_append(
+                trace,
+                "recv_bytes",
+                phase="socks_probe",
+                channel="socks",
+                step="connect",
+                duration=_trace_duration(recv_start),
+                bytes_hex=response_bytes.hex(),
+            )
             connect_succeeded = response_version == PURPLE_PROXY_SOCKS_VERSION and reply == 0
             connect_phase.update({
                 "sent": True,
@@ -948,11 +1203,32 @@ async def run_purple_proxy_socks_probe(
             "connect_succeeded": False,
             "ok": False,
         }
+        if trace is not None:
+            result["trace_timing"] = {"duration": _trace_duration(phase_start)}
+        _trace_append(
+            trace,
+            "phase_end",
+            phase="socks_probe",
+            channel="socks",
+            reachable=True,
+            duration=result.get("trace_timing", {}).get("duration"),
+            error_type=e.__class__.__name__,
+        )
         return result
     finally:
         if client is not None:
             with contextlib.suppress(Exception):
                 await client.close()
+    if trace is not None:
+        result["trace_timing"] = {"duration": _trace_duration(phase_start)}
+    _trace_append(
+        trace,
+        "phase_end",
+        phase="socks_probe",
+        channel="socks",
+        reachable=result.get("reachable"),
+        duration=result.get("trace_timing", {}).get("duration"),
+    )
     return result
 
 
@@ -976,24 +1252,53 @@ async def run_purple_proxy_session(
     socks_connect_host: Optional[str] = None,
     socks_connect_port: int = 443,
     include_identifiers: bool = False,
+    trace: bool = False,
 ) -> dict[str, Any]:
     if log_level is not None and not 0 <= log_level <= 7:
         raise ValueError("log_level must be between 0 and 7")
 
+    session_start = asyncio.get_running_loop().time()
+    trace_events: Optional[list[dict[str, Any]]] = [] if trace else None
+    _trace_append(
+        trace_events,
+        "session_start",
+        timeout=timeout,
+        control_port=control_port,
+        notify_port=notify_port,
+        conn_port=conn_port,
+        protocol_version=protocol_version,
+        include_identifiers=include_identifiers,
+    )
     phases: dict[str, Any] = {}
     notify_client = None
     control_client = None
     notify_messages_task = None
 
     try:
+        connect_start = asyncio.get_running_loop().time()
+        connect_kwargs = {
+            "connection_type": connection_type,
+            "usbmux_address": usbmux_address,
+            "port": notify_port,
+        }
+        if trace_events is not None:
+            connect_kwargs["trace"] = trace_events
+        if include_identifiers:
+            connect_kwargs["include_identifiers"] = True
         notify_client = await asyncio.wait_for(
             PurpleProxyClient.connect_notify(
                 udid,
-                connection_type=connection_type,
-                usbmux_address=usbmux_address,
-                port=notify_port,
+                **connect_kwargs,
             ),
             timeout=timeout,
+        )
+        _trace_append(
+            trace_events,
+            "connect",
+            phase="notify_connect",
+            channel="notify",
+            port=notify_port,
+            duration=_trace_duration(connect_start),
         )
         if log_level is None:
             phases["set_log_level"] = _purple_proxy_skipped_phase("--log-level was not provided.")
@@ -1006,6 +1311,8 @@ async def run_purple_proxy_session(
                 include_response=include_response,
                 level=log_level,
                 include_identifiers=include_identifiers,
+                trace=trace_events,
+                phase_name="set_log_level",
             )
         phases["register_notify"] = await _run_connected_notify_phase(
             notify_client,
@@ -1016,6 +1323,8 @@ async def run_purple_proxy_session(
             listen_timeout=listen_timeout,
             max_messages=max_messages,
             include_identifiers=include_identifiers,
+            trace=trace_events,
+            phase_name="register_notify",
         )
         if phases["register_notify"].get("reachable") and listen_timeout > 0:
             notify_messages_task = asyncio.create_task(
@@ -1026,6 +1335,14 @@ async def run_purple_proxy_session(
                 )
             )
     except Exception as e:
+        _trace_append(
+            trace_events,
+            "connect_error",
+            phase="notify_connect",
+            channel="notify",
+            port=notify_port,
+            error_type=e.__class__.__name__,
+        )
         if log_level is None:
             phases["set_log_level"] = _purple_proxy_skipped_phase("--log-level was not provided.")
         else:
@@ -1050,14 +1367,30 @@ async def run_purple_proxy_session(
         )
 
     try:
+        connect_start = asyncio.get_running_loop().time()
+        connect_kwargs = {
+            "connection_type": connection_type,
+            "usbmux_address": usbmux_address,
+            "port": control_port,
+        }
+        if trace_events is not None:
+            connect_kwargs["trace"] = trace_events
+        if include_identifiers:
+            connect_kwargs["include_identifiers"] = True
         control_client = await asyncio.wait_for(
             PurpleProxyClient.connect_control(
                 udid,
-                connection_type=connection_type,
-                usbmux_address=usbmux_address,
-                port=control_port,
+                **connect_kwargs,
             ),
             timeout=timeout,
+        )
+        _trace_append(
+            trace_events,
+            "connect",
+            phase="control_connect",
+            channel="control",
+            port=control_port,
+            duration=_trace_duration(connect_start),
         )
         phases["begin_control"] = await _run_connected_control_phase(
             control_client,
@@ -1068,6 +1401,8 @@ async def run_purple_proxy_session(
             conn_port=conn_port,
             include_response=include_response,
             include_identifiers=include_identifiers,
+            trace=trace_events,
+            phase_name="begin_control",
         )
         phases["ping"] = await _run_connected_control_phase(
             control_client,
@@ -1078,6 +1413,8 @@ async def run_purple_proxy_session(
             conn_port=conn_port,
             include_response=include_response,
             include_identifiers=include_identifiers,
+            trace=trace_events,
+            phase_name="ping",
         )
         phases["wait_socket"] = await _run_connected_control_phase(
             control_client,
@@ -1088,8 +1425,18 @@ async def run_purple_proxy_session(
             conn_port=conn_port,
             include_response=include_response,
             include_identifiers=include_identifiers,
+            trace=trace_events,
+            phase_name="wait_socket",
         )
     except Exception as e:
+        _trace_append(
+            trace_events,
+            "connect_error",
+            phase="control_connect",
+            channel="control",
+            port=control_port,
+            error_type=e.__class__.__name__,
+        )
         for key, command in (
             ("begin_control", PurpleProxyCommand.BEGIN_CONTROL),
             ("ping", PurpleProxyCommand.PING),
@@ -1131,19 +1478,26 @@ async def run_purple_proxy_session(
         socks_port=conn_port,
     )
     if probe_socks or socks_connect_host is not None:
-        phases["socks_probe"] = await run_purple_proxy_socks_probe(
-            udid=udid,
-            usbmux_address=usbmux_address,
-            timeout=timeout,
-            port=conn_port,
-            connect_host=socks_connect_host,
-            connect_port=socks_connect_port,
-            connection_type=connection_type,
-            include_response=include_response,
-        )
+        socks_kwargs = {
+            "udid": udid,
+            "usbmux_address": usbmux_address,
+            "timeout": timeout,
+            "port": conn_port,
+            "connect_host": socks_connect_host,
+            "connect_port": socks_connect_port,
+            "connection_type": connection_type,
+            "include_response": include_response,
+        }
+        if include_identifiers:
+            socks_kwargs["include_identifiers"] = True
+        if trace_events is not None:
+            socks_kwargs["trace"] = trace_events
+        phases["socks_probe"] = await run_purple_proxy_socks_probe(**socks_kwargs)
     else:
         phases["socks_probe"] = _purple_proxy_skipped_phase("--probe-socks was not provided.")
 
+    session_duration = _trace_duration(session_start)
+    _trace_append(trace_events, "session_end", duration=session_duration)
     result = {
         "checked": True,
         "experimental": True,
@@ -1151,4 +1505,11 @@ async def run_purple_proxy_session(
         "summary": summarize_purple_proxy_session(phases),
     }
     _mark_identifier_output(result, include_identifiers=include_identifiers)
+    if trace_events is not None:
+        result["trace"] = {
+            "enabled": True,
+            "event_count": len(trace_events),
+            "duration": session_duration,
+            "events": trace_events,
+        }
     return result

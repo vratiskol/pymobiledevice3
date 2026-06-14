@@ -1335,6 +1335,10 @@ async def restore_purple_evidence(
             help="Include raw device identifiers and unsanitized PurpleReverseProxy dictionaries.",
         ),
     ] = False,
+    trace: Annotated[
+        bool,
+        typer.Option("--trace", help="Include ordered plist/byte trace events and per-phase timings."),
+    ] = False,
     listen_timeout: Annotated[
         float,
         typer.Option(
@@ -1420,6 +1424,7 @@ async def restore_purple_evidence(
                 "command": "purple-evidence",
                 "include_response": include_response,
                 "include_identifiers": include_identifiers,
+                "trace_enabled": trace,
                 "wait_restoreos": wait_result,
                 "live_probe": live_probe,
                 "session": {
@@ -1454,31 +1459,35 @@ async def restore_purple_evidence(
                 include_identifiers=include_identifiers,
             )
         )
-    session = await run_purple_proxy_session(
-        udid=udid,
-        usbmux_address=usbmux_address,
-        timeout=timeout,
-        control_port=effective_control_port,
-        notify_port=effective_notify_port,
-        protocol_version=protocol_version,
-        conn_port=effective_conn_port,
-        log_level=log_level,
-        url=url,
-        proxy_host=proxy_host,
-        include_response=include_response,
-        listen_timeout=listen_timeout,
-        max_messages=max_messages,
-        probe_socks=probe_socks,
-        socks_connect_host=socks_connect_host,
-        socks_connect_port=socks_connect_port,
-        include_identifiers=include_identifiers,
-    )
+    session_kwargs = {
+        "udid": udid,
+        "usbmux_address": usbmux_address,
+        "timeout": timeout,
+        "control_port": effective_control_port,
+        "notify_port": effective_notify_port,
+        "protocol_version": protocol_version,
+        "conn_port": effective_conn_port,
+        "log_level": log_level,
+        "url": url,
+        "proxy_host": proxy_host,
+        "include_response": include_response,
+        "listen_timeout": listen_timeout,
+        "max_messages": max_messages,
+        "probe_socks": probe_socks,
+        "socks_connect_host": socks_connect_host,
+        "socks_connect_port": socks_connect_port,
+        "include_identifiers": include_identifiers,
+    }
+    if trace:
+        session_kwargs["trace"] = True
+    session = await run_purple_proxy_session(**session_kwargs)
     result = {
         "checked": True,
         "experimental": True,
         "command": "purple-evidence",
         "include_response": include_response,
         "include_identifiers": include_identifiers,
+        "trace_enabled": trace,
         "live_probe": live_probe,
         "session": session,
         "summary": {
@@ -1493,6 +1502,8 @@ async def restore_purple_evidence(
     }
     if wait_result is not None:
         result["wait_restoreos"] = wait_result
+    if trace and "trace" in session:
+        result["trace"] = session["trace"]
     _annotate_port_config(result, port_config)
     if include_identifiers:
         result["identifier_warning"] = "Output contains raw device identifiers and unsanitized response dictionaries."

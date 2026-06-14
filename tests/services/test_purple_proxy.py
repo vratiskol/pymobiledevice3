@@ -109,6 +109,21 @@ async def test_write_dictionary_uses_service_plist_framing():
 
 
 @pytest.mark.asyncio
+async def test_client_trace_records_plist_io_with_sanitized_responses():
+    trace = []
+    service = FakeService(responses=[{"Command": "Pong", "SerialNumber": "sensitive"}])
+    client = PurpleProxyClient(service, trace=trace, trace_channel="control")
+
+    response = await client.send_recv_command_message(PurpleProxyCommand.PING)
+
+    assert response == {"Command": "Pong", "SerialNumber": "sensitive"}
+    assert [event["event"] for event in trace] == ["send_plist", "recv_plist"]
+    assert trace[0]["channel"] == "control"
+    assert trace[0]["message"] == {"Command": "Ping"}
+    assert trace[1]["response"] == {"Command": "Pong", "SerialNumber": "<redacted>"}
+
+
+@pytest.mark.asyncio
 async def test_hello_control_sends_command_and_reads_response():
     service = FakeService(responses=[{"Status": "OK", "CtrlProtoVersion": 1}])
     client = PurpleProxyClient(service)
@@ -811,6 +826,58 @@ async def test_run_purple_proxy_session_can_include_identifiers(monkeypatch):
     assert result["include_identifiers"] is True
     assert result["phases"]["register_notify"]["messages"] == [{"Event": "ProxyOnline", "SerialNumber": "sensitive"}]
     assert result["phases"]["begin_control"]["response"] == {"Command": "Pong", "SerialNumber": "sensitive"}
+
+
+@pytest.mark.asyncio
+async def test_run_purple_proxy_session_trace_records_phase_and_plist_events(monkeypatch):
+    notify_service = FakeService(responses=[{"Event": "ProxyOnline", "SerialNumber": "sensitive"}])
+    control_service = FakeService(
+        responses=[
+            {"Command": "BeginAck", "SerialNumber": "sensitive"},
+            {"Command": "Pong", "SerialNumber": "sensitive"},
+            {"SocketReady": True},
+        ]
+    )
+
+    async def fake_connect_notify(udid=None, **kwargs):
+        return PurpleProxyClient(
+            notify_service,
+            trace=kwargs["trace"],
+            trace_channel="notify",
+            include_identifiers=kwargs.get("include_identifiers", False),
+        )
+
+    async def fake_connect_control(udid=None, **kwargs):
+        return PurpleProxyClient(
+            control_service,
+            trace=kwargs["trace"],
+            trace_channel="control",
+            include_identifiers=kwargs.get("include_identifiers", False),
+        )
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_notify", staticmethod(fake_connect_notify))
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_control", staticmethod(fake_connect_control))
+
+    result = await run_purple_proxy_session(
+        timeout=0.1,
+        protocol_version=2,
+        conn_port=4321,
+        log_level=7,
+        include_response=True,
+        listen_timeout=0.1,
+        max_messages=1,
+        trace=True,
+    )
+
+    events = result["trace"]["events"]
+    assert result["trace"]["enabled"] is True
+    assert result["trace"]["event_count"] == len(events)
+    assert "trace_timing" in result["phases"]["begin_control"]
+    assert "send_plist" in [event["event"] for event in events]
+    assert "recv_plist" in [event["event"] for event in events]
+    assert {"Command": "Pong", "SerialNumber": "<redacted>"} in [
+        event.get("response") for event in events if event["event"] == "recv_plist"
+    ]
 
 
 @pytest.mark.asyncio
