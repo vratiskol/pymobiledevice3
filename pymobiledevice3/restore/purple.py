@@ -871,12 +871,14 @@ async def collect_live_purple_reverse_proxy_probe(
     timeout: float = 1.0,
     include_services: bool = False,
     ports: Optional[list[dict[str, Any]]] = None,
+    include_identifiers: bool = False,
 ) -> dict[str, Any]:
     """
     Probe PurpleReverseProxy-related RestoreOS ports through usbmuxd.
 
-    This intentionally omits UDID, serial, ECID, and pair-record details from its
-    public result so probe output can be pasted into issue/PR text.
+    This omits UDID, serial, ECID, and pair-record details by default so probe
+    output can be pasted into issue/PR text. Raw usbmux identifiers are included
+    only when include_identifiers is explicitly enabled.
     """
     try:
         devices = [device for device in await usbmux.list_devices(usbmux_address=usbmux_address) if device.is_usb]
@@ -923,6 +925,12 @@ async def collect_live_purple_reverse_proxy_probe(
             "query_type": query_type,
             "ports": ports,
         }
+        if include_identifiers:
+            device_result["identifiers"] = {
+                "device_id": getattr(device, "device_id", None),
+                "serial": device.serial,
+                "connection_type": device.connection_type,
+            }
         if include_services:
             device_result["lockdown_services"] = await _probe_lockdown_services(
                 device,
@@ -943,6 +951,7 @@ async def collect_live_purple_reverse_proxy_probe(
         "checked": True,
         "mode": mode,
         "device_count": len(probed_devices),
+        **({"include_identifiers": True} if include_identifiers else {}),
         "ports": probe_ports,
         "devices": probed_devices,
     }

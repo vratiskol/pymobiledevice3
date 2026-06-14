@@ -782,6 +782,38 @@ async def test_run_purple_proxy_session_keeps_notify_open_during_control_sequenc
 
 
 @pytest.mark.asyncio
+async def test_run_purple_proxy_session_can_include_identifiers(monkeypatch):
+    notify_client = FakePurpleProxyClient(messages=[{"Event": "ProxyOnline", "SerialNumber": "sensitive"}])
+    control_client = FakePurpleProxyClient({"Command": "Pong", "SerialNumber": "sensitive"})
+
+    async def fake_connect_notify(udid=None, **kwargs):
+        return notify_client
+
+    async def fake_connect_control(udid=None, **kwargs):
+        return control_client
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_notify", staticmethod(fake_connect_notify))
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_control", staticmethod(fake_connect_control))
+
+    result = await run_purple_proxy_session(
+        timeout=0.1,
+        control_port=1234,
+        notify_port=1235,
+        protocol_version=2,
+        conn_port=4321,
+        log_level=7,
+        include_response=True,
+        include_identifiers=True,
+        listen_timeout=0.1,
+        max_messages=1,
+    )
+
+    assert result["include_identifiers"] is True
+    assert result["phases"]["register_notify"]["messages"] == [{"Event": "ProxyOnline", "SerialNumber": "sensitive"}]
+    assert result["phases"]["begin_control"]["response"] == {"Command": "Pong", "SerialNumber": "sensitive"}
+
+
+@pytest.mark.asyncio
 async def test_run_purple_proxy_session_can_require_socks_probe(monkeypatch):
     notify_client = FakePurpleProxyClient()
     control_client = FakePurpleProxyClient({"Command": "Pong"})

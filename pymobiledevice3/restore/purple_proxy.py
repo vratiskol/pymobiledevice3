@@ -159,6 +159,17 @@ def sanitize_purple_proxy_response(value: Any) -> Any:
     return value
 
 
+def _visible_purple_proxy_response(value: Any, *, include_identifiers: bool) -> Any:
+    if include_identifiers:
+        return value
+    return sanitize_purple_proxy_response(value)
+
+
+def _mark_identifier_output(result: dict[str, Any], *, include_identifiers: bool) -> None:
+    if include_identifiers:
+        result["include_identifiers"] = True
+
+
 def _contains_text(value: Any, needles: tuple[str, ...]) -> bool:
     if isinstance(value, dict):
         return any(_contains_text(key, needles) or _contains_text(item, needles) for key, item in value.items())
@@ -266,6 +277,7 @@ async def _run_connected_control_phase(
     protocol_version: int,
     conn_port: int,
     include_response: bool,
+    include_identifiers: bool = False,
 ) -> dict[str, Any]:
     result = _purple_proxy_control_phase_result(
         command,
@@ -286,15 +298,16 @@ async def _run_connected_control_phase(
     except Exception as e:
         return _purple_proxy_unreachable_phase(result, e)
 
-    sanitized_response = sanitize_purple_proxy_response(response)
+    _mark_identifier_output(result, include_identifiers=include_identifiers)
+    visible_response = _visible_purple_proxy_response(response, include_identifiers=include_identifiers)
     result.update({
         "reachable": True,
-        "response_keys": sorted(str(key) for key in sanitized_response),
+        "response_keys": sorted(str(key) for key in visible_response),
     })
     if command is PurpleProxyCommand.PING:
-        result["pong"] = is_purple_proxy_pong_response(sanitized_response)
+        result["pong"] = is_purple_proxy_pong_response(visible_response)
     if include_response:
-        result["response"] = sanitized_response
+        result["response"] = visible_response
     return result
 
 
@@ -308,6 +321,7 @@ async def _run_connected_notify_phase(
     level: Optional[int] = None,
     listen_timeout: float = 0.0,
     max_messages: int = 8,
+    include_identifiers: bool = False,
 ) -> dict[str, Any]:
     result = _purple_proxy_notify_phase_result(
         command,
@@ -329,6 +343,7 @@ async def _run_connected_notify_phase(
     except Exception as e:
         return _purple_proxy_unreachable_phase(result, e)
 
+    _mark_identifier_output(result, include_identifiers=include_identifiers)
     result.update({
         "reachable": True,
         "sent": True,
@@ -341,13 +356,17 @@ def _add_notify_messages_to_phase(
     messages: list[dict[str, Any]],
     *,
     include_response: bool,
+    include_identifiers: bool = False,
 ) -> dict[str, Any]:
-    sanitized_messages = [sanitize_purple_proxy_response(message) for message in messages]
-    phase["message_count"] = len(sanitized_messages)
-    phase["message_keys"] = [sorted(str(key) for key in message) for message in sanitized_messages]
-    phase["notify_summary"] = summarize_purple_proxy_notify_messages(sanitized_messages)
+    visible_messages = [
+        _visible_purple_proxy_response(message, include_identifiers=include_identifiers) for message in messages
+    ]
+    _mark_identifier_output(phase, include_identifiers=include_identifiers)
+    phase["message_count"] = len(visible_messages)
+    phase["message_keys"] = [sorted(str(key) for key in message) for message in visible_messages]
+    phase["notify_summary"] = summarize_purple_proxy_notify_messages(visible_messages)
     if include_response:
-        phase["messages"] = sanitized_messages
+        phase["messages"] = visible_messages
     return phase
 
 
@@ -578,6 +597,7 @@ async def run_purple_proxy_control_command(
     conn_port: int = PURPLE_PROXY_SOCKS_PORT,
     connection_type: str = "USB",
     include_response: bool = False,
+    include_identifiers: bool = False,
 ) -> dict[str, Any]:
     if isinstance(command, str):
         command = PurpleProxyCommand(command)
@@ -594,6 +614,7 @@ async def run_purple_proxy_control_command(
         result["protocol_version"] = protocol_version
     if command is PurpleProxyCommand.WAIT_SOCKET:
         result["conn_port"] = conn_port
+    _mark_identifier_output(result, include_identifiers=include_identifiers)
 
     try:
         client = await asyncio.wait_for(
@@ -626,15 +647,15 @@ async def run_purple_proxy_control_command(
             with contextlib.suppress(Exception):
                 await client.close()
 
-    sanitized_response = sanitize_purple_proxy_response(response)
+    visible_response = _visible_purple_proxy_response(response, include_identifiers=include_identifiers)
     result.update({
         "reachable": True,
-        "response_keys": sorted(str(key) for key in sanitized_response),
+        "response_keys": sorted(str(key) for key in visible_response),
     })
     if command is PurpleProxyCommand.PING:
-        result["pong"] = is_purple_proxy_pong_response(sanitized_response)
+        result["pong"] = is_purple_proxy_pong_response(visible_response)
     if include_response:
-        result["response"] = sanitized_response
+        result["response"] = visible_response
     return result
 
 
@@ -670,6 +691,7 @@ async def run_purple_proxy_notify_command(
     expect_response: bool = False,
     listen_timeout: float = 0.0,
     max_messages: int = 8,
+    include_identifiers: bool = False,
 ) -> dict[str, Any]:
     if isinstance(command, str):
         command = PurpleProxyCommand(command)
@@ -692,6 +714,7 @@ async def run_purple_proxy_notify_command(
             "listen_timeout": listen_timeout,
             "max_messages": max_messages,
         })
+    _mark_identifier_output(result, include_identifiers=include_identifiers)
 
     try:
         client = await asyncio.wait_for(
@@ -717,17 +740,22 @@ async def run_purple_proxy_notify_command(
 
         if expect_response:
             response = await asyncio.wait_for(client.read_dictionary(), timeout=timeout)
-            sanitized_response = sanitize_purple_proxy_response(response)
-            result["response_keys"] = sorted(str(key) for key in sanitized_response)
+            visible_response = _visible_purple_proxy_response(response, include_identifiers=include_identifiers)
+            result["response_keys"] = sorted(str(key) for key in visible_response)
             if include_response:
-                result["response"] = sanitized_response
+                result["response"] = visible_response
         elif listen_timeout > 0:
             messages = await collect_purple_proxy_notify_messages(
                 client,
                 listen_timeout=listen_timeout,
                 max_messages=max_messages,
             )
-            _add_notify_messages_to_phase(result, messages, include_response=include_response)
+            _add_notify_messages_to_phase(
+                result,
+                messages,
+                include_response=include_response,
+                include_identifiers=include_identifiers,
+            )
     except asyncio.TimeoutError as e:
         if result.get("sent"):
             result.update({
@@ -947,6 +975,7 @@ async def run_purple_proxy_session(
     probe_socks: bool = False,
     socks_connect_host: Optional[str] = None,
     socks_connect_port: int = 443,
+    include_identifiers: bool = False,
 ) -> dict[str, Any]:
     if log_level is not None and not 0 <= log_level <= 7:
         raise ValueError("log_level must be between 0 and 7")
@@ -976,6 +1005,7 @@ async def run_purple_proxy_session(
                 port=notify_port,
                 include_response=include_response,
                 level=log_level,
+                include_identifiers=include_identifiers,
             )
         phases["register_notify"] = await _run_connected_notify_phase(
             notify_client,
@@ -985,6 +1015,7 @@ async def run_purple_proxy_session(
             include_response=include_response,
             listen_timeout=listen_timeout,
             max_messages=max_messages,
+            include_identifiers=include_identifiers,
         )
         if phases["register_notify"].get("reachable") and listen_timeout > 0:
             notify_messages_task = asyncio.create_task(
@@ -1036,6 +1067,7 @@ async def run_purple_proxy_session(
             protocol_version=protocol_version,
             conn_port=conn_port,
             include_response=include_response,
+            include_identifiers=include_identifiers,
         )
         phases["ping"] = await _run_connected_control_phase(
             control_client,
@@ -1045,6 +1077,7 @@ async def run_purple_proxy_session(
             protocol_version=protocol_version,
             conn_port=conn_port,
             include_response=include_response,
+            include_identifiers=include_identifiers,
         )
         phases["wait_socket"] = await _run_connected_control_phase(
             control_client,
@@ -1054,6 +1087,7 @@ async def run_purple_proxy_session(
             protocol_version=protocol_version,
             conn_port=conn_port,
             include_response=include_response,
+            include_identifiers=include_identifiers,
         )
     except Exception as e:
         for key, command in (
@@ -1082,6 +1116,7 @@ async def run_purple_proxy_session(
                     phases["register_notify"],
                     messages,
                     include_response=include_response,
+                    include_identifiers=include_identifiers,
                 )
         if control_client is not None:
             with contextlib.suppress(Exception):
@@ -1109,9 +1144,11 @@ async def run_purple_proxy_session(
     else:
         phases["socks_probe"] = _purple_proxy_skipped_phase("--probe-socks was not provided.")
 
-    return {
+    result = {
         "checked": True,
         "experimental": True,
         "phases": phases,
         "summary": summarize_purple_proxy_session(phases),
     }
+    _mark_identifier_output(result, include_identifiers=include_identifiers)
+    return result

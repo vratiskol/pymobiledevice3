@@ -987,6 +987,26 @@ def _purple_session_reachable_ports(probe: dict[str, Any]) -> list[str]:
     return sorted(reachable_ports)
 
 
+def _purple_probe_kwargs(
+    *,
+    usbmux_address: Optional[str],
+    timeout: float,
+    include_services: bool,
+    port_config: Optional[dict[str, Any]],
+    include_identifiers: bool = False,
+) -> dict[str, Any]:
+    probe_kwargs = {
+        "usbmux_address": usbmux_address,
+        "timeout": timeout,
+        "include_services": include_services,
+    }
+    if port_config is not None:
+        probe_kwargs["ports"] = port_config["probe_ports"]
+    if include_identifiers:
+        probe_kwargs["include_identifiers"] = True
+    return probe_kwargs
+
+
 @cli.command("purple-session")
 @async_command
 async def restore_purple_session(
@@ -1097,14 +1117,14 @@ async def restore_purple_session(
         PURPLE_PROXY_NOTIFY_PORT,
     )
     effective_conn_port = _purple_configured_port(port_config, "socks", conn_port, PURPLE_PROXY_SOCKS_PORT)
-    probe_kwargs = {
-        "usbmux_address": usbmux_address,
-        "timeout": timeout,
-        "include_services": include_services,
-    }
-    if port_config is not None:
-        probe_kwargs["ports"] = port_config["probe_ports"]
-    probe = await collect_live_purple_reverse_proxy_probe(**probe_kwargs)
+    probe = await collect_live_purple_reverse_proxy_probe(
+        **_purple_probe_kwargs(
+            usbmux_address=usbmux_address,
+            timeout=timeout,
+            include_services=include_services,
+            port_config=port_config,
+        )
+    )
     result = await run_purple_proxy_session(
         udid=udid,
         usbmux_address=usbmux_address,
@@ -1132,6 +1152,178 @@ async def restore_purple_session(
         "probe_mode": probe.get("mode"),
         "probe_reachable_ports": _purple_session_reachable_ports(probe),
     })
+    print_json(result, colored=False)
+    if strict and not result["summary"]["ok"]:
+        raise typer.Exit(1)
+
+
+@cli.command("purple-evidence")
+@async_command
+async def restore_purple_evidence(
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", min=0.1, help="Timeout for each PurpleReverseProxy connection and reply."),
+    ] = 1.0,
+    firmware_root: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--firmware-root",
+            help="Read PurpleReverseProxy socket ports from an extracted RestoreOS ramdisk root.",
+        ),
+    ] = None,
+    control_port: Annotated[
+        int,
+        typer.Option("--control-port", min=1, max=0xFFFF, help="Device-side PurpleReverseProxy control port."),
+    ] = PURPLE_PROXY_CONTROL_PORT,
+    notify_port: Annotated[
+        int,
+        typer.Option("--notify-port", min=1, max=0xFFFF, help="Device-side PurpleReverseProxy notify port."),
+    ] = PURPLE_PROXY_NOTIFY_PORT,
+    protocol_version: Annotated[
+        int,
+        typer.Option("--protocol-version", min=0, help="CtrlProtoVersion value to send with BeginCtrl."),
+    ] = PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
+    conn_port: Annotated[
+        int,
+        typer.Option("--conn-port", min=1, max=0xFFFF, help="ConnPort value to send with WaitSocket."),
+    ] = PURPLE_PROXY_SOCKS_PORT,
+    log_level: Annotated[
+        int,
+        typer.Option("--log-level", min=0, max=7, help="Send SetLogLevel before RegisterNotify."),
+    ] = 7,
+    url: Annotated[
+        str,
+        typer.Option("--url", help="URL passed to the modeled CopyProxyDictionaryWithOptions path."),
+    ] = "https://www.apple.com/",
+    proxy_host: Annotated[
+        str,
+        typer.Option("--proxy-host", help="SOCKS proxy host to place in the proxy dictionary."),
+    ] = PURPLE_PROXY_LOOPBACK_HOST,
+    include_response: Annotated[
+        bool,
+        typer.Option(
+            "--include-response/--no-include-response",
+            help="Include PurpleReverseProxy response and notify dictionaries in JSON output.",
+        ),
+    ] = True,
+    include_identifiers: Annotated[
+        bool,
+        typer.Option(
+            "--include-identifiers",
+            help="Include raw device identifiers and unsanitized PurpleReverseProxy dictionaries.",
+        ),
+    ] = False,
+    listen_timeout: Annotated[
+        float,
+        typer.Option(
+            "--listen-timeout", min=0.0, help="Seconds to collect asynchronous notify dictionaries during the session."
+        ),
+    ] = 1.0,
+    max_messages: Annotated[
+        int,
+        typer.Option("--max-messages", min=1, help="Maximum notify dictionaries to collect while listening."),
+    ] = 8,
+    probe_socks: Annotated[
+        bool,
+        typer.Option("--probe-socks/--no-probe-socks", help="Run a SOCKS5 data-plane probe after WaitSocket."),
+    ] = True,
+    socks_connect_host: Annotated[
+        Optional[str],
+        typer.Option(
+            "--socks-connect-host",
+            help="Optionally send a SOCKS5 CONNECT request during --probe-socks.",
+        ),
+    ] = None,
+    socks_connect_port: Annotated[
+        int,
+        typer.Option("--socks-connect-port", min=1, max=0xFFFF, help="Port for the optional session SOCKS CONNECT."),
+    ] = 443,
+    include_services: Annotated[
+        bool,
+        typer.Option(
+            "--include-services",
+            help="Also try starting PurpleReverseProxy lockdown service names when lockdownd is reachable.",
+        ),
+    ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Exit non-zero when the collected session summary is not ok."),
+    ] = False,
+    udid: Annotated[
+        Optional[str],
+        typer.Option("--udid", "--serial", help="Target device serial/UDID."),
+    ] = None,
+    usbmux_address: Annotated[
+        Optional[str],
+        typer.Option("--usbmux-address", help="Address of the usbmuxd daemon (unix socket path or HOST:PORT)."),
+    ] = None,
+) -> None:
+    """
+    Collect one-shot PurpleReverseProxy probe, session, notify, and SOCKS evidence.
+    """
+    port_config = _purple_port_config(firmware_root)
+    effective_control_port = _purple_configured_port(
+        port_config,
+        "ctrl",
+        control_port,
+        PURPLE_PROXY_CONTROL_PORT,
+    )
+    effective_notify_port = _purple_configured_port(
+        port_config,
+        "notify",
+        notify_port,
+        PURPLE_PROXY_NOTIFY_PORT,
+    )
+    effective_conn_port = _purple_configured_port(port_config, "socks", conn_port, PURPLE_PROXY_SOCKS_PORT)
+    live_probe = await collect_live_purple_reverse_proxy_probe(
+        **_purple_probe_kwargs(
+            usbmux_address=usbmux_address,
+            timeout=timeout,
+            include_services=include_services,
+            port_config=port_config,
+            include_identifiers=include_identifiers,
+        )
+    )
+    session = await run_purple_proxy_session(
+        udid=udid,
+        usbmux_address=usbmux_address,
+        timeout=timeout,
+        control_port=effective_control_port,
+        notify_port=effective_notify_port,
+        protocol_version=protocol_version,
+        conn_port=effective_conn_port,
+        log_level=log_level,
+        url=url,
+        proxy_host=proxy_host,
+        include_response=include_response,
+        listen_timeout=listen_timeout,
+        max_messages=max_messages,
+        probe_socks=probe_socks,
+        socks_connect_host=socks_connect_host,
+        socks_connect_port=socks_connect_port,
+        include_identifiers=include_identifiers,
+    )
+    result = {
+        "checked": True,
+        "experimental": True,
+        "command": "purple-evidence",
+        "include_response": include_response,
+        "include_identifiers": include_identifiers,
+        "live_probe": live_probe,
+        "session": session,
+        "summary": {
+            "probe_mode": live_probe.get("mode"),
+            "probe_device_count": live_probe.get("device_count", 0),
+            "probe_reachable_ports": _purple_session_reachable_ports(live_probe),
+            "session_ok": session["summary"]["ok"],
+            "socks_probe_ok": session["summary"].get("socks_probe_ok"),
+            "contains_raw_identifiers": include_identifiers,
+            "ok": session["summary"]["ok"],
+        },
+    }
+    _annotate_port_config(result, port_config)
+    if include_identifiers:
+        result["identifier_warning"] = "Output contains raw device identifiers and unsanitized response dictionaries."
     print_json(result, colored=False)
     if strict and not result["summary"]["ok"]:
         raise typer.Exit(1)

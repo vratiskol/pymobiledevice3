@@ -24,6 +24,7 @@ TEST_UUID = bytes.fromhex("00112233445566778899aabbccddeeff")
 
 
 class FakeMuxDevice:
+    device_id = 123
     serial = "fake-sensitive-serial"
     connection_type = "USB"
     is_usb = True
@@ -1225,6 +1226,112 @@ def test_restore_purple_session_help():
     assert "--strict" in result.output
 
 
+def test_restore_purple_evidence_help():
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-evidence", "--help"], env={"COLUMNS": "220"})
+
+    assert result.exit_code == 0
+    assert "--firmware-root" in result.output
+    assert "--include-response" in result.output
+    assert "--include-identifiers" in result.output
+    assert "--probe-socks" in result.output
+    assert "--include-services" in result.output
+    assert "--strict" in result.output
+
+
+def test_restore_purple_evidence_collects_raw_output(tmp_path, monkeypatch):
+    root = _write_purple_launchd_root(tmp_path)
+
+    async def fake_collect_live_purple_reverse_proxy_probe(**kwargs):
+        assert kwargs["include_identifiers"] is True
+        assert kwargs["timeout"] == 0.5
+        assert {port["name"]: port["port"] for port in kwargs["ports"]} == {
+            "restore": 62078,
+            "socks": 2081,
+            "ctrl": 2082,
+            "notify": 2084,
+        }
+        return {
+            "checked": True,
+            "mode": "restored",
+            "device_count": 1,
+            "include_identifiers": True,
+            "devices": [
+                {
+                    "index": 0,
+                    "mode": "restored",
+                    "identifiers": {"serial": "fake-sensitive-serial"},
+                    "ports": [{"name": "ctrl", "reachable": True}],
+                }
+            ],
+        }
+
+    async def fake_run_purple_proxy_session(**kwargs):
+        assert kwargs["include_response"] is True
+        assert kwargs["include_identifiers"] is True
+        assert kwargs["control_port"] == 2082
+        assert kwargs["notify_port"] == 2084
+        assert kwargs["conn_port"] == 2081
+        assert kwargs["log_level"] == 7
+        assert kwargs["probe_socks"] is True
+        return {
+            "checked": True,
+            "experimental": True,
+            "include_identifiers": True,
+            "phases": {
+                "register_notify": {
+                    "checked": True,
+                    "reachable": True,
+                    "messages": [{"Event": "ProxyOnline", "SerialNumber": "fake-sensitive-serial"}],
+                },
+                "begin_control": {"checked": True, "reachable": True},
+                "ping": {"checked": True, "reachable": True, "pong": True},
+                "wait_socket": {"checked": True, "reachable": True},
+                "proxy_dictionary": {"checked": True},
+                "socks_probe": {"checked": True, "summary": {"ok": True}},
+            },
+            "summary": {
+                "control_reachable": True,
+                "ping_pong": True,
+                "wait_socket_reachable": True,
+                "notify_registered": True,
+                "set_log_level_sent": True,
+                "socks_probe_ok": True,
+                "proxy_dictionary_ready": True,
+                "ok": True,
+            },
+        }
+
+    monkeypatch.setattr(
+        restore_cli, "collect_live_purple_reverse_proxy_probe", fake_collect_live_purple_reverse_proxy_probe
+    )
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_session", fake_run_purple_proxy_session)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "restore",
+            "purple-evidence",
+            "--firmware-root",
+            str(root),
+            "--timeout",
+            "0.5",
+            "--include-identifiers",
+        ],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["include_identifiers"] is True
+    assert output["summary"]["contains_raw_identifiers"] is True
+    assert output["summary"]["ok"] is True
+    assert output["live_probe"]["devices"][0]["identifiers"]["serial"] == "fake-sensitive-serial"
+    assert output["session"]["phases"]["register_notify"]["messages"] == [
+        {"Event": "ProxyOnline", "SerialNumber": "fake-sensitive-serial"}
+    ]
+    assert output["port_config"]["ports"]["ctrl"] == 2082
+    assert "fake-sensitive-serial" in result.output
+
+
 def test_restore_purple_session_prints_orchestrated_json(monkeypatch):
     async def fake_collect_live_purple_reverse_proxy_probe(**kwargs):
         assert kwargs == {
@@ -1523,3 +1630,30 @@ async def test_collect_live_purple_reverse_proxy_probe_restored_ports_are_redact
         "reason": "--include-services was not provided.",
     }
     assert "fake-sensitive-serial" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_collect_live_purple_reverse_proxy_probe_can_include_identifiers(monkeypatch):
+    async def fake_list_devices(usbmux_address=None):
+        return [FakeMuxDevice()]
+
+    async def fake_create_using_usbmux(serial, port, connection_type=None, usbmux_address=None):
+        response = {}
+        if port == 62078:
+            response = {"Type": "com.apple.mobile.restored", "RestoreProtocolVersion": 15}
+        return FakeService(response)
+
+    from pymobiledevice3.restore import purple
+
+    monkeypatch.setattr(purple.usbmux, "list_devices", fake_list_devices)
+    monkeypatch.setattr(purple.ServiceConnection, "create_using_usbmux", fake_create_using_usbmux)
+
+    result = await collect_live_purple_reverse_proxy_probe(timeout=0.1, include_identifiers=True)
+
+    assert result["include_identifiers"] is True
+    assert result["devices"][0]["identifiers"] == {
+        "device_id": 123,
+        "serial": "fake-sensitive-serial",
+        "connection_type": "USB",
+    }
+    assert "fake-sensitive-serial" in repr(result)
