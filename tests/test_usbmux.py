@@ -1,6 +1,6 @@
 import socket
 
-from pymobiledevice3.usbmux import PlistMuxConnection, list_usb_device_inventory
+from pymobiledevice3.usbmux import PlistMuxConnection, list_usb_device_inventory, usb_composition_summary
 
 
 def test_plist_mux_ignores_paired_message() -> None:
@@ -98,6 +98,8 @@ def test_usb_device_inventory_parses_linux_sysfs(tmp_path) -> None:
     assert devices[0].interfaces[1].alias == "AppleUSBMux"
     assert devices[0].interfaces[2].network_interfaces == ["eth-test"]
     assert devices[0].interfaces[2].network_state == []
+    assert devices[0].to_dict()["composition"]["guess"] == "mux+ptp+ethernet"
+    assert "standardMuxPTPEthernet" in devices[0].to_dict()["composition"]["firmware_matches"]
 
 
 def test_usb_device_inventory_can_include_non_apple_devices(tmp_path) -> None:
@@ -106,8 +108,20 @@ def test_usb_device_inventory_can_include_non_apple_devices(tmp_path) -> None:
     _write(device / "idVendor", "1d6b")
     _write(device / "idProduct", "0002")
 
+    data_interface = tmp_path / "1-1:1.0"
+    data_interface.mkdir()
+    _write(data_interface / "bInterfaceNumber", "00")
+    _write(data_interface / "bAlternateSetting", "0")
+    _write(data_interface / "bInterfaceClass", "0a")
+    _write(data_interface / "bInterfaceSubClass", "00")
+    _write(data_interface / "bInterfaceProtocol", "00")
+    _write(data_interface / "bNumEndpoints", "02")
+
     assert list_usb_device_inventory(tmp_path) == []
-    assert list_usb_device_inventory(tmp_path, vendor_id=None)[0].vendor_id == "1d6b"
+    non_apple = list_usb_device_inventory(tmp_path, vendor_id=None)[0]
+    assert non_apple.vendor_id == "1d6b"
+    assert non_apple.interfaces[0].alias is None
+    assert non_apple.to_dict()["composition"]["firmware_matches"] == []
 
 
 def test_usb_device_inventory_can_include_network_state(tmp_path) -> None:
@@ -148,3 +162,39 @@ def test_usb_device_inventory_can_include_configuration_descriptors(tmp_path) ->
     assert configurations[1].interfaces[0].alias == "AppleUSBMux"
     assert configurations[1].interfaces[0].role == "usbmux"
     assert configurations[1].interfaces[0].endpoints[0].to_dict()["address"] == "0x85"
+
+
+def test_usb_composition_summary_matches_ios27_restore_aux_ncm(tmp_path) -> None:
+    _write_apple_device_sysfs(tmp_path)
+
+    aux_control = tmp_path / "1-2:4.3"
+    aux_control.mkdir()
+    _write(aux_control / "interface", "AppleUSBNCMControlAux")
+    _write(aux_control / "bInterfaceNumber", "03")
+    _write(aux_control / "bAlternateSetting", "0")
+    _write(aux_control / "bInterfaceClass", "02")
+    _write(aux_control / "bInterfaceSubClass", "0d")
+    _write(aux_control / "bInterfaceProtocol", "00")
+    _write(aux_control / "bNumEndpoints", "01")
+
+    aux_data = tmp_path / "1-2:4.4"
+    aux_data.mkdir()
+    _write(aux_data / "interface", "AppleUSBNCMDataAux")
+    _write(aux_data / "bInterfaceNumber", "04")
+    _write(aux_data / "bAlternateSetting", "0")
+    _write(aux_data / "bInterfaceClass", "0a")
+    _write(aux_data / "bInterfaceSubClass", "00")
+    _write(aux_data / "bInterfaceProtocol", "00")
+    _write(aux_data / "bNumEndpoints", "02")
+
+    devices = list_usb_device_inventory(tmp_path)
+    composition = usb_composition_summary([
+        interface
+        for interface in devices[0].interfaces
+        if interface.alias != "PTP" and interface.alias != "AppleUSBEthernet"
+    ])
+
+    assert composition["guess"] == "mux+ncm-aux"
+    assert composition["firmware_matches"] == ["standardRestore", "muxNcmAux"]
+    assert composition["has_usbmux"] is True
+    assert composition["has_network"] is True

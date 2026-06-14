@@ -38,5 +38,7 @@ def test_usbmux_interfaces_reads_fake_sysfs(tmp_path):
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload[0]["configuration"] == "PTP + Apple Mobile Device"
+    assert payload[0]["composition"]["guess"] == "mux-only"
+    assert "standardMuxOnly" in payload[0]["composition"]["firmware_matches"]
     assert payload[0]["interfaces"][0]["alias"] == "AppleUSBMux"
     assert payload[0]["interfaces"][0]["role"] == "usbmux"

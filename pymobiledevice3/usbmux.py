@@ -63,6 +63,99 @@ APPLE_INTERFACE_ALIASES = {
     "USBAudio2Control": "USBAudio2Control",
     "USBAudio2StreamIN": "USBAudio2StreamIN",
     "USBAudio2StreamOUT": "USBAudio2StreamOUT",
+    "UVCControlInterface": "UVCControlInterface",
+    "UVCStreamInterface": "UVCStreamInterface",
+    "UVCStreamInterfaceA": "UVCStreamInterfaceA",
+}
+APPLE_USB_FIRMWARE_CONFIGURATION_SIGNATURES = {
+    frozenset(("AppleUSBMux",)): (
+        "AppleUSBTestDevice",
+        "standardBringup",
+        "standardMuxOnly",
+        "stdMuxIAPVal",
+        "stdMuxIDA",
+    ),
+    frozenset(("PTP",)): (
+        "standardMuxPTP",
+        "standardMuxPTPEthernet",
+        "standardMuxPTPEthernetValeria",
+        "stdMuxPTPEthValIDA",
+    ),
+    frozenset(("PTP", "AppleUSBMux")): (
+        "standardMuxPTP",
+        "standardMuxPTPEthernet",
+        "standardMuxPTPEthernetValeria",
+        "stdMuxPTPEthValIDA",
+    ),
+    frozenset(("AppleUSBMux", "AppleUSBEthernet")): ("standardMuxEthernet",),
+    frozenset(("PTP", "AppleUSBMux", "AppleUSBEthernet")): (
+        "standardMuxPTPEthernet",
+        "standardMuxPTPEthernetValeria",
+        "stdMuxPTPEthValIDA",
+    ),
+    frozenset(("AppleUSBMux", "AppleUSBNCMControl", "AppleUSBNCMData")): ("iBridgeBringup",),
+    frozenset(("AppleUSBNCMControl", "AppleUSBNCMData")): ("ncmBringup",),
+    frozenset(("AppleUSBNCMControl", "AppleUSBNCMData", "AppleUSBNCMControlAux", "AppleUSBNCMDataAux")): (
+        "ncmAuxBringup",
+    ),
+    frozenset(("AppleUSBMux", "AppleUSBNCMControlAux", "AppleUSBNCMDataAux")): (
+        "standardRestore",
+        "muxNcmAux",
+    ),
+    frozenset((
+        "PTP",
+        "AppleUSBMux",
+        "AppleUSBEthernet",
+        "AppleUSBNCMControl",
+        "AppleUSBNCMData",
+        "AppleUSBNCMControlAux",
+        "AppleUSBNCMDataAux",
+    )): ("stdMuxPTPEthValIDA",),
+    frozenset((
+        "AppleUSBMux",
+        "AppleUSBNCMControl",
+        "AppleUSBNCMData",
+        "AppleUSBNCMControlAux",
+        "AppleUSBNCMDataAux",
+    )): ("muxNcm", "muxNcmVal"),
+    frozenset(("AppleUSBNCMControlDirect", "AppleUSBNCMData", "IapOverUsbHid")): ("DeviceModeCarplay",),
+    frozenset(("AppleUSBNCMControlDirect", "AppleUSBNCMData", "IapOverUsbHid", "AppleUSBMux")): ("DeviceModeCarplay2",),
+    frozenset(("AppleUSBMux", "IapOverUsbHid")): ("stdMuxIAPVal",),
+    frozenset(("AppleUSBMux", "Valeria")): ("stdMuxIAPVal",),
+    frozenset(("PTP", "AppleUSBMux", "Valeria")): ("standardMuxPTPEthernetValeria",),
+    frozenset(("PTP", "AppleUSBMux", "Valeria", "AppleUSBNCMControlAux", "AppleUSBNCMDataAux")): (
+        "stdMuxPTPEthValIDA",
+    ),
+    frozenset(("AppleUSBMux", "USBAudio2Control", "USBAudio2StreamIN", "USBAudio2StreamOUT", "IDAMInterface")): (
+        "stdMuxIDA",
+    ),
+    frozenset((
+        "AppleUSBMux",
+        "USBAudio2Control",
+        "USBAudio2StreamIN",
+        "USBAudio2StreamOUT",
+        "IDAMInterface",
+        "AppleUSBNCMControlAux",
+        "AppleUSBNCMDataAux",
+    )): ("stdMuxPTPEthValIDA",),
+    frozenset(("UVCControlInterface", "UVCStreamInterface", "UVCStreamInterfaceA", "AppleUSBMux")): ("muxNcmAuxVideo",),
+    frozenset(("UVCControlInterface", "UVCStreamInterface", "AppleUSBMux")): ("muxNcmAuxVideo",),
+    frozenset((
+        "UVCControlInterface",
+        "UVCStreamInterface",
+        "UVCStreamInterfaceA",
+        "AppleUSBMux",
+        "AppleUSBNCMControlAux",
+        "AppleUSBNCMDataAux",
+    )): ("muxNcmAuxVideo",),
+    frozenset((
+        "UVCControlInterface",
+        "UVCStreamInterface",
+        "AppleUSBMux",
+        "AppleUSBNCMControlAux",
+        "AppleUSBNCMDataAux",
+    )): ("muxNcmAuxVideo",),
+    frozenset(("USBDeviceTester",)): ("USBDeviceTester",),
 }
 
 usbmuxd_version = Enum(
@@ -315,6 +408,7 @@ class UsbDeviceInventory:
             "configuration": self.configuration,
             "num_configurations": self.num_configurations,
             "num_interfaces": self.num_interfaces,
+            "composition": usb_composition_summary(self.interfaces),
             "interfaces": [interface.to_dict() for interface in self.interfaces],
             "available_configurations": [configuration.to_dict() for configuration in self.available_configurations],
         }
@@ -759,11 +853,87 @@ def _read_network_interface_states(
     ]
 
 
+def _dedupe_preserving_order(values: list[str]) -> list[str]:
+    deduped = []
+    for value in values:
+        if value not in deduped:
+            deduped.append(value)
+    return deduped
+
+
+def _composition_guess(alias_set: frozenset[str]) -> str:
+    has_mux = "AppleUSBMux" in alias_set
+    has_ptp = "PTP" in alias_set
+    has_ethernet = "AppleUSBEthernet" in alias_set
+    has_ncm = {"AppleUSBNCMControl", "AppleUSBNCMData"}.issubset(alias_set)
+    has_ncm_aux = {"AppleUSBNCMControlAux", "AppleUSBNCMDataAux"}.issubset(alias_set)
+    has_direct_ncm = {"AppleUSBNCMControlDirect", "AppleUSBNCMData"}.issubset(alias_set)
+    has_iap = "IapOverUsbHid" in alias_set or "iAP" in alias_set
+    has_uvc = bool({"UVCControlInterface", "UVCStreamInterface", "UVCStreamInterfaceA"} & alias_set)
+    has_audio = any(alias.startswith("USBAudio") for alias in alias_set)
+
+    if not alias_set:
+        return "unknown"
+    if has_direct_ncm and has_iap:
+        return "carplay" if not has_mux else "carplay+mux"
+    if has_mux and has_ptp and has_ethernet and has_ncm and has_ncm_aux:
+        return "mux+ptp+ethernet+ncm+aux"
+    if has_mux and has_ptp and has_ethernet:
+        return "mux+ptp+ethernet"
+    if has_mux and has_ptp:
+        return "mux+ptp"
+    if has_mux and has_ncm and has_ncm_aux:
+        return "mux+ncm+aux"
+    if has_mux and has_uvc and has_ncm_aux:
+        return "mux+video+ncm-aux"
+    if has_mux and has_ncm_aux:
+        return "mux+ncm-aux"
+    if has_mux and has_ncm:
+        return "mux+ncm"
+    if has_mux and has_uvc:
+        return "mux+video"
+    if has_mux and has_audio:
+        return "mux+audio"
+    if has_mux:
+        return "mux-only"
+    if has_ncm or has_direct_ncm:
+        return "ncm-only"
+    if has_ptp:
+        return "ptp-only"
+    return "unknown"
+
+
+def usb_composition_summary(interfaces: list["UsbInterface"]) -> dict[str, object]:
+    aliases = _dedupe_preserving_order([interface.alias for interface in interfaces if interface.alias is not None])
+    roles = _dedupe_preserving_order([interface.role for interface in interfaces if interface.role is not None])
+    alias_set = frozenset(aliases)
+    hints = []
+    if "AppleUSBMux" not in alias_set:
+        hints.append("AppleUSBMux is not active; lockdown/usbmux services are not expected over this USB composition.")
+    if {"AppleUSBNCMControlAux", "AppleUSBNCMDataAux"}.issubset(alias_set):
+        hints.append("Aux NCM is active; remote services may also depend on a USB network interface.")
+    if "Valeria" in alias_set:
+        hints.append("Valeria is active; this is an extended Apple USB composition.")
+    if {"AppleUSBNCMControlDirect", "AppleUSBNCMData"}.issubset(alias_set):
+        hints.append("Direct NCM is active; this matches CarPlay-style USB networking compositions.")
+
+    return {
+        "guess": _composition_guess(alias_set),
+        "aliases": aliases,
+        "roles": roles,
+        "firmware_matches": list(APPLE_USB_FIRMWARE_CONFIGURATION_SIGNATURES.get(alias_set, ())),
+        "has_usbmux": "AppleUSBMux" in alias_set,
+        "has_network": any(role in ("network", "network-control") for role in roles),
+        "hints": hints,
+    }
+
+
 def _apple_interface_alias(
     name: Optional[str],
     interface_class: Optional[str] = None,
     interface_subclass: Optional[str] = None,
     interface_protocol: Optional[str] = None,
+    apple_device: bool = True,
 ) -> Optional[str]:
     if name is not None:
         if name in APPLE_INTERFACE_ALIASES:
@@ -771,6 +941,8 @@ def _apple_interface_alias(
         if name.startswith("Apple "):
             return name.replace(" ", "")
         return name
+    if not apple_device:
+        return None
     if interface_class == "06" and interface_subclass == "01" and interface_protocol == "01":
         return "PTP"
     if interface_class == "ff" and interface_subclass == "fe" and interface_protocol == "02":
@@ -785,6 +957,10 @@ def _apple_interface_alias(
         return "USBAudio2Control"
     if interface_class == "01" and interface_subclass == "02":
         return "USBAudio2Stream"
+    if interface_class == "0e" and interface_subclass == "01":
+        return "UVCControlInterface"
+    if interface_class == "0e" and interface_subclass == "02":
+        return "UVCStreamInterface"
     return None
 
 
@@ -814,6 +990,12 @@ def _interface_role(
         return "audio-control"
     if (alias or "").startswith("USBAudio2Stream") or (interface_class == "01" and interface_subclass == "02"):
         return "audio-streaming"
+    if alias == "UVCControlInterface" or (interface_class == "0e" and interface_subclass == "01"):
+        return "video-control"
+    if (alias or "").startswith("UVCStreamInterface") or (interface_class == "0e" and interface_subclass == "02"):
+        return "video-streaming"
+    if alias in ("USBDeviceTester", "AppleUSBTestInterface"):
+        return "usb-test"
     if interface_class == "03":
         return "hid"
     return None
@@ -832,7 +1014,7 @@ def _le16(data: bytes, offset: int) -> int:
     return data[offset] | (data[offset + 1] << 8)
 
 
-def parse_usb_configuration_descriptors(data: bytes) -> list[UsbConfigurationDescriptor]:
+def parse_usb_configuration_descriptors(data: bytes, apple_device: bool = True) -> list[UsbConfigurationDescriptor]:
     configurations = []
     current_configuration = None
     current_interface = None
@@ -860,7 +1042,9 @@ def parse_usb_configuration_descriptors(data: bytes) -> list[UsbConfigurationDes
             interface_class = f"{descriptor[5]:02x}"
             interface_subclass = f"{descriptor[6]:02x}"
             interface_protocol = f"{descriptor[7]:02x}"
-            alias = _apple_interface_alias(None, interface_class, interface_subclass, interface_protocol)
+            alias = _apple_interface_alias(
+                None, interface_class, interface_subclass, interface_protocol, apple_device=apple_device
+            )
             current_interface = UsbDescriptorInterface(
                 number=descriptor[2],
                 alternate_setting=descriptor[3],
@@ -887,12 +1071,12 @@ def parse_usb_configuration_descriptors(data: bytes) -> list[UsbConfigurationDes
     return configurations
 
 
-def _read_usb_configuration_descriptors(path: Path) -> list[UsbConfigurationDescriptor]:
+def _read_usb_configuration_descriptors(path: Path, apple_device: bool = True) -> list[UsbConfigurationDescriptor]:
     try:
         data = (path / "descriptors").read_bytes()
     except OSError:
         return []
-    return parse_usb_configuration_descriptors(data)
+    return parse_usb_configuration_descriptors(data, apple_device=apple_device)
 
 
 def _read_usb_interface(
@@ -900,6 +1084,7 @@ def _read_usb_interface(
     include_network_state: bool = False,
     net_sysfs_path: Union[str, Path] = LINUX_NET_SYSFS,
     include_ip_command: bool = True,
+    apple_device: bool = True,
 ) -> Optional[UsbInterface]:
     number = _parse_sysfs_int(path / "bInterfaceNumber")
     if number is None:
@@ -908,7 +1093,9 @@ def _read_usb_interface(
     interface_class = _normalize_hex(_read_sysfs_text(path / "bInterfaceClass"), 2)
     interface_subclass = _normalize_hex(_read_sysfs_text(path / "bInterfaceSubClass"), 2)
     interface_protocol = _normalize_hex(_read_sysfs_text(path / "bInterfaceProtocol"), 2)
-    alias = _apple_interface_alias(name, interface_class, interface_subclass, interface_protocol)
+    alias = _apple_interface_alias(
+        name, interface_class, interface_subclass, interface_protocol, apple_device=apple_device
+    )
     network_interfaces = _read_network_interfaces(path)
     return UsbInterface(
         sysfs_name=path.name,
@@ -937,6 +1124,8 @@ def _read_usb_device_inventory(
     include_ip_command: bool = True,
     include_configuration_descriptors: bool = False,
 ) -> UsbDeviceInventory:
+    vendor_id = _normalize_hex(_read_sysfs_text(path / "idVendor"), 4)
+    apple_device = vendor_id == APPLE_VENDOR_ID
     interfaces = []
     interface_prefix = f"{path.name}:"
     for child in _safe_iterdir(path.parent):
@@ -947,6 +1136,7 @@ def _read_usb_device_inventory(
             include_network_state=include_network_state,
             net_sysfs_path=net_sysfs_path,
             include_ip_command=include_ip_command,
+            apple_device=apple_device,
         )
         if interface is not None:
             interfaces.append(interface)
@@ -956,7 +1146,7 @@ def _read_usb_device_inventory(
 
     return UsbDeviceInventory(
         sysfs_name=path.name,
-        vendor_id=_normalize_hex(_read_sysfs_text(path / "idVendor"), 4),
+        vendor_id=vendor_id,
         product_id=_normalize_hex(_read_sysfs_text(path / "idProduct"), 4),
         manufacturer=_read_sysfs_text(path / "manufacturer"),
         product=_read_sysfs_text(path / "product"),
@@ -970,7 +1160,9 @@ def _read_usb_device_inventory(
         num_configurations=_parse_sysfs_int(path / "bNumConfigurations"),
         num_interfaces=_parse_sysfs_int(path / "bNumInterfaces"),
         interfaces=interfaces,
-        available_configurations=_read_usb_configuration_descriptors(path) if include_configuration_descriptors else [],
+        available_configurations=_read_usb_configuration_descriptors(path, apple_device=apple_device)
+        if include_configuration_descriptors
+        else [],
     )
 
 
