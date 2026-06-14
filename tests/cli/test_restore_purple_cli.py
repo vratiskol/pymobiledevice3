@@ -556,6 +556,106 @@ def test_restore_purple_proxy_dict_strict_fails_when_ping_is_not_pong(monkeypatc
     assert json.loads(result.output)["ping"]["pong"] is False
 
 
+def test_restore_purple_socks_probe_help():
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-socks-probe", "--help"])
+
+    assert result.exit_code == 0
+    assert "--timeout" in result.output
+    assert "--port" in result.output
+    assert "--connect-host" in result.output
+    assert "--connect-port" in result.output
+    assert "--include-response" in result.output
+    assert "--strict" in result.output
+
+
+def test_restore_purple_socks_probe_prints_redacted_json(monkeypatch):
+    async def fake_run_purple_proxy_socks_probe(**kwargs):
+        assert kwargs == {
+            "udid": "sensitive-udid",
+            "usbmux_address": "/tmp/usbmux",
+            "timeout": 0.5,
+            "port": 1234,
+            "connect_host": "example.test",
+            "connect_port": 443,
+            "include_response": True,
+        }
+        return {
+            "checked": True,
+            "experimental": True,
+            "protocol": "SOCKS5",
+            "port": 1234,
+            "include_response": True,
+            "reachable": True,
+            "handshake": {
+                "accepted": True,
+                "response_hex": "0500",
+            },
+            "connect": {
+                "checked": True,
+                "target_address_type": "domain",
+                "target_port": 443,
+                "succeeded": True,
+            },
+            "summary": {
+                "handshake_ok": True,
+                "connect_succeeded": True,
+                "ok": True,
+            },
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_socks_probe", fake_run_purple_proxy_socks_probe)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "restore",
+            "purple-socks-probe",
+            "--timeout",
+            "0.5",
+            "--port",
+            "1234",
+            "--connect-host",
+            "example.test",
+            "--connect-port",
+            "443",
+            "--include-response",
+            "--udid",
+            "sensitive-udid",
+            "--usbmux-address",
+            "/tmp/usbmux",
+        ],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["handshake"]["accepted"] is True
+    assert output["connect"]["target_address_type"] == "domain"
+    assert output["summary"]["ok"] is True
+    assert "sensitive-udid" not in result.output
+
+
+def test_restore_purple_socks_probe_strict_fails_when_summary_is_not_ok(monkeypatch):
+    async def fake_run_purple_proxy_socks_probe(**kwargs):
+        return {
+            "checked": True,
+            "experimental": True,
+            "protocol": "SOCKS5",
+            "reachable": False,
+            "summary": {
+                "handshake_ok": False,
+                "connect_succeeded": None,
+                "ok": False,
+            },
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_socks_probe", fake_run_purple_proxy_socks_probe)
+
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-socks-probe", "--strict"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.output)["summary"]["ok"] is False
+
+
 def test_restore_purple_restore_options_help():
     result = CliRunner().invoke(__main__.app, ["restore", "purple-restore-options", "--help"])
 

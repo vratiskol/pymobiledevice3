@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import ipaddress
 import plistlib
 from enum import Enum
 from typing import Any, Optional, Union
@@ -19,6 +20,13 @@ PURPLE_PROXY_IDENTIFIER_KEY = "Identifier"
 PURPLE_PROXY_LEVEL_KEY = "Level"
 PURPLE_PROXY_SOCKS_PROXY_HOST_KEY = "SOCKSProxyHost"
 PURPLE_PROXY_SOCKS_PROXY_PORT_KEY = "SOCKSProxyPort"
+PURPLE_PROXY_SOCKS_VERSION = 5
+PURPLE_PROXY_SOCKS_NO_AUTHENTICATION = 0
+PURPLE_PROXY_SOCKS_CONNECT_COMMAND = 1
+PURPLE_PROXY_SOCKS_RESERVED = 0
+PURPLE_PROXY_SOCKS_ATYP_IPV4 = 1
+PURPLE_PROXY_SOCKS_ATYP_DOMAIN = 3
+PURPLE_PROXY_SOCKS_ATYP_IPV6 = 4
 SENSITIVE_PURPLE_PROXY_KEYS = (
     "ecid",
     "serial",
@@ -42,6 +50,71 @@ class PurpleProxyCommand(str, Enum):
 
 def format_purple_proxy_socks_url(host: str = PURPLE_PROXY_LOOPBACK_HOST, port: int = PURPLE_PROXY_SOCKS_PORT) -> str:
     return f"socks://{host}:{port}/"
+
+
+def _validate_socks_port(port: int) -> None:
+    if not 1 <= port <= 0xFFFF:
+        raise ValueError("SOCKS port must be between 1 and 65535")
+
+
+def _socks_method_name(method: int) -> str:
+    if method == PURPLE_PROXY_SOCKS_NO_AUTHENTICATION:
+        return "no_authentication_required"
+    if method == 0xFF:
+        return "no_acceptable_methods"
+    return f"method_0x{method:02x}"
+
+
+def _socks_reply_name(reply: int) -> str:
+    return {
+        0x00: "succeeded",
+        0x01: "general_failure",
+        0x02: "connection_not_allowed",
+        0x03: "network_unreachable",
+        0x04: "host_unreachable",
+        0x05: "connection_refused",
+        0x06: "ttl_expired",
+        0x07: "command_not_supported",
+        0x08: "address_type_not_supported",
+    }.get(reply, f"reply_0x{reply:02x}")
+
+
+def _socks_address_type_name(address_type: int) -> str:
+    return {
+        PURPLE_PROXY_SOCKS_ATYP_IPV4: "ipv4",
+        PURPLE_PROXY_SOCKS_ATYP_DOMAIN: "domain",
+        PURPLE_PROXY_SOCKS_ATYP_IPV6: "ipv6",
+    }.get(address_type, f"address_type_0x{address_type:02x}")
+
+
+def _build_socks_connect_request(host: str, port: int) -> tuple[bytes, str]:
+    _validate_socks_port(port)
+    if not host:
+        raise ValueError("connect host must not be empty")
+
+    try:
+        ip_address = ipaddress.ip_address(host)
+    except ValueError:
+        address = host.encode("idna")
+        if len(address) > 255:
+            raise ValueError("connect host is too long for a SOCKS5 domain address") from None
+        address_type = PURPLE_PROXY_SOCKS_ATYP_DOMAIN
+        address_payload = bytes([len(address)]) + address
+    else:
+        address_type = PURPLE_PROXY_SOCKS_ATYP_IPV4 if ip_address.version == 4 else PURPLE_PROXY_SOCKS_ATYP_IPV6
+        address_payload = ip_address.packed
+
+    return (
+        bytes([
+            PURPLE_PROXY_SOCKS_VERSION,
+            PURPLE_PROXY_SOCKS_CONNECT_COMMAND,
+            PURPLE_PROXY_SOCKS_RESERVED,
+            address_type,
+        ])
+        + address_payload
+        + port.to_bytes(2, "big"),
+        _socks_address_type_name(address_type),
+    )
 
 
 def build_purple_proxy_dictionary(
@@ -637,6 +710,181 @@ async def run_purple_proxy_notify_command(
             with contextlib.suppress(Exception):
                 await client.close()
 
+    return result
+
+
+async def run_purple_proxy_socks_probe(
+    *,
+    udid: Optional[str] = None,
+    usbmux_address: Optional[str] = None,
+    timeout: float = 1.0,
+    port: int = PURPLE_PROXY_SOCKS_PORT,
+    connect_host: Optional[str] = None,
+    connect_port: int = 443,
+    connection_type: str = "USB",
+    include_response: bool = False,
+) -> dict[str, Any]:
+    _validate_socks_port(port)
+
+    result: dict[str, Any] = {
+        "checked": True,
+        "experimental": True,
+        "protocol": "SOCKS5",
+        "port": port,
+        "include_response": include_response,
+    }
+    client = None
+
+    try:
+        client = await asyncio.wait_for(
+            PurpleProxyClient.connect_socks(
+                udid,
+                connection_type=connection_type,
+                usbmux_address=usbmux_address,
+                port=port,
+            ),
+            timeout=timeout,
+        )
+    except Exception as e:
+        result.update({
+            "reachable": False,
+            "error_type": e.__class__.__name__,
+            "summary": {
+                "handshake_ok": False,
+                "connect_succeeded": None,
+                "ok": False,
+            },
+        })
+        return result
+
+    try:
+        greeting = bytes([
+            PURPLE_PROXY_SOCKS_VERSION,
+            1,
+            PURPLE_PROXY_SOCKS_NO_AUTHENTICATION,
+        ])
+        await asyncio.wait_for(client.service.sendall(greeting), timeout=timeout)
+        method_response = await asyncio.wait_for(client.service.recvall(2), timeout=timeout)
+        version, method = method_response
+        handshake_ok = version == PURPLE_PROXY_SOCKS_VERSION and method == PURPLE_PROXY_SOCKS_NO_AUTHENTICATION
+        result.update({
+            "reachable": True,
+            "handshake": {
+                "sent": True,
+                "version": version,
+                "method": method,
+                "method_name": _socks_method_name(method),
+                "accepted": handshake_ok,
+            },
+        })
+        if include_response:
+            result["handshake"]["response_hex"] = method_response.hex()
+    except Exception as e:
+        result.update({
+            "reachable": True,
+            "handshake": {
+                "sent": True,
+                "accepted": False,
+                "error_type": e.__class__.__name__,
+            },
+            "summary": {
+                "handshake_ok": False,
+                "connect_succeeded": None,
+                "ok": False,
+            },
+        })
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.close()
+        return result
+    finally:
+        if client is not None and connect_host is None:
+            with contextlib.suppress(Exception):
+                await client.close()
+
+    if connect_host is None:
+        result["connect"] = _purple_proxy_skipped_phase("--connect-host was not provided.")
+        result["summary"] = {
+            "handshake_ok": handshake_ok,
+            "connect_succeeded": None,
+            "ok": handshake_ok,
+        }
+        return result
+
+    try:
+        connect_request, target_address_type = _build_socks_connect_request(connect_host, connect_port)
+        connect_phase: dict[str, Any] = {
+            "checked": True,
+            "target_address_type": target_address_type,
+            "target_port": connect_port,
+        }
+        if not handshake_ok:
+            connect_phase.update({
+                "sent": False,
+                "reason": "SOCKS5 greeting was not accepted.",
+            })
+            result["connect"] = connect_phase
+            result["summary"] = {
+                "handshake_ok": False,
+                "connect_succeeded": False,
+                "ok": False,
+            }
+        else:
+            await asyncio.wait_for(client.service.sendall(connect_request), timeout=timeout)
+            response_header = await asyncio.wait_for(client.service.recvall(4), timeout=timeout)
+            response_version, reply, reserved, address_type = response_header
+            if address_type == PURPLE_PROXY_SOCKS_ATYP_IPV4:
+                bound_address = await asyncio.wait_for(client.service.recvall(4), timeout=timeout)
+            elif address_type == PURPLE_PROXY_SOCKS_ATYP_IPV6:
+                bound_address = await asyncio.wait_for(client.service.recvall(16), timeout=timeout)
+            elif address_type == PURPLE_PROXY_SOCKS_ATYP_DOMAIN:
+                bound_domain_size = await asyncio.wait_for(client.service.recvall(1), timeout=timeout)
+                bound_address = bound_domain_size + await asyncio.wait_for(
+                    client.service.recvall(bound_domain_size[0]),
+                    timeout=timeout,
+                )
+            else:
+                raise ValueError(f"unsupported SOCKS5 bind address type: {address_type}")
+            bound_port = int.from_bytes(await asyncio.wait_for(client.service.recvall(2), timeout=timeout), "big")
+            connect_succeeded = response_version == PURPLE_PROXY_SOCKS_VERSION and reply == 0
+            connect_phase.update({
+                "sent": True,
+                "version": response_version,
+                "reply": reply,
+                "reply_name": _socks_reply_name(reply),
+                "reserved": reserved,
+                "bound_address_type": _socks_address_type_name(address_type),
+                "bound_address_length": len(bound_address),
+                "bound_port": bound_port,
+                "succeeded": connect_succeeded,
+            })
+            if include_response:
+                connect_phase["response_hex"] = (
+                    response_header.hex() + bound_address.hex() + bound_port.to_bytes(2, "big").hex()
+                )
+            result["connect"] = connect_phase
+            result["summary"] = {
+                "handshake_ok": handshake_ok,
+                "connect_succeeded": connect_succeeded,
+                "ok": handshake_ok and connect_succeeded,
+            }
+    except Exception as e:
+        result["connect"] = {
+            "checked": True,
+            "target_port": connect_port,
+            "sent": False,
+            "error_type": e.__class__.__name__,
+        }
+        result["summary"] = {
+            "handshake_ok": handshake_ok,
+            "connect_succeeded": False,
+            "ok": False,
+        }
+        return result
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.close()
     return result
 
 

@@ -16,6 +16,7 @@ from pymobiledevice3.restore.purple_proxy import (
     run_purple_proxy_control_command,
     run_purple_proxy_notify_command,
     run_purple_proxy_session,
+    run_purple_proxy_socks_probe,
     sanitize_purple_proxy_response,
 )
 
@@ -34,6 +35,14 @@ class FakeService:
         assert endianity == ">"
         assert fmt == plistlib.FMT_XML
         self.sent.append(message)
+
+    async def recvall(self, size):
+        response = self.responses.pop(0)
+        assert len(response) == size
+        return response
+
+    async def sendall(self, payload):
+        self.sent.append(payload)
 
     async def close(self):
         self.closed = True
@@ -515,6 +524,130 @@ async def test_run_purple_proxy_notify_command_reports_connect_error(monkeypatch
         "expect_response": False,
         "reachable": False,
         "error_type": "OSError",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_purple_proxy_socks_probe_accepts_no_auth_handshake(monkeypatch):
+    service = FakeService(responses=[b"\x05\x00"])
+    calls = []
+
+    async def fake_connect_socks(udid=None, **kwargs):
+        calls.append({"udid": udid, **kwargs})
+        return PurpleProxyClient(service)
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_socks", staticmethod(fake_connect_socks))
+
+    result = await run_purple_proxy_socks_probe(
+        udid="sensitive-udid",
+        usbmux_address="/tmp/usbmux",
+        timeout=0.1,
+        include_response=True,
+    )
+
+    assert result == {
+        "checked": True,
+        "experimental": True,
+        "protocol": "SOCKS5",
+        "port": PURPLE_PROXY_SOCKS_PORT,
+        "include_response": True,
+        "reachable": True,
+        "handshake": {
+            "sent": True,
+            "version": 5,
+            "method": 0,
+            "method_name": "no_authentication_required",
+            "accepted": True,
+            "response_hex": "0500",
+        },
+        "connect": {
+            "checked": False,
+            "reason": "--connect-host was not provided.",
+        },
+        "summary": {
+            "handshake_ok": True,
+            "connect_succeeded": None,
+            "ok": True,
+        },
+    }
+    assert service.sent == [b"\x05\x01\x00"]
+    assert service.closed is True
+    assert calls == [
+        {
+            "udid": "sensitive-udid",
+            "connection_type": "USB",
+            "usbmux_address": "/tmp/usbmux",
+            "port": PURPLE_PROXY_SOCKS_PORT,
+        }
+    ]
+    assert "sensitive" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_run_purple_proxy_socks_probe_sends_connect_request(monkeypatch):
+    service = FakeService(responses=[b"\x05\x00", b"\x05\x00\x00\x01", b"\x00\x00\x00\x00", b"\x04\xd2"])
+
+    async def fake_connect_socks(udid=None, **kwargs):
+        return PurpleProxyClient(service)
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_socks", staticmethod(fake_connect_socks))
+
+    result = await run_purple_proxy_socks_probe(
+        timeout=0.1,
+        connect_host="example.test",
+        connect_port=443,
+        include_response=True,
+    )
+
+    assert result["connect"] == {
+        "checked": True,
+        "target_address_type": "domain",
+        "target_port": 443,
+        "sent": True,
+        "version": 5,
+        "reply": 0,
+        "reply_name": "succeeded",
+        "reserved": 0,
+        "bound_address_type": "ipv4",
+        "bound_address_length": 4,
+        "bound_port": 1234,
+        "succeeded": True,
+        "response_hex": "050000010000000004d2",
+    }
+    assert result["summary"] == {
+        "handshake_ok": True,
+        "connect_succeeded": True,
+        "ok": True,
+    }
+    assert service.sent == [
+        b"\x05\x01\x00",
+        b"\x05\x01\x00\x03\x0cexample.test\x01\xbb",
+    ]
+    assert service.closed is True
+
+
+@pytest.mark.asyncio
+async def test_run_purple_proxy_socks_probe_reports_connect_error(monkeypatch):
+    async def fake_connect_socks(udid=None, **kwargs):
+        raise OSError("closed")
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_socks", staticmethod(fake_connect_socks))
+
+    result = await run_purple_proxy_socks_probe(timeout=0.1)
+
+    assert result == {
+        "checked": True,
+        "experimental": True,
+        "protocol": "SOCKS5",
+        "port": PURPLE_PROXY_SOCKS_PORT,
+        "include_response": False,
+        "reachable": False,
+        "error_type": "OSError",
+        "summary": {
+            "handshake_ok": False,
+            "connect_succeeded": None,
+            "ok": False,
+        },
     }
 
 

@@ -51,6 +51,7 @@ from pymobiledevice3.restore.purple_proxy import (
     run_purple_proxy_control_command,
     run_purple_proxy_notify_command,
     run_purple_proxy_session,
+    run_purple_proxy_socks_probe,
 )
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore import Restore
@@ -703,6 +704,65 @@ async def restore_purple_proxy_dict(
         )
     print_json(result, colored=False)
     if strict and ping and (not result["ping"]["reachable"] or not result["ping"].get("pong")):
+        raise typer.Exit(1)
+
+
+@cli.command("purple-socks-probe")
+@async_command
+async def restore_purple_socks_probe(
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", min=0.1, help="Timeout for connecting and waiting for SOCKS replies."),
+    ] = 1.0,
+    port: Annotated[
+        int,
+        typer.Option("--port", min=1, max=0xFFFF, help="Device-side PurpleReverseProxy SOCKS port."),
+    ] = PURPLE_PROXY_SOCKS_PORT,
+    connect_host: Annotated[
+        Optional[str],
+        typer.Option(
+            "--connect-host",
+            help="Optionally send a SOCKS5 CONNECT request; the host value is not printed in JSON output.",
+        ),
+    ] = None,
+    connect_port: Annotated[
+        int,
+        typer.Option("--connect-port", min=1, max=0xFFFF, help="Port for the optional SOCKS5 CONNECT request."),
+    ] = 443,
+    include_response: Annotated[
+        bool,
+        typer.Option("--include-response", help="Include raw SOCKS response bytes as hex in JSON output."),
+    ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Exit non-zero when the SOCKS probe summary is not ok."),
+    ] = False,
+    udid: Annotated[
+        Optional[str],
+        typer.Option("--udid", "--serial", help="Target device serial/UDID; never printed in command output."),
+    ] = None,
+    usbmux_address: Annotated[
+        Optional[str],
+        typer.Option("--usbmux-address", help="Address of the usbmuxd daemon (unix socket path or HOST:PORT)."),
+    ] = None,
+) -> None:
+    """
+    Probe the PurpleReverseProxy SOCKS data plane without restoring a device.
+    """
+    try:
+        result = await run_purple_proxy_socks_probe(
+            udid=udid,
+            usbmux_address=usbmux_address,
+            timeout=timeout,
+            port=port,
+            connect_host=connect_host,
+            connect_port=connect_port,
+            include_response=include_response,
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from None
+    print_json(result, colored=False)
+    if strict and not result["summary"]["ok"]:
         raise typer.Exit(1)
 
 
