@@ -11,6 +11,7 @@ from pymobiledevice3.restore.purple_proxy import (
     PurpleProxyClient,
     PurpleProxyCommand,
     build_purple_proxy_dictionary,
+    classify_purple_proxy_notify_message,
     is_purple_proxy_pong_response,
     probe_purple_proxy_hello,
     run_purple_proxy_control_command,
@@ -18,6 +19,7 @@ from pymobiledevice3.restore.purple_proxy import (
     run_purple_proxy_session,
     run_purple_proxy_socks_probe,
     sanitize_purple_proxy_response,
+    summarize_purple_proxy_notify_messages,
 )
 
 
@@ -234,6 +236,39 @@ def test_sanitize_purple_proxy_response_redacts_identifier_keys():
         "SerialNumber": "<redacted>",
         "Nested": {"UniqueChipID": "<redacted>"},
         "Items": [{"UDID": "<redacted>"}],
+    }
+
+
+def test_classify_purple_proxy_notify_message_recognizes_known_shapes():
+    assert classify_purple_proxy_notify_message({"Event": "ProxyOnline"}) == "proxy_online"
+    assert classify_purple_proxy_notify_message({"Name": "com.apple.PurpleReverseProxy.ProxyOnline"}) == "proxy_online"
+    assert classify_purple_proxy_notify_message({"Error": "connection failed"}) == "error"
+    assert classify_purple_proxy_notify_message({"Level": 7, "Message": "verbose"}) == "log"
+    assert classify_purple_proxy_notify_message({"Status": "Ready"}) == "status"
+    assert classify_purple_proxy_notify_message({"Message": "opaque"}) == "unknown"
+
+
+def test_summarize_purple_proxy_notify_messages_counts_classifications():
+    summary = summarize_purple_proxy_notify_messages([
+        {"Event": "ProxyOnline"},
+        {"Error": "connection failed"},
+        {"Level": 7},
+        {"Message": "opaque"},
+    ])
+
+    assert summary == {
+        "classified": True,
+        "message_count": 4,
+        "observed_events": ["error", "log", "proxy_online", "unknown"],
+        "event_counts": {
+            "error": 1,
+            "log": 1,
+            "proxy_online": 1,
+            "unknown": 1,
+        },
+        "proxy_online": True,
+        "error_count": 1,
+        "unknown_count": 1,
     }
 
 
@@ -455,6 +490,15 @@ async def test_run_purple_proxy_notify_command_register_collects_sanitized_messa
         "sent": True,
         "message_count": 1,
         "message_keys": [["Event", "SerialNumber"]],
+        "notify_summary": {
+            "classified": True,
+            "message_count": 1,
+            "observed_events": ["proxy_online"],
+            "event_counts": {"proxy_online": 1},
+            "proxy_online": True,
+            "error_count": 0,
+            "unknown_count": 0,
+        },
         "messages": [{"Event": "ProxyOnline", "SerialNumber": "<redacted>"}],
     }
     assert fake_client.sent == [{"Command": "RegisterNotify"}]
@@ -694,6 +738,15 @@ async def test_run_purple_proxy_session_keeps_notify_open_during_control_sequenc
         "ok": True,
     }
     assert phases["set_log_level"]["sent"] is True
+    assert phases["register_notify"]["notify_summary"] == {
+        "classified": True,
+        "message_count": 1,
+        "observed_events": ["proxy_online"],
+        "event_counts": {"proxy_online": 1},
+        "proxy_online": True,
+        "error_count": 0,
+        "unknown_count": 0,
+    }
     assert phases["register_notify"]["messages"] == [{"Event": "ProxyOnline", "SerialNumber": "<redacted>"}]
     assert phases["begin_control"]["response"] == {"Command": "Pong", "SerialNumber": "<redacted>"}
     assert phases["ping"]["pong"] is True

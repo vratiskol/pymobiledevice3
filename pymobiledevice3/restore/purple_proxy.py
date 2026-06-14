@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import ipaddress
 import plistlib
+from collections import Counter
 from enum import Enum
 from typing import Any, Optional, Union
 
@@ -158,6 +159,40 @@ def sanitize_purple_proxy_response(value: Any) -> Any:
     return value
 
 
+def _contains_text(value: Any, needles: tuple[str, ...]) -> bool:
+    if isinstance(value, dict):
+        return any(_contains_text(key, needles) or _contains_text(item, needles) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_contains_text(item, needles) for item in value)
+    text = str(value).lower()
+    return any(needle in text for needle in needles)
+
+
+def classify_purple_proxy_notify_message(message: dict[str, Any]) -> str:
+    if _contains_text(message, ("proxyonline", "proxy online", "purplereverseproxy.proxyonline")):
+        return "proxy_online"
+    if _contains_text(message, ("error", "fault", "failed", "failure")):
+        return "error"
+    if _contains_text(message, ("log", "level")):
+        return "log"
+    if _contains_text(message, ("status", "state")):
+        return "status"
+    return "unknown"
+
+
+def summarize_purple_proxy_notify_messages(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    event_counts = Counter(classify_purple_proxy_notify_message(message) for message in messages)
+    return {
+        "classified": True,
+        "message_count": len(messages),
+        "observed_events": sorted(event for event, count in event_counts.items() if count),
+        "event_counts": dict(sorted(event_counts.items())),
+        "proxy_online": event_counts["proxy_online"] > 0,
+        "error_count": event_counts["error"],
+        "unknown_count": event_counts["unknown"],
+    }
+
+
 def _purple_proxy_skipped_phase(reason: str) -> dict[str, Any]:
     return {
         "checked": False,
@@ -310,6 +345,7 @@ def _add_notify_messages_to_phase(
     sanitized_messages = [sanitize_purple_proxy_response(message) for message in messages]
     phase["message_count"] = len(sanitized_messages)
     phase["message_keys"] = [sorted(str(key) for key in message) for message in sanitized_messages]
+    phase["notify_summary"] = summarize_purple_proxy_notify_messages(sanitized_messages)
     if include_response:
         phase["messages"] = sanitized_messages
     return phase
@@ -691,11 +727,7 @@ async def run_purple_proxy_notify_command(
                 listen_timeout=listen_timeout,
                 max_messages=max_messages,
             )
-            sanitized_messages = [sanitize_purple_proxy_response(message) for message in messages]
-            result["message_count"] = len(sanitized_messages)
-            result["message_keys"] = [sorted(str(key) for key in message) for message in sanitized_messages]
-            if include_response:
-                result["messages"] = sanitized_messages
+            _add_notify_messages_to_phase(result, messages, include_response=include_response)
     except asyncio.TimeoutError as e:
         if result.get("sent"):
             result.update({
