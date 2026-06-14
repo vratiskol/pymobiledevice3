@@ -1,16 +1,70 @@
 import asyncio
 import contextlib
+import re
 import time
 from collections.abc import Iterable
 from typing import Any, Optional
 
 from pymobiledevice3 import usbmux
 from pymobiledevice3.lockdown import DEFAULT_LABEL
+from pymobiledevice3.restore.consts import PROGRESS_BAR_OPERATIONS
+from pymobiledevice3.restore.restore_options import SUPPORTED_DATA_TYPES, SUPPORTED_MESSAGE_TYPES
 from pymobiledevice3.restore.restored_client import RestoredClient
 from pymobiledevice3.service_connection import ServiceConnection
 from pymobiledevice3.usbmux import MuxDevice
 
 DEFAULT_RESTORE_PROTOCOL_QUERY_KEYS = ("HardwareInfo", "SavedDebugInfo")
+KNOWN_RESTORE_STATUS_ERRORS = {
+    0xFFFFFFFFFFFFFFFF: "verification error",
+    6: "disk failure",
+    14: "fail",
+    27: "failed to mount filesystems",
+    50: "failed to load SEP firmware",
+    51: "failed to load SEP firmware",
+    53: "failed to recover FDR data",
+    1015: "X-Gold Baseband Update Failed. Defective Unit?",
+}
+PYMOBILEDEVICE3_RESTORE_MESSAGE_HANDLERS = frozenset({
+    "AsyncDataRequestMsg",
+    "AsyncWait",
+    "BasebandUpdaterOutputData",
+    "BBUpdateStatusMsg",
+    "CheckpointMsg",
+    "DataRequestMsg",
+    "PreviousRestoreLogMsg",
+    "ProgressMsg",
+    "RestoreAttestation",
+    "RestoredCrash",
+    "StatusMsg",
+})
+PYMOBILEDEVICE3_DATA_REQUEST_HANDLERS = frozenset({
+    "BasebandData",
+    "BasebandUpdaterOutputData",
+    "BootabilityBundle",
+    "BuildIdentityDict",
+    "DeviceTree",
+    "EANData",
+    "FDRTrustData",
+    "FirmwareUpdaterData",
+    "FirmwareUpdaterPreflight",
+    "FUDData",
+    "HostSystemTime",
+    "KernelCache",
+    "NORData",
+    "PersonalizedBootObjectV3",
+    "PersonalizedData",
+    "ReceiptManifest",
+    "RecoveryOSASRImage",
+    "RecoveryOSLocalPolicy",
+    "RecoveryOSRootTicketData",
+    "RootTicket",
+    "SourceBootObjectV4",
+    "StreamedImageDecryptionKey",
+    "SystemImageCanonicalMetadata",
+    "SystemImageData",
+    "SystemImageRootHash",
+    "URLAsset",
+})
 SENSITIVE_RESTORE_PROTOCOL_KEYS = (
     "apnonce",
     "chipid",
@@ -23,11 +77,23 @@ SENSITIVE_RESTORE_PROTOCOL_KEYS = (
     "uniquechipid",
     "udid",
 )
+_UDID_RE = re.compile(r"\b(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{16}|[0-9a-fA-F]{40})\b")
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_SENSITIVE_STRING_PAIR_RE = re.compile(
+    r"\b(udid|serial(?:number)?|ecid|uniquechipid|apnonce|sepnonce)\b(\s*[:=]\s*)([^\s,;]+)",
+    re.IGNORECASE,
+)
 
 
 def _is_sensitive_key(key: str) -> bool:
     normalized = key.lower()
     return any(sensitive in normalized for sensitive in SENSITIVE_RESTORE_PROTOCOL_KEYS)
+
+
+def _redact_sensitive_string(value: str) -> str:
+    value = _UDID_RE.sub("<redacted>", value)
+    value = _IPV4_RE.sub("<redacted>", value)
+    return _SENSITIVE_STRING_PAIR_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", value)
 
 
 def sanitize_restore_protocol_value(value: Any, *, include_identifiers: bool = False) -> Any:
@@ -48,7 +114,190 @@ def sanitize_restore_protocol_value(value: Any, *, include_identifiers: bool = F
     if isinstance(value, tuple):
         return [sanitize_restore_protocol_value(item, include_identifiers=include_identifiers) for item in value]
 
+    if isinstance(value, bytes):
+        return f"<bytes:{len(value)}>"
+
+    if isinstance(value, str):
+        return _redact_sensitive_string(value)
+
     return value
+
+
+def _restore_message_type(message: dict[str, Any]) -> str:
+    return str(message.get("MsgType") or "Unknown")
+
+
+def _progress_operation_name(operation: Any) -> Any:
+    if isinstance(operation, int):
+        return PROGRESS_BAR_OPERATIONS.get(operation, operation)
+    return operation
+
+
+def _summary_text_for_restore_message(msg_type: str, fields: dict[str, Any], severity: str) -> str:
+    if msg_type in ("DataRequestMsg", "AsyncDataRequestMsg"):
+        data_type = fields.get("data_type") or "unknown"
+        return f"{msg_type} requested {data_type}"
+    if msg_type == "ProgressMsg":
+        operation = fields.get("operation") or "unknown"
+        progress = fields.get("progress")
+        return f"{operation} {progress}%" if progress is not None else str(operation)
+    if msg_type == "StatusMsg":
+        status = fields.get("status")
+        if status == 0:
+            return "restore completed successfully"
+        error = fields.get("error")
+        return f"restore status {status}: {error}" if error else f"restore status {status}"
+    if msg_type == "PreviousRestoreLogMsg":
+        return "previous restore log available"
+    if msg_type == "RestoredCrash":
+        return "restored crash backtrace available"
+    if msg_type == "RestoreAttestation":
+        return "restore attestation request"
+    if msg_type == "BBUpdateStatusMsg":
+        return "baseband update accepted" if fields.get("accepted") is True else "baseband update failed"
+    if msg_type == "CheckpointMsg":
+        checkpoint = fields.get("checkpoint")
+        return f"checkpoint {checkpoint}" if checkpoint is not None else "restore checkpoint"
+    if severity == "warning":
+        return f"unhandled restore message {msg_type}"
+    return msg_type
+
+
+def summarize_restore_message(
+    message: dict[str, Any],
+    *,
+    include_raw: bool = False,
+    include_identifiers: bool = False,
+) -> dict[str, Any]:
+    msg_type = _restore_message_type(message)
+    fields: dict[str, Any] = {}
+    severity = "info"
+
+    if msg_type in ("DataRequestMsg", "AsyncDataRequestMsg"):
+        data_type = message.get("DataType")
+        fields = {
+            "data_type": data_type,
+            "data_port": message.get("DataPort"),
+            "supported_by_restore_options": SUPPORTED_DATA_TYPES.get(data_type) if isinstance(data_type, str) else None,
+            "implemented_by_pymobiledevice3": data_type in PYMOBILEDEVICE3_DATA_REQUEST_HANDLERS,
+        }
+        severity = "request"
+        if isinstance(data_type, str) and data_type not in PYMOBILEDEVICE3_DATA_REQUEST_HANDLERS:
+            severity = "warning"
+    elif msg_type == "ProgressMsg":
+        operation = message.get("Operation")
+        fields = {
+            "operation_raw": operation,
+            "operation": _progress_operation_name(operation),
+            "progress": message.get("Progress"),
+        }
+        severity = "progress"
+    elif msg_type == "StatusMsg":
+        status = message.get("Status")
+        fields = {
+            "status": status,
+            "error": KNOWN_RESTORE_STATUS_ERRORS.get(status) if isinstance(status, int) else None,
+            "log_available": bool(message.get("Log")),
+        }
+        severity = "success" if status == 0 else "error"
+        if message.get("Log") is not None:
+            fields["log"] = sanitize_restore_protocol_value(message["Log"], include_identifiers=include_identifiers)
+    elif msg_type == "PreviousRestoreLogMsg":
+        log = message.get("PreviousRestoreLog")
+        fields = {
+            "log_available": log is not None,
+            "log_size": len(log) if isinstance(log, (str, bytes)) else None,
+        }
+        if log is not None:
+            fields["log"] = sanitize_restore_protocol_value(log, include_identifiers=include_identifiers)
+        severity = "warning"
+    elif msg_type == "RestoredCrash":
+        backtrace = message.get("RestoredBacktrace") or []
+        fields = {
+            "backtrace_frames": len(backtrace) if isinstance(backtrace, list) else None,
+            "backtrace": sanitize_restore_protocol_value(backtrace, include_identifiers=include_identifiers),
+        }
+        severity = "error"
+    elif msg_type == "RestoreAttestation":
+        fields = {
+            "handled_by_pymobiledevice3": True,
+            "response": {"RestoreShouldAttest": False},
+        }
+        severity = "request"
+    elif msg_type == "BBUpdateStatusMsg":
+        fields = {"accepted": message.get("Accepted")}
+        severity = "info" if message.get("Accepted") else "error"
+    elif msg_type == "CheckpointMsg":
+        fields = {
+            "checkpoint": message.get("Checkpoint") or message.get("CheckpointID"),
+            "operation": message.get("Operation"),
+        }
+    elif msg_type == "AsyncWait":
+        fields = {"async_context": message.get("AsyncContext")}
+    elif msg_type == "BasebandUpdaterOutputData":
+        fields = {"data_port": message.get("DataPort")}
+        severity = "request"
+    elif msg_type not in PYMOBILEDEVICE3_RESTORE_MESSAGE_HANDLERS:
+        severity = "warning"
+
+    summary = {
+        "msg_type": msg_type,
+        "known_to_restore_options": msg_type in SUPPORTED_MESSAGE_TYPES,
+        "supported_by_restore_options": SUPPORTED_MESSAGE_TYPES.get(msg_type),
+        "implemented_by_pymobiledevice3": msg_type in PYMOBILEDEVICE3_RESTORE_MESSAGE_HANDLERS,
+        "severity": severity,
+        "summary": _summary_text_for_restore_message(msg_type, fields, severity),
+        "fields": fields,
+    }
+    if include_raw:
+        summary["raw"] = sanitize_restore_protocol_value(message, include_identifiers=include_identifiers)
+    return summary
+
+
+def build_restore_message_report(
+    messages: Iterable[dict[str, Any]],
+    *,
+    include_raw: bool = False,
+    include_identifiers: bool = False,
+) -> dict[str, Any]:
+    summarized = [
+        summarize_restore_message(message, include_raw=include_raw, include_identifiers=include_identifiers)
+        for message in messages
+    ]
+    failures = [message for message in summarized if message["severity"] == "error"]
+    warnings = [message for message in summarized if message["severity"] == "warning"]
+    data_requests = [
+        message for message in summarized if message["msg_type"] in ("DataRequestMsg", "AsyncDataRequestMsg")
+    ]
+    progress = [message for message in summarized if message["msg_type"] == "ProgressMsg"]
+    final_statuses = [message for message in summarized if message["msg_type"] == "StatusMsg"]
+    unimplemented = [
+        message
+        for message in summarized
+        if not message["implemented_by_pymobiledevice3"]
+        or (
+            message["msg_type"] in ("DataRequestMsg", "AsyncDataRequestMsg")
+            and not message["fields"].get("implemented_by_pymobiledevice3")
+        )
+    ]
+
+    return {
+        "summary": {
+            "total": len(summarized),
+            "failures": len(failures),
+            "warnings": len(warnings),
+            "data_requests": len(data_requests),
+            "progress_updates": len(progress),
+            "unimplemented": len(unimplemented),
+            "completed": any(message["fields"].get("status") == 0 for message in final_statuses),
+            "last_progress": progress[-1]["fields"] if progress else None,
+            "final_status": final_statuses[-1]["fields"] if final_statuses else None,
+        },
+        "failures": failures,
+        "warnings": warnings,
+        "unimplemented": unimplemented,
+        "messages": summarized,
+    }
 
 
 def _mode_from_query_type(query_type: Any) -> str:
