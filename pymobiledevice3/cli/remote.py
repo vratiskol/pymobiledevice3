@@ -32,6 +32,7 @@ from pymobiledevice3.remote.module_imports import MAX_IDLE_TIMEOUT, start_tunnel
 from pymobiledevice3.remote.remote_service_discovery import RSD_PORT
 from pymobiledevice3.remote.tunnel_service import (
     RemotePairingManualPairingService,
+    RemotePairingTunnelService,
     get_core_device_tunnel_services,
     get_remote_pairing_tunnel_services,
     verify_remote_pairing_endpoint,
@@ -44,6 +45,19 @@ from pymobiledevice3.utils import run_in_loop
 logger = logging.getLogger(__name__)
 
 TUNNEL_SERVICE_DISCOVERY_ATTEMPTS = 3
+REMOTE_PAIRING_SAFE_MANAGEMENT_COMMANDS = {
+    "query-usb-trust-state": "queryUSBConnectedHostTrustState",
+    "list-paired-host-records": "listPairedHostRecord",
+    "query-audit-history": "queryAuditHistory",
+    "browse-pairable-hosts": "browseForPairableHost",
+}
+REMOTE_PAIRING_WRITE_MANAGEMENT_COMMANDS = {
+    "start-audit-activity": "startAuditActivity",
+}
+REMOTE_PAIRING_MANAGEMENT_COMMANDS = {
+    **REMOTE_PAIRING_SAFE_MANAGEMENT_COMMANDS,
+    **REMOTE_PAIRING_WRITE_MANAGEMENT_COMMANDS,
+}
 
 
 async def browse_rsd(timeout: float = DEFAULT_BONJOUR_TIMEOUT) -> list[dict]:
@@ -76,6 +90,88 @@ async def cli_browse(timeout: float = DEFAULT_BONJOUR_TIMEOUT) -> None:
         "usb": await browse_rsd(timeout),
         "wifi": await browse_remotepairing(timeout),
     })
+
+
+def _remote_pairing_management_command_names(
+    commands: Optional[list[str]], include_write_commands: bool
+) -> dict[str, str]:
+    available_commands = (
+        REMOTE_PAIRING_MANAGEMENT_COMMANDS if include_write_commands else REMOTE_PAIRING_SAFE_MANAGEMENT_COMMANDS
+    )
+    if not commands:
+        return available_commands
+
+    selected_commands = {}
+    invalid_commands = []
+    for command in commands:
+        command_key = command.strip()
+        command_name = available_commands.get(command_key)
+        if command_name is None:
+            invalid_commands.append(command)
+        else:
+            selected_commands[command_key] = command_name
+
+    if invalid_commands:
+        valid = ", ".join(sorted(available_commands))
+        raise typer.BadParameter(f"unsupported RemotePairing management command(s): {invalid_commands}. Valid: {valid}")
+    return selected_commands
+
+
+async def _remote_pairing_management_services(
+    udid: Optional[str],
+    host: Optional[str],
+    port: Optional[int],
+    timeout: float,
+) -> list[RemotePairingTunnelService]:
+    if host is not None or port is not None:
+        if host is None or port is None or udid is None:
+            raise typer.BadParameter("--host, --port, and --udid must be provided together")
+        service = RemotePairingTunnelService(udid, host, port)
+        try:
+            await service.connect(autopair=False)
+        except Exception:
+            await service.close()
+            raise
+        return [service]
+    return await get_remote_pairing_tunnel_services(bonjour_timeout=timeout, udid=udid)
+
+
+async def collect_remote_pairing_management_diagnostics(
+    udid: Optional[str] = None,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    timeout: float = 3.0,
+    commands: Optional[list[str]] = None,
+    include_write_commands: bool = False,
+) -> list[dict]:
+    command_names = _remote_pairing_management_command_names(commands, include_write_commands)
+    services = await _remote_pairing_management_services(udid, host, port, timeout)
+    diagnostics = []
+    for service in services:
+        service_result = {
+            "identifier": service.remote_identifier,
+            "address": service.hostname,
+            "port": service.port,
+            "peer_info": (service.handshake_info or {}).get("peerDeviceInfo"),
+            "commands": {},
+        }
+        try:
+            for command_key, command_name in command_names.items():
+                try:
+                    service_result["commands"][command_key] = {
+                        "command": command_name,
+                        "response": await service.send_remote_pairing_management_request(command_name),
+                    }
+                except Exception as e:
+                    service_result["commands"][command_key] = {
+                        "command": command_name,
+                        "error_type": e.__class__.__name__,
+                        "error": str(e),
+                    }
+        finally:
+            await service.close()
+        diagnostics.append(service_result)
+    return diagnostics
 
 
 cli = InjectingTyper(
@@ -149,6 +245,51 @@ async def browse(
 def rsd_info(service_provider: RSDServiceProviderDep) -> None:
     """show info extracted from RSD peer"""
     print_json(service_provider.peer_info)
+
+
+@cli.command("pairing-management")
+@async_command
+async def cli_pairing_management(
+    udid: Annotated[
+        Optional[str],
+        typer.Option("--udid", help="RemotePairing device identifier to target."),
+    ] = None,
+    host: Annotated[
+        Optional[str],
+        typer.Option(help="RemotePairing host address. Requires --port and --udid."),
+    ] = None,
+    port: Annotated[
+        Optional[int],
+        typer.Option(help="RemotePairing TCP port. Requires --host and --udid."),
+    ] = None,
+    timeout: Annotated[
+        float,
+        typer.Option(help="Bonjour discovery timeout when host/port are omitted."),
+    ] = 3.0,
+    command: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--command",
+            "-c",
+            help="Management command to run. Repeatable. Defaults to all safe read-only commands.",
+        ),
+    ] = None,
+    include_write_commands: Annotated[
+        bool,
+        typer.Option(help="Allow write-like experimental management commands such as start-audit-activity."),
+    ] = False,
+) -> None:
+    """Run experimental RemotePairingDevice management diagnostics."""
+    print_json(
+        await collect_remote_pairing_management_diagnostics(
+            udid=udid,
+            host=host,
+            port=port,
+            timeout=timeout,
+            commands=command,
+            include_write_commands=include_write_commands,
+        )
+    )
 
 
 async def tunnel_task(

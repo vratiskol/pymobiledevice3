@@ -471,6 +471,10 @@ class RemotePairingProtocol(StartTcpTunnel):
         response = await self._send_receive_encrypted_request(request)
         return response["createListener"]
 
+    async def send_remote_pairing_management_request(self, command: str, payload: Optional[dict] = None) -> dict:
+        response = await self._send_receive_encrypted_request({"request": {"_0": {command: payload or {}}}})
+        return response.get(command, response)
+
     @asynccontextmanager
     async def start_quic_tunnel(
         self,

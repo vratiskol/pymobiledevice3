@@ -64,3 +64,72 @@ def test_remote_delete_pair_dry_run(tmp_path):
     payload = json.loads(result.output)
     assert payload["deleted"] is False
     assert payload["exists"] is True
+
+
+def test_remote_pairing_management_command_prints_json(monkeypatch):
+    from pymobiledevice3.cli import remote as remote_cli
+
+    captured = {}
+
+    async def fake_collect_remote_pairing_management_diagnostics(**kwargs):
+        captured.update(kwargs)
+        return [
+            {
+                "identifier": "device-1",
+                "address": "192.0.2.10",
+                "port": 12345,
+                "commands": {
+                    "query-usb-trust-state": {
+                        "command": "queryUSBConnectedHostTrustState",
+                        "response": {"trusted": True},
+                    }
+                },
+            }
+        ]
+
+    monkeypatch.setattr(
+        remote_cli,
+        "collect_remote_pairing_management_diagnostics",
+        fake_collect_remote_pairing_management_diagnostics,
+    )
+
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "--no-color",
+            "remote",
+            "pairing-management",
+            "--udid",
+            "device-1",
+            "--host",
+            "192.0.2.10",
+            "--port",
+            "12345",
+            "--timeout",
+            "0.5",
+            "--command",
+            "query-usb-trust-state",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload[0]["commands"]["query-usb-trust-state"]["response"] == {"trusted": True}
+    assert captured == {
+        "udid": "device-1",
+        "host": "192.0.2.10",
+        "port": 12345,
+        "timeout": 0.5,
+        "commands": ["query-usb-trust-state"],
+        "include_write_commands": False,
+    }
+
+
+def test_remote_pairing_management_rejects_write_command_without_opt_in():
+    result = CliRunner().invoke(
+        __main__.app,
+        ["--no-color", "remote", "pairing-management", "--command", "start-audit-activity"],
+    )
+
+    assert result.exit_code != 0
+    assert "unsupported RemotePairing management command" in result.output
