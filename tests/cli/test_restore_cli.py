@@ -1,5 +1,10 @@
+import json
+import plistlib
+import zipfile
+
 from typer.testing import CliRunner
 
+from pymobiledevice3 import __main__
 from pymobiledevice3.cli import restore
 from pymobiledevice3.irecv import Mode
 
@@ -40,6 +45,14 @@ class FakeIRecv:
     ap_nonce = b"\xaa\xbb"
     sep_nonce = b"\xcc\xdd"
 
+    def getenv(self, name):
+        return {
+            "auto-boot": b"true\x00ignored",
+            "build-version": b"iBoot-9999\x00",
+            "serial-number": b"sensitive-serial\x00",
+            "missing": None,
+        }[name]
+
 
 class FakeRestoredClient:
     def __init__(self) -> None:
@@ -65,10 +78,113 @@ def test_restore_info_help() -> None:
     assert "--include-errors" in result.output
 
 
+def test_restore_iboot_env_help() -> None:
+    result = CliRunner().invoke(restore.cli, ["iboot-env", "--help"])
+
+    assert result.exit_code == 0
+    assert "--include-identifiers" in result.output
+
+
+def test_restore_options_info_help() -> None:
+    result = CliRunner().invoke(restore.cli, ["options-info", "--help"])
+
+    assert result.exit_code == 0
+    assert "--ipsw" in result.output
+    assert "--include-defaults" in result.output
+
+
 def test_parse_ecid_decimal_prefixed_and_plain_hex() -> None:
     assert restore._parse_ecid("1234") == 1234
     assert restore._parse_ecid("0x4d2") == 1234
     assert restore._parse_ecid("4d2") == 1234
+
+
+def test_irecv_environment_info_decodes_and_redacts_values() -> None:
+    output = restore._irecv_environment_info(
+        FakeIRecv(),
+        ["auto-boot", "build-version", "serial-number", "missing"],
+    )
+
+    assert output["source"] == "irecv"
+    assert output["environment"]["auto-boot"] == {"available": True, "value": "true"}
+    assert output["environment"]["build-version"]["value"] == "iBoot-9999"
+    assert output["environment"]["serial-number"] == {"available": True, "value": "<redacted>"}
+    assert output["environment"]["missing"] == {"available": False, "value": None}
+
+
+def test_irecv_environment_info_can_include_identifiers() -> None:
+    output = restore._irecv_environment_info(FakeIRecv(), ["serial-number"], include_identifiers=True)
+
+    assert output["environment"]["serial-number"] == {"available": True, "value": "sensitive-serial"}
+
+
+def test_restore_options_info_reports_python_gaps() -> None:
+    output = restore.build_restore_options_info()
+
+    assert "SupportedDataTypes" in output["python"]["default_option_keys"]
+    assert "RecoveryOSAppleLogo" in output["gaps"]["supported_data_types_without_handler"]
+    assert "CrashLog" in output["gaps"]["supported_message_types_without_handler"]
+
+
+def test_restore_options_info_reads_ipsw_manifest(tmp_path) -> None:
+    ipsw = tmp_path / "sample.ipsw"
+    build_manifest = {
+        "ProductVersion": "27.0",
+        "ProductBuildVersion": "24A000",
+        "SupportedProductTypes": ["iPhone99,9"],
+        "BuildIdentities": [
+            {
+                "Info": {
+                    "Variant": "Developer Erase Install (IPSW)",
+                    "RestoreBehavior": "Erase",
+                    "DeviceClass": "d00ap",
+                    "ContentEncoding": "aea",
+                    "MinimumSystemPartition": 123,
+                    "SystemPartitionPadding": {"128": 1280},
+                    "RestoreAttestationMode": 8,
+                },
+                "Manifest": {
+                    "iBoot": {"Info": {"Path": "Firmware/all_flash/iBoot.test.im4p", "Personalize": True}},
+                    "RestoreRamDisk": {"Info": {"Path": "restore.dmg", "Personalize": True}},
+                },
+            }
+        ],
+    }
+    restore_plist = {
+        "ProductVersion": "27.0",
+        "ProductBuildVersion": "24A000",
+        "SupportedProductTypes": ["iPhone99,9"],
+        "SupportedProductTypeIDs": {"Recovery": [1]},
+        "SystemRestoreImageFileSystems": {"restore.dmg": "APFS"},
+    }
+    with zipfile.ZipFile(ipsw, "w") as archive:
+        archive.writestr("BuildManifest.plist", plistlib.dumps(build_manifest))
+        archive.writestr("Restore.plist", plistlib.dumps(restore_plist))
+
+    output = restore.build_restore_options_info(ipsw)
+
+    assert output["ipsw"]["build_manifest"]["product"]["build_version"] == "24A000"
+    identity = output["ipsw"]["build_manifest"]["build_identities"][0]
+    assert identity["restore_behavior"] == "Erase"
+    assert identity["components"]["iBoot"]["path"] == "Firmware/all_flash/iBoot.test.im4p"
+    assert output["ipsw"]["restore_plist"]["system_restore_image_file_systems"] == {"restore.dmg": "APFS"}
+    assert output["gaps"]["manifest_restore_behavior_not_in_default_options"] is True
+
+
+def test_restore_options_info_command_prints_json(tmp_path) -> None:
+    build_manifest = {
+        "ProductVersion": "27.0",
+        "ProductBuildVersion": "24A000",
+        "BuildIdentities": [],
+    }
+    ipsw = tmp_path / "sample.ipsw"
+    with zipfile.ZipFile(ipsw, "w") as archive:
+        archive.writestr("BuildManifest.plist", plistlib.dumps(build_manifest))
+
+    result = CliRunner().invoke(__main__.app, ["restore", "options-info", "--ipsw", str(ipsw)])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["ipsw"]["build_manifest"]["product"]["version"] == "27.0"
 
 
 def test_lockdown_restore_info_decodes_normal_mode() -> None:
