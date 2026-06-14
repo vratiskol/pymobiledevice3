@@ -1,5 +1,6 @@
 import asyncio
 import json
+import plistlib
 
 from typer.testing import CliRunner
 
@@ -179,3 +180,79 @@ def test_collect_restore_protocol_info_reports_usbmux_error(monkeypatch):
         "error_type": "RuntimeError",
         "error": "usbmux down",
     }
+
+
+def test_build_restore_message_report_summarizes_failure_and_requests():
+    output = protocol.build_restore_message_report([
+        {"MsgType": "DataRequestMsg", "DataType": "SystemImageData", "DataPort": 12345},
+        {"MsgType": "DataRequestMsg", "DataType": "NewFirmwareThing"},
+        {"MsgType": "ProgressMsg", "Operation": 14, "Progress": 42},
+        {"MsgType": "StatusMsg", "Status": 27, "Log": "failed for 00000000-0000000000000000 at 192.0.2.10"},
+    ])
+
+    assert output["summary"]["total"] == 4
+    assert output["summary"]["failures"] == 1
+    assert output["summary"]["warnings"] == 1
+    assert output["summary"]["data_requests"] == 2
+    assert output["summary"]["last_progress"]["operation"] == "VERIFY_RESTORE"
+    assert output["summary"]["final_status"]["error"] == "failed to mount filesystems"
+    assert output["messages"][0]["fields"]["implemented_by_pymobiledevice3"] is True
+    assert output["messages"][1]["fields"]["implemented_by_pymobiledevice3"] is False
+    assert output["messages"][3]["fields"]["log"] == "failed for <redacted> at <redacted>"
+
+
+def test_build_restore_message_report_can_include_raw_messages():
+    output = protocol.build_restore_message_report(
+        [{"MsgType": "PreviousRestoreLogMsg", "PreviousRestoreLog": b"\x01\x02"}],
+        include_raw=True,
+    )
+
+    assert output["warnings"][0]["raw"] == {
+        "MsgType": "PreviousRestoreLogMsg",
+        "PreviousRestoreLog": "<bytes:2>",
+    }
+    assert output["warnings"][0]["fields"]["log"] == "<bytes:2>"
+
+
+def test_restore_message_report_redacts_identifier_markers_in_logs():
+    output = protocol.build_restore_message_report([
+        {
+            "MsgType": "StatusMsg",
+            "Status": 14,
+            "Log": "SerialNumber=raw-serial ECID:123456789 apnonce=abcdef",
+        }
+    ])
+
+    assert output["failures"][0]["fields"]["log"] == "SerialNumber=<redacted> ECID:<redacted> apnonce=<redacted>"
+
+
+def test_restore_message_report_command_reads_json(tmp_path):
+    capture = tmp_path / "restore_messages.json"
+    capture.write_text(
+        json.dumps({
+            "messages": [
+                {"MsgType": "ProgressMsg", "Operation": 18, "Progress": 5},
+                {"MsgType": "StatusMsg", "Status": 0},
+            ]
+        })
+    )
+
+    result = CliRunner().invoke(__main__.app, ["restore", "message-report", str(capture)])
+
+    assert result.exit_code == 0, result.output
+    output = json.loads(result.output)
+    assert output["summary"]["completed"] is True
+    assert output["summary"]["last_progress"]["operation"] == "FLASH_FIRMWARE"
+
+
+def test_restore_message_report_command_reads_plist(tmp_path):
+    capture = tmp_path / "restore_message.plist"
+    capture.write_bytes(plistlib.dumps({"MsgType": "RestoredCrash", "RestoredBacktrace": ["frame0", "frame1"]}))
+
+    result = CliRunner().invoke(__main__.app, ["restore", "message-report", str(capture), "--include-raw"])
+
+    assert result.exit_code == 0, result.output
+    output = json.loads(result.output)
+    assert output["summary"]["failures"] == 1
+    assert output["failures"][0]["fields"]["backtrace_frames"] == 2
+    assert output["failures"][0]["raw"]["MsgType"] == "RestoredCrash"

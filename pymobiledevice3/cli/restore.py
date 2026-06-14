@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import json
 import logging
 import plistlib
 import tempfile
@@ -34,7 +35,7 @@ from pymobiledevice3.irecv import (
 )
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.restore.device import Device
-from pymobiledevice3.restore.protocol import collect_restore_protocol_info
+from pymobiledevice3.restore.protocol import build_restore_message_report, collect_restore_protocol_info
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore import Restore
 from pymobiledevice3.restore.restored_client import RestoredClient
@@ -211,6 +212,32 @@ def _error_info(error: Exception) -> dict:
         "type": error.__class__.__name__,
         "message": str(error),
     }
+
+
+def _load_restore_message_document(path: Path) -> Any:
+    data = path.read_bytes()
+    try:
+        return plistlib.loads(data)
+    except Exception:
+        try:
+            return json.loads(data.decode())
+        except Exception as e:
+            raise typer.BadParameter(f"failed to parse {path} as plist or JSON: {e}") from e
+
+
+def _restore_messages_from_document(document: Any) -> list[dict]:
+    if isinstance(document, list):
+        messages = document
+    elif isinstance(document, dict) and isinstance(document.get("messages"), list):
+        messages = document["messages"]
+    elif isinstance(document, dict) and "MsgType" in document:
+        messages = [document]
+    else:
+        raise typer.BadParameter("expected a restore message dict, a list of messages, or a dict with a messages list")
+
+    if not all(isinstance(message, dict) for message in messages):
+        raise typer.BadParameter("all restore messages must be dictionaries")
+    return messages
 
 
 def _matches_ecid(ecid: Optional[int], found_ecid: Optional[int]) -> bool:
@@ -536,6 +563,33 @@ async def restore_protocol_info(
     print_json(output, colored=False)
     if strict and not any(device.get("mode") == "restored" for device in output["devices"]):
         raise typer.Exit(1)
+
+
+@cli.command("message-report")
+def restore_message_report(
+    input_path: Annotated[
+        Path,
+        typer.Argument(exists=True, dir_okay=False, readable=True, help="JSON/plist restore message capture."),
+    ],
+    include_raw: Annotated[
+        bool,
+        typer.Option(help="Include sanitized raw input messages next to each summary."),
+    ] = False,
+    include_identifiers: Annotated[
+        bool,
+        typer.Option(help="Include raw device identifiers and nonce-like values in the report."),
+    ] = False,
+) -> None:
+    """Summarize restored MsgType plists into a structured failure report."""
+    messages = _restore_messages_from_document(_load_restore_message_document(input_path))
+    print_json(
+        build_restore_message_report(
+            messages,
+            include_raw=include_raw,
+            include_identifiers=include_identifiers,
+        ),
+        colored=False,
+    )
 
 
 async def restore_tss_task(
