@@ -875,6 +875,9 @@ def test_restore_purple_session_help():
     assert "--log-level" in result.output
     assert "--listen-timeout" in result.output
     assert "--max-messages" in result.output
+    assert "--probe-socks" in result.output
+    assert "--socks-connect-host" in result.output
+    assert "--socks-connect-port" in result.output
     assert "--include-services" in result.output
     assert "--strict" in result.output
 
@@ -919,6 +922,9 @@ def test_restore_purple_session_prints_orchestrated_json(monkeypatch):
             "include_response": True,
             "listen_timeout": 0.2,
             "max_messages": 2,
+            "probe_socks": True,
+            "socks_connect_host": "example.test",
+            "socks_connect_port": 443,
         }
         return {
             "checked": True,
@@ -936,6 +942,16 @@ def test_restore_purple_session_prints_orchestrated_json(monkeypatch):
                 "ping": {"checked": True, "command": "Ping", "reachable": True, "pong": True},
                 "wait_socket": {"checked": True, "command": "WaitSocket", "reachable": True},
                 "proxy_dictionary": {"checked": True, "proxy_url": "socks://127.0.0.1:4321/"},
+                "socks_probe": {
+                    "checked": True,
+                    "protocol": "SOCKS5",
+                    "reachable": True,
+                    "summary": {
+                        "handshake_ok": True,
+                        "connect_succeeded": True,
+                        "ok": True,
+                    },
+                },
             },
             "summary": {
                 "control_reachable": True,
@@ -943,6 +959,7 @@ def test_restore_purple_session_prints_orchestrated_json(monkeypatch):
                 "wait_socket_reachable": True,
                 "notify_registered": True,
                 "set_log_level_sent": True,
+                "socks_probe_ok": True,
                 "proxy_dictionary_ready": True,
                 "ok": True,
             },
@@ -980,6 +997,11 @@ def test_restore_purple_session_prints_orchestrated_json(monkeypatch):
             "--max-messages",
             "2",
             "--include-services",
+            "--probe-socks",
+            "--socks-connect-host",
+            "example.test",
+            "--socks-connect-port",
+            "443",
             "--udid",
             "sensitive-udid",
             "--usbmux-address",
@@ -991,7 +1013,9 @@ def test_restore_purple_session_prints_orchestrated_json(monkeypatch):
     output = json.loads(result.output)
     assert output["phases"]["probe"]["mode"] == "restored"
     assert output["phases"]["register_notify"]["messages"] == [{"SerialNumber": "<redacted>", "Event": "ProxyOnline"}]
+    assert output["phases"]["socks_probe"]["summary"]["connect_succeeded"] is True
     assert output["summary"]["ok"] is True
+    assert output["summary"]["socks_probe_ok"] is True
     assert output["summary"]["probe_mode"] == "restored"
     assert output["summary"]["probe_reachable_ports"] == ["ctrl", "notify", "restore"]
     assert "sensitive-udid" not in result.output

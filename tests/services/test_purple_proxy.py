@@ -689,6 +689,7 @@ async def test_run_purple_proxy_session_keeps_notify_open_during_control_sequenc
         "wait_socket_reachable": True,
         "notify_registered": True,
         "set_log_level_sent": True,
+        "socks_probe_ok": None,
         "proxy_dictionary_ready": True,
         "ok": True,
     }
@@ -698,6 +699,10 @@ async def test_run_purple_proxy_session_keeps_notify_open_during_control_sequenc
     assert phases["ping"]["pong"] is True
     assert phases["wait_socket"]["conn_port"] == 4321
     assert phases["proxy_dictionary"]["proxy_url"] == "socks://127.0.0.1:4321/"
+    assert phases["socks_probe"] == {
+        "checked": False,
+        "reason": "--probe-socks was not provided.",
+    }
     assert notify_client.sent == [
         {"Command": "SetLogLevel", "Level": 7},
         {"Command": "RegisterNotify"},
@@ -724,6 +729,67 @@ async def test_run_purple_proxy_session_keeps_notify_open_during_control_sequenc
 
 
 @pytest.mark.asyncio
+async def test_run_purple_proxy_session_can_require_socks_probe(monkeypatch):
+    notify_client = FakePurpleProxyClient()
+    control_client = FakePurpleProxyClient({"Command": "Pong"})
+    socks_calls = []
+
+    async def fake_connect_notify(udid=None, **kwargs):
+        return notify_client
+
+    async def fake_connect_control(udid=None, **kwargs):
+        return control_client
+
+    async def fake_run_purple_proxy_socks_probe(**kwargs):
+        socks_calls.append(kwargs)
+        return {
+            "checked": True,
+            "experimental": True,
+            "protocol": "SOCKS5",
+            "port": 4321,
+            "reachable": True,
+            "summary": {
+                "handshake_ok": True,
+                "connect_succeeded": True,
+                "ok": True,
+            },
+        }
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_notify", staticmethod(fake_connect_notify))
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_control", staticmethod(fake_connect_control))
+    monkeypatch.setattr(purple_proxy, "run_purple_proxy_socks_probe", fake_run_purple_proxy_socks_probe)
+
+    result = await run_purple_proxy_session(
+        udid="sensitive-udid",
+        usbmux_address="/tmp/usbmux",
+        timeout=0.1,
+        protocol_version=2,
+        conn_port=4321,
+        probe_socks=True,
+        socks_connect_host="example.test",
+        socks_connect_port=443,
+        listen_timeout=0.0,
+    )
+
+    assert result["summary"]["socks_probe_ok"] is True
+    assert result["summary"]["ok"] is True
+    assert result["phases"]["socks_probe"]["summary"]["connect_succeeded"] is True
+    assert socks_calls == [
+        {
+            "udid": "sensitive-udid",
+            "usbmux_address": "/tmp/usbmux",
+            "timeout": 0.1,
+            "port": 4321,
+            "connect_host": "example.test",
+            "connect_port": 443,
+            "connection_type": "USB",
+            "include_response": False,
+        }
+    ]
+    assert "sensitive" not in repr(result)
+
+
+@pytest.mark.asyncio
 async def test_run_purple_proxy_session_summarizes_unreachable_control(monkeypatch):
     async def fake_connect_notify(udid=None, **kwargs):
         return FakePurpleProxyClient()
@@ -738,9 +804,14 @@ async def test_run_purple_proxy_session_summarizes_unreachable_control(monkeypat
 
     assert result["summary"]["ok"] is False
     assert result["summary"]["set_log_level_sent"] is None
+    assert result["summary"]["socks_probe_ok"] is None
     assert result["phases"]["set_log_level"] == {
         "checked": False,
         "reason": "--log-level was not provided.",
+    }
+    assert result["phases"]["socks_probe"] == {
+        "checked": False,
+        "reason": "--probe-socks was not provided.",
     }
     assert result["phases"]["begin_control"]["reachable"] is False
     assert result["phases"]["begin_control"]["error_type"] == "OSError"

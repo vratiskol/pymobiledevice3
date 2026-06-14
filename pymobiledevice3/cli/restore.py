@@ -903,6 +903,21 @@ async def restore_purple_session(
         int,
         typer.Option("--max-messages", min=1, help="Maximum notify dictionaries to collect while listening."),
     ] = 8,
+    probe_socks: Annotated[
+        bool,
+        typer.Option("--probe-socks", help="Also run a SOCKS5 data-plane probe on --conn-port after WaitSocket."),
+    ] = False,
+    socks_connect_host: Annotated[
+        Optional[str],
+        typer.Option(
+            "--socks-connect-host",
+            help="Optionally send a SOCKS5 CONNECT request during --probe-socks; the host is not printed.",
+        ),
+    ] = None,
+    socks_connect_port: Annotated[
+        int,
+        typer.Option("--socks-connect-port", min=1, max=0xFFFF, help="Port for the optional session SOCKS CONNECT."),
+    ] = 443,
     include_services: Annotated[
         bool,
         typer.Option(
@@ -945,6 +960,9 @@ async def restore_purple_session(
         include_response=include_response,
         listen_timeout=listen_timeout,
         max_messages=max_messages,
+        probe_socks=probe_socks,
+        socks_connect_host=socks_connect_host,
+        socks_connect_port=socks_connect_port,
     )
     result["phases"] = {
         "probe": probe,

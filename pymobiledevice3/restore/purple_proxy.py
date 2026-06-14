@@ -317,15 +317,20 @@ def _add_notify_messages_to_phase(
 
 def summarize_purple_proxy_session(phases: dict[str, Any]) -> dict[str, Any]:
     log_phase = phases.get("set_log_level", {})
+    socks_phase = phases.get("socks_probe", {})
     log_level_requested = bool(log_phase.get("checked"))
+    socks_requested = bool(socks_phase.get("checked"))
     control_reachable = bool(phases.get("begin_control", {}).get("reachable"))
     ping_pong = bool(phases.get("ping", {}).get("reachable") and phases.get("ping", {}).get("pong"))
     wait_socket_reachable = bool(phases.get("wait_socket", {}).get("reachable"))
     notify_registered = bool(phases.get("register_notify", {}).get("reachable"))
     proxy_dictionary_ready = bool(phases.get("proxy_dictionary", {}).get("checked"))
+    socks_probe_ok = None
     set_log_level_sent = None
     if log_level_requested:
         set_log_level_sent = bool(log_phase.get("reachable") and log_phase.get("sent"))
+    if socks_requested:
+        socks_probe_ok = bool(socks_phase.get("summary", {}).get("ok"))
 
     required = [
         control_reachable,
@@ -336,6 +341,8 @@ def summarize_purple_proxy_session(phases: dict[str, Any]) -> dict[str, Any]:
     ]
     if log_level_requested:
         required.append(bool(set_log_level_sent))
+    if socks_requested:
+        required.append(bool(socks_probe_ok))
 
     return {
         "control_reachable": control_reachable,
@@ -343,6 +350,7 @@ def summarize_purple_proxy_session(phases: dict[str, Any]) -> dict[str, Any]:
         "wait_socket_reachable": wait_socket_reachable,
         "notify_registered": notify_registered,
         "set_log_level_sent": set_log_level_sent,
+        "socks_probe_ok": socks_probe_ok,
         "proxy_dictionary_ready": proxy_dictionary_ready,
         "ok": all(required),
     }
@@ -904,6 +912,9 @@ async def run_purple_proxy_session(
     include_response: bool = False,
     listen_timeout: float = 1.0,
     max_messages: int = 8,
+    probe_socks: bool = False,
+    socks_connect_host: Optional[str] = None,
+    socks_connect_port: int = 443,
 ) -> dict[str, Any]:
     if log_level is not None and not 0 <= log_level <= 7:
         raise ValueError("log_level must be between 0 and 7")
@@ -1052,6 +1063,19 @@ async def run_purple_proxy_session(
         host=proxy_host,
         socks_port=conn_port,
     )
+    if probe_socks or socks_connect_host is not None:
+        phases["socks_probe"] = await run_purple_proxy_socks_probe(
+            udid=udid,
+            usbmux_address=usbmux_address,
+            timeout=timeout,
+            port=conn_port,
+            connect_host=socks_connect_host,
+            connect_port=socks_connect_port,
+            connection_type=connection_type,
+            include_response=include_response,
+        )
+    else:
+        phases["socks_probe"] = _purple_proxy_skipped_phase("--probe-socks was not provided.")
 
     return {
         "checked": True,
