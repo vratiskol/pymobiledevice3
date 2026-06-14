@@ -764,6 +764,181 @@ def test_restore_purple_notify_strict_fails_when_unreachable(monkeypatch):
     assert json.loads(result.output)["reachable"] is False
 
 
+def test_restore_purple_session_help():
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-session", "--help"], env={"COLUMNS": "200"})
+
+    assert result.exit_code == 0
+    assert "--control-port" in result.output
+    assert "--notify-port" in result.output
+    assert "--protocol-version" in result.output
+    assert "--conn-port" in result.output
+    assert "--log-level" in result.output
+    assert "--listen-timeout" in result.output
+    assert "--max-messages" in result.output
+    assert "--include-services" in result.output
+    assert "--strict" in result.output
+
+
+def test_restore_purple_session_prints_orchestrated_json(monkeypatch):
+    async def fake_collect_live_purple_reverse_proxy_probe(**kwargs):
+        assert kwargs == {
+            "usbmux_address": "/tmp/usbmux",
+            "timeout": 0.5,
+            "include_services": True,
+        }
+        return {
+            "checked": True,
+            "mode": "restored",
+            "device_count": 1,
+            "devices": [
+                {
+                    "index": 0,
+                    "mode": "restored",
+                    "ports": [
+                        {"name": "restore", "port": 62078, "reachable": True},
+                        {"name": "socks", "port": 1081, "reachable": False},
+                        {"name": "ctrl", "port": 1082, "reachable": True},
+                        {"name": "notify", "port": 1084, "reachable": True},
+                    ],
+                }
+            ],
+        }
+
+    async def fake_run_purple_proxy_session(**kwargs):
+        assert kwargs == {
+            "udid": "sensitive-udid",
+            "usbmux_address": "/tmp/usbmux",
+            "timeout": 0.5,
+            "control_port": 1234,
+            "notify_port": 1235,
+            "protocol_version": 2,
+            "conn_port": 4321,
+            "log_level": 7,
+            "url": "https://example.test/path",
+            "proxy_host": "127.0.0.1",
+            "include_response": True,
+            "listen_timeout": 0.2,
+            "max_messages": 2,
+        }
+        return {
+            "checked": True,
+            "experimental": True,
+            "phases": {
+                "set_log_level": {"checked": True, "command": "SetLogLevel", "reachable": True, "sent": True},
+                "register_notify": {
+                    "checked": True,
+                    "command": "RegisterNotify",
+                    "reachable": True,
+                    "sent": True,
+                    "messages": [{"SerialNumber": "<redacted>", "Event": "ProxyOnline"}],
+                },
+                "begin_control": {"checked": True, "command": "BeginCtrl", "reachable": True},
+                "ping": {"checked": True, "command": "Ping", "reachable": True, "pong": True},
+                "wait_socket": {"checked": True, "command": "WaitSocket", "reachable": True},
+                "proxy_dictionary": {"checked": True, "proxy_url": "socks://127.0.0.1:4321/"},
+            },
+            "summary": {
+                "control_reachable": True,
+                "ping_pong": True,
+                "wait_socket_reachable": True,
+                "notify_registered": True,
+                "set_log_level_sent": True,
+                "proxy_dictionary_ready": True,
+                "ok": True,
+            },
+        }
+
+    monkeypatch.setattr(
+        restore_cli, "collect_live_purple_reverse_proxy_probe", fake_collect_live_purple_reverse_proxy_probe
+    )
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_session", fake_run_purple_proxy_session)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "restore",
+            "purple-session",
+            "--timeout",
+            "0.5",
+            "--control-port",
+            "1234",
+            "--notify-port",
+            "1235",
+            "--protocol-version",
+            "2",
+            "--conn-port",
+            "4321",
+            "--log-level",
+            "7",
+            "--url",
+            "https://example.test/path",
+            "--proxy-host",
+            "127.0.0.1",
+            "--include-response",
+            "--listen-timeout",
+            "0.2",
+            "--max-messages",
+            "2",
+            "--include-services",
+            "--udid",
+            "sensitive-udid",
+            "--usbmux-address",
+            "/tmp/usbmux",
+        ],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["phases"]["probe"]["mode"] == "restored"
+    assert output["phases"]["register_notify"]["messages"] == [{"SerialNumber": "<redacted>", "Event": "ProxyOnline"}]
+    assert output["summary"]["ok"] is True
+    assert output["summary"]["probe_mode"] == "restored"
+    assert output["summary"]["probe_reachable_ports"] == ["ctrl", "notify", "restore"]
+    assert "sensitive-udid" not in result.output
+
+
+def test_restore_purple_session_strict_fails_when_summary_is_not_ok(monkeypatch):
+    async def fake_collect_live_purple_reverse_proxy_probe(**kwargs):
+        return {
+            "checked": True,
+            "mode": "no_usb_device",
+            "device_count": 0,
+        }
+
+    async def fake_run_purple_proxy_session(**kwargs):
+        return {
+            "checked": True,
+            "experimental": True,
+            "phases": {
+                "set_log_level": {"checked": False, "reason": "--log-level was not provided."},
+                "register_notify": {"checked": True, "reachable": False},
+                "begin_control": {"checked": True, "reachable": False},
+                "ping": {"checked": True, "reachable": False},
+                "wait_socket": {"checked": True, "reachable": False},
+                "proxy_dictionary": {"checked": True},
+            },
+            "summary": {
+                "control_reachable": False,
+                "ping_pong": False,
+                "wait_socket_reachable": False,
+                "notify_registered": False,
+                "set_log_level_sent": None,
+                "proxy_dictionary_ready": True,
+                "ok": False,
+            },
+        }
+
+    monkeypatch.setattr(
+        restore_cli, "collect_live_purple_reverse_proxy_probe", fake_collect_live_purple_reverse_proxy_probe
+    )
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_session", fake_run_purple_proxy_session)
+
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-session", "--strict"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.output)["summary"]["ok"] is False
+
+
 @pytest.mark.asyncio
 async def test_collect_live_purple_reverse_proxy_probe_without_usb_device(monkeypatch):
     async def fake_list_devices(usbmux_address=None):

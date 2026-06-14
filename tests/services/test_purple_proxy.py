@@ -15,6 +15,7 @@ from pymobiledevice3.restore.purple_proxy import (
     probe_purple_proxy_hello,
     run_purple_proxy_control_command,
     run_purple_proxy_notify_command,
+    run_purple_proxy_session,
     sanitize_purple_proxy_response,
 )
 
@@ -515,6 +516,101 @@ async def test_run_purple_proxy_notify_command_reports_connect_error(monkeypatch
         "reachable": False,
         "error_type": "OSError",
     }
+
+
+@pytest.mark.asyncio
+async def test_run_purple_proxy_session_keeps_notify_open_during_control_sequence(monkeypatch):
+    notify_client = FakePurpleProxyClient(messages=[{"Event": "ProxyOnline", "SerialNumber": "sensitive"}])
+    control_client = FakePurpleProxyClient({"Command": "Pong", "SerialNumber": "sensitive"})
+    calls = []
+
+    async def fake_connect_notify(udid=None, **kwargs):
+        calls.append({"kind": "notify", "udid": udid, **kwargs})
+        return notify_client
+
+    async def fake_connect_control(udid=None, **kwargs):
+        calls.append({"kind": "control", "udid": udid, **kwargs})
+        return control_client
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_notify", staticmethod(fake_connect_notify))
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_control", staticmethod(fake_connect_control))
+
+    result = await run_purple_proxy_session(
+        udid="sensitive-udid",
+        usbmux_address="/tmp/usbmux",
+        timeout=0.1,
+        control_port=1234,
+        notify_port=1235,
+        protocol_version=2,
+        conn_port=4321,
+        log_level=7,
+        include_response=True,
+        listen_timeout=0.1,
+        max_messages=1,
+    )
+
+    phases = result["phases"]
+    assert result["summary"] == {
+        "control_reachable": True,
+        "ping_pong": True,
+        "wait_socket_reachable": True,
+        "notify_registered": True,
+        "set_log_level_sent": True,
+        "proxy_dictionary_ready": True,
+        "ok": True,
+    }
+    assert phases["set_log_level"]["sent"] is True
+    assert phases["register_notify"]["messages"] == [{"Event": "ProxyOnline", "SerialNumber": "<redacted>"}]
+    assert phases["begin_control"]["response"] == {"Command": "Pong", "SerialNumber": "<redacted>"}
+    assert phases["ping"]["pong"] is True
+    assert phases["wait_socket"]["conn_port"] == 4321
+    assert phases["proxy_dictionary"]["proxy_url"] == "socks://127.0.0.1:4321/"
+    assert notify_client.sent == [
+        {"Command": "SetLogLevel", "Level": 7},
+        {"Command": "RegisterNotify"},
+    ]
+    assert calls == [
+        {
+            "kind": "notify",
+            "udid": "sensitive-udid",
+            "connection_type": "USB",
+            "usbmux_address": "/tmp/usbmux",
+            "port": 1235,
+        },
+        {
+            "kind": "control",
+            "udid": "sensitive-udid",
+            "connection_type": "USB",
+            "usbmux_address": "/tmp/usbmux",
+            "port": 1234,
+        },
+    ]
+    assert notify_client.closed is True
+    assert control_client.closed is True
+    assert "sensitive" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_run_purple_proxy_session_summarizes_unreachable_control(monkeypatch):
+    async def fake_connect_notify(udid=None, **kwargs):
+        return FakePurpleProxyClient()
+
+    async def fake_connect_control(udid=None, **kwargs):
+        raise OSError("closed")
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_notify", staticmethod(fake_connect_notify))
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_control", staticmethod(fake_connect_control))
+
+    result = await run_purple_proxy_session(timeout=0.1, listen_timeout=0.0)
+
+    assert result["summary"]["ok"] is False
+    assert result["summary"]["set_log_level_sent"] is None
+    assert result["phases"]["set_log_level"] == {
+        "checked": False,
+        "reason": "--log-level was not provided.",
+    }
+    assert result["phases"]["begin_control"]["reachable"] is False
+    assert result["phases"]["begin_control"]["error_type"] == "OSError"
 
 
 @pytest.mark.asyncio

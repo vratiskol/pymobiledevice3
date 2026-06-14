@@ -50,6 +50,7 @@ from pymobiledevice3.restore.purple_proxy import (
     build_purple_proxy_dictionary,
     run_purple_proxy_control_command,
     run_purple_proxy_notify_command,
+    run_purple_proxy_session,
 )
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore import Restore
@@ -779,6 +780,122 @@ async def restore_purple_notify(
     )
     print_json(result, colored=False)
     if strict and not result["reachable"]:
+        raise typer.Exit(1)
+
+
+def _purple_session_reachable_ports(probe: dict[str, Any]) -> list[str]:
+    reachable_ports = set()
+    for device in probe.get("devices", []):
+        for port in device.get("ports", []):
+            if port.get("reachable") and port.get("name") is not None:
+                reachable_ports.add(str(port["name"]))
+    return sorted(reachable_ports)
+
+
+@cli.command("purple-session")
+@async_command
+async def restore_purple_session(
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", min=0.1, help="Timeout for each PurpleReverseProxy connection and reply."),
+    ] = 1.0,
+    control_port: Annotated[
+        int,
+        typer.Option("--control-port", min=1, max=0xFFFF, help="Device-side PurpleReverseProxy control port."),
+    ] = PURPLE_PROXY_CONTROL_PORT,
+    notify_port: Annotated[
+        int,
+        typer.Option("--notify-port", min=1, max=0xFFFF, help="Device-side PurpleReverseProxy notify port."),
+    ] = PURPLE_PROXY_NOTIFY_PORT,
+    protocol_version: Annotated[
+        int,
+        typer.Option("--protocol-version", min=0, help="CtrlProtoVersion value to send with BeginCtrl."),
+    ] = PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
+    conn_port: Annotated[
+        int,
+        typer.Option("--conn-port", min=1, max=0xFFFF, help="ConnPort value to send with WaitSocket."),
+    ] = PURPLE_PROXY_SOCKS_PORT,
+    log_level: Annotated[
+        Optional[int],
+        typer.Option("--log-level", min=0, max=7, help="Optionally send SetLogLevel before RegisterNotify."),
+    ] = None,
+    url: Annotated[
+        str,
+        typer.Option("--url", help="URL passed to the modeled CopyProxyDictionaryWithOptions path."),
+    ] = "https://www.apple.com/",
+    proxy_host: Annotated[
+        str,
+        typer.Option("--proxy-host", help="SOCKS proxy host to place in the proxy dictionary."),
+    ] = PURPLE_PROXY_LOOPBACK_HOST,
+    include_response: Annotated[
+        bool,
+        typer.Option(
+            "--include-response", help="Include sanitized response or notification dictionaries in JSON output."
+        ),
+    ] = False,
+    listen_timeout: Annotated[
+        float,
+        typer.Option(
+            "--listen-timeout", min=0.0, help="Seconds to collect asynchronous notify dictionaries during the session."
+        ),
+    ] = 1.0,
+    max_messages: Annotated[
+        int,
+        typer.Option("--max-messages", min=1, help="Maximum notify dictionaries to collect while listening."),
+    ] = 8,
+    include_services: Annotated[
+        bool,
+        typer.Option(
+            "--include-services",
+            help="Also try starting PurpleReverseProxy lockdown service names when lockdownd is reachable.",
+        ),
+    ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Exit non-zero when the session summary is not ok."),
+    ] = False,
+    udid: Annotated[
+        Optional[str],
+        typer.Option("--udid", "--serial", help="Target device serial/UDID; never printed in command output."),
+    ] = None,
+    usbmux_address: Annotated[
+        Optional[str],
+        typer.Option("--usbmux-address", help="Address of the usbmuxd daemon (unix socket path or HOST:PORT)."),
+    ] = None,
+) -> None:
+    """
+    Run the PurpleReverseProxy restore-session probe sequence.
+    """
+    probe = await collect_live_purple_reverse_proxy_probe(
+        usbmux_address=usbmux_address,
+        timeout=timeout,
+        include_services=include_services,
+    )
+    result = await run_purple_proxy_session(
+        udid=udid,
+        usbmux_address=usbmux_address,
+        timeout=timeout,
+        control_port=control_port,
+        notify_port=notify_port,
+        protocol_version=protocol_version,
+        conn_port=conn_port,
+        log_level=log_level,
+        url=url,
+        proxy_host=proxy_host,
+        include_response=include_response,
+        listen_timeout=listen_timeout,
+        max_messages=max_messages,
+    )
+    result["phases"] = {
+        "probe": probe,
+        **result["phases"],
+    }
+    result["summary"].update({
+        "probe_mode": probe.get("mode"),
+        "probe_reachable_ports": _purple_session_reachable_ports(probe),
+    })
+    print_json(result, colored=False)
+    if strict and not result["summary"]["ok"]:
         raise typer.Exit(1)
 
 

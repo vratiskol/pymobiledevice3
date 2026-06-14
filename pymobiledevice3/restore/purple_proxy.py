@@ -85,6 +85,196 @@ def sanitize_purple_proxy_response(value: Any) -> Any:
     return value
 
 
+def _purple_proxy_skipped_phase(reason: str) -> dict[str, Any]:
+    return {
+        "checked": False,
+        "reason": reason,
+    }
+
+
+def _purple_proxy_control_phase_result(
+    command: PurpleProxyCommand,
+    *,
+    port: int,
+    protocol_version: int,
+    conn_port: int,
+    include_response: bool,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "checked": True,
+        "experimental": True,
+        "command": command.value,
+        "port": port,
+        "include_response": include_response,
+    }
+    if command in (PurpleProxyCommand.HELLO_CONTROL, PurpleProxyCommand.BEGIN_CONTROL):
+        result["protocol_version"] = protocol_version
+    if command is PurpleProxyCommand.WAIT_SOCKET:
+        result["conn_port"] = conn_port
+    return result
+
+
+def _purple_proxy_notify_phase_result(
+    command: PurpleProxyCommand,
+    *,
+    port: int,
+    include_response: bool,
+    level: Optional[int] = None,
+    listen_timeout: float = 0.0,
+    max_messages: int = 8,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "checked": True,
+        "experimental": True,
+        "command": command.value,
+        "port": port,
+        "include_response": include_response,
+        "expect_response": False,
+    }
+    if command is PurpleProxyCommand.SET_LOG_LEVEL:
+        result["level"] = level
+    if listen_timeout > 0:
+        result.update({
+            "listen_timeout": listen_timeout,
+            "max_messages": max_messages,
+        })
+    return result
+
+
+def _purple_proxy_unreachable_phase(result: dict[str, Any], e: BaseException) -> dict[str, Any]:
+    result.update({
+        "reachable": False,
+        "error_type": e.__class__.__name__,
+    })
+    return result
+
+
+async def _run_connected_control_phase(
+    client: "PurpleProxyClient",
+    command: PurpleProxyCommand,
+    *,
+    timeout: float,
+    port: int,
+    protocol_version: int,
+    conn_port: int,
+    include_response: bool,
+) -> dict[str, Any]:
+    result = _purple_proxy_control_phase_result(
+        command,
+        port=port,
+        protocol_version=protocol_version,
+        conn_port=conn_port,
+        include_response=include_response,
+    )
+    try:
+        if command is PurpleProxyCommand.BEGIN_CONTROL:
+            response = await asyncio.wait_for(client.begin_control(protocol_version=protocol_version), timeout=timeout)
+        elif command is PurpleProxyCommand.WAIT_SOCKET:
+            response = await asyncio.wait_for(client.wait_socket(conn_port=conn_port), timeout=timeout)
+        elif command is PurpleProxyCommand.PING:
+            response = await asyncio.wait_for(client.send_ping(), timeout=timeout)
+        else:
+            raise ValueError(f"unsupported PurpleReverseProxy session control command: {command.value}")
+    except Exception as e:
+        return _purple_proxy_unreachable_phase(result, e)
+
+    sanitized_response = sanitize_purple_proxy_response(response)
+    result.update({
+        "reachable": True,
+        "response_keys": sorted(str(key) for key in sanitized_response),
+    })
+    if command is PurpleProxyCommand.PING:
+        result["pong"] = is_purple_proxy_pong_response(sanitized_response)
+    if include_response:
+        result["response"] = sanitized_response
+    return result
+
+
+async def _run_connected_notify_phase(
+    client: "PurpleProxyClient",
+    command: PurpleProxyCommand,
+    *,
+    timeout: float,
+    port: int,
+    include_response: bool,
+    level: Optional[int] = None,
+    listen_timeout: float = 0.0,
+    max_messages: int = 8,
+) -> dict[str, Any]:
+    result = _purple_proxy_notify_phase_result(
+        command,
+        port=port,
+        include_response=include_response,
+        level=level,
+        listen_timeout=listen_timeout,
+        max_messages=max_messages,
+    )
+    try:
+        if command is PurpleProxyCommand.REGISTER_NOTIFY:
+            await asyncio.wait_for(client.register_notify(), timeout=timeout)
+        elif command is PurpleProxyCommand.SET_LOG_LEVEL:
+            if level is None:
+                raise ValueError("level is required for SetLogLevel")
+            await asyncio.wait_for(client.set_log_level(level), timeout=timeout)
+        else:
+            await asyncio.wait_for(client.send_command_message(command), timeout=timeout)
+    except Exception as e:
+        return _purple_proxy_unreachable_phase(result, e)
+
+    result.update({
+        "reachable": True,
+        "sent": True,
+    })
+    return result
+
+
+def _add_notify_messages_to_phase(
+    phase: dict[str, Any],
+    messages: list[dict[str, Any]],
+    *,
+    include_response: bool,
+) -> dict[str, Any]:
+    sanitized_messages = [sanitize_purple_proxy_response(message) for message in messages]
+    phase["message_count"] = len(sanitized_messages)
+    phase["message_keys"] = [sorted(str(key) for key in message) for message in sanitized_messages]
+    if include_response:
+        phase["messages"] = sanitized_messages
+    return phase
+
+
+def summarize_purple_proxy_session(phases: dict[str, Any]) -> dict[str, Any]:
+    log_phase = phases.get("set_log_level", {})
+    log_level_requested = bool(log_phase.get("checked"))
+    control_reachable = bool(phases.get("begin_control", {}).get("reachable"))
+    ping_pong = bool(phases.get("ping", {}).get("reachable") and phases.get("ping", {}).get("pong"))
+    wait_socket_reachable = bool(phases.get("wait_socket", {}).get("reachable"))
+    notify_registered = bool(phases.get("register_notify", {}).get("reachable"))
+    proxy_dictionary_ready = bool(phases.get("proxy_dictionary", {}).get("checked"))
+    set_log_level_sent = None
+    if log_level_requested:
+        set_log_level_sent = bool(log_phase.get("reachable") and log_phase.get("sent"))
+
+    required = [
+        control_reachable,
+        ping_pong,
+        wait_socket_reachable,
+        notify_registered,
+        proxy_dictionary_ready,
+    ]
+    if log_level_requested:
+        required.append(bool(set_log_level_sent))
+
+    return {
+        "control_reachable": control_reachable,
+        "ping_pong": ping_pong,
+        "wait_socket_reachable": wait_socket_reachable,
+        "notify_registered": notify_registered,
+        "set_log_level_sent": set_log_level_sent,
+        "proxy_dictionary_ready": proxy_dictionary_ready,
+        "ok": all(required),
+    }
+
+
 class PurpleProxyClient:
     """
     Minimal PurpleReverseProxy dictionary protocol client.
@@ -448,3 +638,176 @@ async def run_purple_proxy_notify_command(
                 await client.close()
 
     return result
+
+
+async def run_purple_proxy_session(
+    *,
+    udid: Optional[str] = None,
+    usbmux_address: Optional[str] = None,
+    timeout: float = 1.0,
+    control_port: int = PURPLE_PROXY_CONTROL_PORT,
+    notify_port: int = PURPLE_PROXY_NOTIFY_PORT,
+    protocol_version: int = PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
+    conn_port: int = PURPLE_PROXY_SOCKS_PORT,
+    log_level: Optional[int] = None,
+    url: str = "https://www.apple.com/",
+    proxy_host: str = PURPLE_PROXY_LOOPBACK_HOST,
+    connection_type: str = "USB",
+    include_response: bool = False,
+    listen_timeout: float = 1.0,
+    max_messages: int = 8,
+) -> dict[str, Any]:
+    if log_level is not None and not 0 <= log_level <= 7:
+        raise ValueError("log_level must be between 0 and 7")
+
+    phases: dict[str, Any] = {}
+    notify_client = None
+    control_client = None
+    notify_messages_task = None
+
+    try:
+        notify_client = await asyncio.wait_for(
+            PurpleProxyClient.connect_notify(
+                udid,
+                connection_type=connection_type,
+                usbmux_address=usbmux_address,
+                port=notify_port,
+            ),
+            timeout=timeout,
+        )
+        if log_level is None:
+            phases["set_log_level"] = _purple_proxy_skipped_phase("--log-level was not provided.")
+        else:
+            phases["set_log_level"] = await _run_connected_notify_phase(
+                notify_client,
+                PurpleProxyCommand.SET_LOG_LEVEL,
+                timeout=timeout,
+                port=notify_port,
+                include_response=include_response,
+                level=log_level,
+            )
+        phases["register_notify"] = await _run_connected_notify_phase(
+            notify_client,
+            PurpleProxyCommand.REGISTER_NOTIFY,
+            timeout=timeout,
+            port=notify_port,
+            include_response=include_response,
+            listen_timeout=listen_timeout,
+            max_messages=max_messages,
+        )
+        if phases["register_notify"].get("reachable") and listen_timeout > 0:
+            notify_messages_task = asyncio.create_task(
+                collect_purple_proxy_notify_messages(
+                    notify_client,
+                    listen_timeout=listen_timeout,
+                    max_messages=max_messages,
+                )
+            )
+    except Exception as e:
+        if log_level is None:
+            phases["set_log_level"] = _purple_proxy_skipped_phase("--log-level was not provided.")
+        else:
+            phases["set_log_level"] = _purple_proxy_unreachable_phase(
+                _purple_proxy_notify_phase_result(
+                    PurpleProxyCommand.SET_LOG_LEVEL,
+                    port=notify_port,
+                    include_response=include_response,
+                    level=log_level,
+                ),
+                e,
+            )
+        phases["register_notify"] = _purple_proxy_unreachable_phase(
+            _purple_proxy_notify_phase_result(
+                PurpleProxyCommand.REGISTER_NOTIFY,
+                port=notify_port,
+                include_response=include_response,
+                listen_timeout=listen_timeout,
+                max_messages=max_messages,
+            ),
+            e,
+        )
+
+    try:
+        control_client = await asyncio.wait_for(
+            PurpleProxyClient.connect_control(
+                udid,
+                connection_type=connection_type,
+                usbmux_address=usbmux_address,
+                port=control_port,
+            ),
+            timeout=timeout,
+        )
+        phases["begin_control"] = await _run_connected_control_phase(
+            control_client,
+            PurpleProxyCommand.BEGIN_CONTROL,
+            timeout=timeout,
+            port=control_port,
+            protocol_version=protocol_version,
+            conn_port=conn_port,
+            include_response=include_response,
+        )
+        phases["ping"] = await _run_connected_control_phase(
+            control_client,
+            PurpleProxyCommand.PING,
+            timeout=timeout,
+            port=control_port,
+            protocol_version=protocol_version,
+            conn_port=conn_port,
+            include_response=include_response,
+        )
+        phases["wait_socket"] = await _run_connected_control_phase(
+            control_client,
+            PurpleProxyCommand.WAIT_SOCKET,
+            timeout=timeout,
+            port=control_port,
+            protocol_version=protocol_version,
+            conn_port=conn_port,
+            include_response=include_response,
+        )
+    except Exception as e:
+        for key, command in (
+            ("begin_control", PurpleProxyCommand.BEGIN_CONTROL),
+            ("ping", PurpleProxyCommand.PING),
+            ("wait_socket", PurpleProxyCommand.WAIT_SOCKET),
+        ):
+            phases[key] = _purple_proxy_unreachable_phase(
+                _purple_proxy_control_phase_result(
+                    command,
+                    port=control_port,
+                    protocol_version=protocol_version,
+                    conn_port=conn_port,
+                    include_response=include_response,
+                ),
+                e,
+            )
+    finally:
+        if notify_messages_task is not None:
+            try:
+                messages = await notify_messages_task
+            except Exception as e:
+                phases["register_notify"]["message_error_type"] = e.__class__.__name__
+            else:
+                _add_notify_messages_to_phase(
+                    phases["register_notify"],
+                    messages,
+                    include_response=include_response,
+                )
+        if control_client is not None:
+            with contextlib.suppress(Exception):
+                await control_client.close()
+        if notify_client is not None:
+            with contextlib.suppress(Exception):
+                await notify_client.close()
+
+    phases["proxy_dictionary"] = build_purple_proxy_dictionary(
+        url=url,
+        host=proxy_host,
+        socks_port=conn_port,
+    )
+
+    return {
+        "checked": True,
+        "experimental": True,
+        "phases": phases,
+        "summary": summarize_purple_proxy_session(phases),
+    }
