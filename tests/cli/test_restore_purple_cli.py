@@ -18,6 +18,7 @@ from pymobiledevice3.restore.purple import (
     build_purple_reverse_proxy_restore_options,
     collect_live_purple_reverse_proxy_probe,
     parse_purple_reverse_proxy_launchd,
+    wait_for_purple_restoreos,
 )
 
 TEST_UUID = bytes.fromhex("00112233445566778899aabbccddeeff")
@@ -1231,11 +1232,104 @@ def test_restore_purple_evidence_help():
 
     assert result.exit_code == 0
     assert "--firmware-root" in result.output
+    assert "--wait-restoreos" in result.output
+    assert "--wait-timeout" in result.output
+    assert "--wait-poll-interval" in result.output
     assert "--include-response" in result.output
     assert "--include-identifiers" in result.output
     assert "--probe-socks" in result.output
     assert "--include-services" in result.output
     assert "--strict" in result.output
+
+
+def test_restore_purple_wait_help():
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-wait", "--help"], env={"COLUMNS": "200"})
+
+    assert result.exit_code == 0
+    assert "--timeout" in result.output
+    assert "--probe-timeout" in result.output
+    assert "--poll-interval" in result.output
+    assert "--firmware-root" in result.output
+    assert "--include-identifiers" in result.output
+    assert "--include-history" in result.output
+
+
+def test_restore_purple_wait_prints_ready_json(tmp_path, monkeypatch):
+    root = _write_purple_launchd_root(tmp_path)
+
+    async def fake_wait_for_purple_restoreos(**kwargs):
+        assert kwargs["udid"] == "sensitive-udid"
+        assert kwargs["timeout"] == 2.0
+        assert kwargs["probe_timeout"] == 0.5
+        assert kwargs["poll_interval"] == 0.2
+        assert kwargs["include_identifiers"] is True
+        assert kwargs["include_history"] is True
+        assert {port["name"]: port["port"] for port in kwargs["ports"]} == {
+            "restore": 62078,
+            "socks": 2081,
+            "ctrl": 2082,
+            "notify": 2084,
+        }
+        return {
+            "checked": True,
+            "ready": True,
+            "expected_mode": "restored",
+            "mode": "restored",
+            "attempt_count": 1,
+            "elapsed": 0.1,
+            "last_probe": {"checked": True, "mode": "restored", "device_count": 1},
+            "reason": "restoreos_reached",
+        }
+
+    monkeypatch.setattr(restore_cli, "wait_for_purple_restoreos", fake_wait_for_purple_restoreos)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "restore",
+            "purple-wait",
+            "--firmware-root",
+            str(root),
+            "--timeout",
+            "2",
+            "--probe-timeout",
+            "0.5",
+            "--poll-interval",
+            "0.2",
+            "--include-identifiers",
+            "--include-history",
+            "--udid",
+            "sensitive-udid",
+        ],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["ready"] is True
+    assert output["port_config"]["ports"]["socks"] == 2081
+
+
+def test_restore_purple_wait_exits_when_not_ready(monkeypatch):
+    async def fake_wait_for_purple_restoreos(**kwargs):
+        return {
+            "checked": True,
+            "ready": False,
+            "expected_mode": "restored",
+            "mode": "normal_lockdown",
+            "attempt_count": 2,
+            "elapsed": 1.0,
+            "last_probe": {"checked": True, "mode": "normal_lockdown", "device_count": 1},
+            "reason": "timeout_waiting_for_restoreos",
+        }
+
+    monkeypatch.setattr(restore_cli, "wait_for_purple_restoreos", fake_wait_for_purple_restoreos)
+
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-wait", "--timeout", "0.5"])
+
+    assert result.exit_code == 1
+    output = json.loads(result.output)
+    assert output["ready"] is False
+    assert output["reason"] == "timeout_waiting_for_restoreos"
 
 
 def test_restore_purple_evidence_collects_raw_output(tmp_path, monkeypatch):
@@ -1332,9 +1426,141 @@ def test_restore_purple_evidence_collects_raw_output(tmp_path, monkeypatch):
     assert "fake-sensitive-serial" in result.output
 
 
+def test_restore_purple_evidence_waits_for_restoreos(tmp_path, monkeypatch):
+    root = _write_purple_launchd_root(tmp_path)
+
+    async def fake_wait_for_purple_restoreos(**kwargs):
+        assert kwargs["udid"] == "sensitive-udid"
+        assert kwargs["timeout"] == 3.0
+        assert kwargs["poll_interval"] == 0.2
+        assert kwargs["probe_timeout"] == 0.5
+        assert kwargs["include_identifiers"] is True
+        assert kwargs["include_history"] is True
+        assert {port["name"]: port["port"] for port in kwargs["ports"]} == {
+            "restore": 62078,
+            "socks": 2081,
+            "ctrl": 2082,
+            "notify": 2084,
+        }
+        return {
+            "checked": True,
+            "ready": True,
+            "expected_mode": "restored",
+            "mode": "restored",
+            "attempt_count": 2,
+            "elapsed": 0.4,
+            "last_probe": {
+                "checked": True,
+                "mode": "restored",
+                "device_count": 1,
+                "devices": [{"index": 0, "mode": "restored", "ports": [{"name": "ctrl", "reachable": True}]}],
+            },
+            "reason": "restoreos_reached",
+        }
+
+    async def fake_run_purple_proxy_session(**kwargs):
+        assert kwargs["control_port"] == 2082
+        assert kwargs["notify_port"] == 2084
+        assert kwargs["conn_port"] == 2081
+        return {
+            "checked": True,
+            "experimental": True,
+            "phases": {
+                "register_notify": {"checked": True, "reachable": True},
+                "begin_control": {"checked": True, "reachable": True},
+                "ping": {"checked": True, "reachable": True, "pong": True},
+                "wait_socket": {"checked": True, "reachable": True},
+                "proxy_dictionary": {"checked": True},
+                "socks_probe": {"checked": True, "summary": {"ok": True}},
+            },
+            "summary": {
+                "control_reachable": True,
+                "ping_pong": True,
+                "wait_socket_reachable": True,
+                "notify_registered": True,
+                "set_log_level_sent": True,
+                "socks_probe_ok": True,
+                "proxy_dictionary_ready": True,
+                "ok": True,
+            },
+        }
+
+    monkeypatch.setattr(restore_cli, "wait_for_purple_restoreos", fake_wait_for_purple_restoreos)
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_session", fake_run_purple_proxy_session)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "restore",
+            "purple-evidence",
+            "--firmware-root",
+            str(root),
+            "--wait-restoreos",
+            "--wait-timeout",
+            "3",
+            "--wait-poll-interval",
+            "0.2",
+            "--include-wait-history",
+            "--timeout",
+            "0.5",
+            "--include-identifiers",
+            "--udid",
+            "sensitive-udid",
+        ],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["wait_restoreos"]["ready"] is True
+    assert output["live_probe"]["mode"] == "restored"
+    assert output["summary"]["ok"] is True
+
+
+def test_restore_purple_evidence_wait_timeout_skips_session(monkeypatch):
+    session_called = False
+
+    async def fake_wait_for_purple_restoreos(**kwargs):
+        return {
+            "checked": True,
+            "ready": False,
+            "expected_mode": "restored",
+            "mode": "normal_lockdown",
+            "attempt_count": 2,
+            "elapsed": 1.0,
+            "last_probe": {
+                "checked": True,
+                "mode": "normal_lockdown",
+                "device_count": 1,
+                "devices": [{"index": 0, "mode": "normal_lockdown", "ports": []}],
+            },
+            "reason": "timeout_waiting_for_restoreos",
+        }
+
+    async def fake_run_purple_proxy_session(**kwargs):
+        nonlocal session_called
+        session_called = True
+        return {}
+
+    monkeypatch.setattr(restore_cli, "wait_for_purple_restoreos", fake_wait_for_purple_restoreos)
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_session", fake_run_purple_proxy_session)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        ["restore", "purple-evidence", "--wait-restoreos", "--wait-timeout", "0.5"],
+    )
+
+    assert result.exit_code == 1
+    output = json.loads(result.output)
+    assert output["wait_restoreos"]["ready"] is False
+    assert output["session"] == {"checked": False, "reason": "RestoreOS was not reached before --wait-timeout."}
+    assert output["summary"]["ok"] is False
+    assert session_called is False
+
+
 def test_restore_purple_session_prints_orchestrated_json(monkeypatch):
     async def fake_collect_live_purple_reverse_proxy_probe(**kwargs):
         assert kwargs == {
+            "udid": "sensitive-udid",
             "usbmux_address": "/tmp/usbmux",
             "timeout": 0.5,
             "include_services": True,
@@ -1657,3 +1883,47 @@ async def test_collect_live_purple_reverse_proxy_probe_can_include_identifiers(m
         "connection_type": "USB",
     }
     assert "fake-sensitive-serial" in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_purple_restoreos_polls_until_restored(monkeypatch):
+    probes = [
+        {
+            "checked": True,
+            "mode": "normal_lockdown",
+            "device_count": 1,
+            "devices": [{"index": 0, "mode": "normal_lockdown"}],
+        },
+        {
+            "checked": True,
+            "mode": "restored",
+            "device_count": 1,
+            "devices": [{"index": 0, "mode": "restored"}],
+        },
+    ]
+
+    async def fake_collect_live_purple_reverse_proxy_probe(**kwargs):
+        assert kwargs["udid"] == "fake-sensitive-serial"
+        return probes.pop(0)
+
+    async def fake_sleep(delay):
+        assert delay == 0.1
+
+    from pymobiledevice3.restore import purple
+
+    monkeypatch.setattr(purple, "collect_live_purple_reverse_proxy_probe", fake_collect_live_purple_reverse_proxy_probe)
+    monkeypatch.setattr(purple.asyncio, "sleep", fake_sleep)
+
+    result = await wait_for_purple_restoreos(
+        udid="fake-sensitive-serial",
+        timeout=5.0,
+        poll_interval=0.1,
+        probe_timeout=0.2,
+        include_history=True,
+    )
+
+    assert result["ready"] is True
+    assert result["reason"] == "restoreos_reached"
+    assert result["attempt_count"] == 2
+    assert result["history"][0]["mode"] == "normal_lockdown"
+    assert result["last_probe"]["mode"] == "restored"

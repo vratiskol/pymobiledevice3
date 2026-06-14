@@ -41,6 +41,7 @@ from pymobiledevice3.restore.purple import (
     build_purple_reverse_proxy_restore_options,
     collect_live_purple_reverse_proxy_probe,
     collect_live_purple_reverse_proxy_status,
+    wait_for_purple_restoreos,
 )
 from pymobiledevice3.restore.purple_proxy import (
     PURPLE_PROXY_CONTROL_PORT,
@@ -989,6 +990,7 @@ def _purple_session_reachable_ports(probe: dict[str, Any]) -> list[str]:
 
 def _purple_probe_kwargs(
     *,
+    udid: Optional[str] = None,
     usbmux_address: Optional[str],
     timeout: float,
     include_services: bool,
@@ -1000,11 +1002,112 @@ def _purple_probe_kwargs(
         "timeout": timeout,
         "include_services": include_services,
     }
+    if udid is not None:
+        probe_kwargs["udid"] = udid
     if port_config is not None:
         probe_kwargs["ports"] = port_config["probe_ports"]
     if include_identifiers:
         probe_kwargs["include_identifiers"] = True
     return probe_kwargs
+
+
+def _purple_wait_kwargs(
+    *,
+    udid: Optional[str],
+    usbmux_address: Optional[str],
+    timeout: float,
+    poll_interval: float,
+    probe_timeout: float,
+    include_services: bool,
+    port_config: Optional[dict[str, Any]],
+    include_identifiers: bool = False,
+    include_history: bool = False,
+) -> dict[str, Any]:
+    wait_kwargs = {
+        "udid": udid,
+        "usbmux_address": usbmux_address,
+        "timeout": timeout,
+        "poll_interval": poll_interval,
+        "probe_timeout": probe_timeout,
+        "include_services": include_services,
+        "include_identifiers": include_identifiers,
+        "include_history": include_history,
+    }
+    if port_config is not None:
+        wait_kwargs["ports"] = port_config["probe_ports"]
+    return wait_kwargs
+
+
+@cli.command("purple-wait")
+@async_command
+async def restore_purple_wait(
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", min=0.1, help="Maximum seconds to wait for a matching USB device in RestoreOS."),
+    ] = 180.0,
+    probe_timeout: Annotated[
+        float,
+        typer.Option("--probe-timeout", min=0.1, help="Per-connection timeout for each readiness probe."),
+    ] = 1.0,
+    poll_interval: Annotated[
+        float,
+        typer.Option("--poll-interval", min=0.1, help="Seconds between readiness probes."),
+    ] = 1.0,
+    firmware_root: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--firmware-root",
+            help="Read PurpleReverseProxy socket ports from an extracted RestoreOS ramdisk root.",
+        ),
+    ] = None,
+    include_services: Annotated[
+        bool,
+        typer.Option(
+            "--include-services",
+            help="Also try starting PurpleReverseProxy lockdown service names when lockdownd is reachable.",
+        ),
+    ] = False,
+    include_identifiers: Annotated[
+        bool,
+        typer.Option(
+            "--include-identifiers",
+            help="Include raw usbmux identifiers in the last readiness probe.",
+        ),
+    ] = False,
+    include_history: Annotated[
+        bool,
+        typer.Option("--include-history", help="Include one compact mode snapshot for each readiness attempt."),
+    ] = False,
+    udid: Annotated[
+        Optional[str],
+        typer.Option("--udid", "--serial", help="Target device serial/UDID."),
+    ] = None,
+    usbmux_address: Annotated[
+        Optional[str],
+        typer.Option("--usbmux-address", help="Address of the usbmuxd daemon (unix socket path or HOST:PORT)."),
+    ] = None,
+) -> None:
+    """
+    Wait until a USB device is visible in RestoreOS/restored mode.
+    """
+    port_config = _purple_port_config(firmware_root)
+    result = await wait_for_purple_restoreos(
+        **_purple_wait_kwargs(
+            udid=udid,
+            usbmux_address=usbmux_address,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            probe_timeout=probe_timeout,
+            include_services=include_services,
+            port_config=port_config,
+            include_identifiers=include_identifiers,
+            include_history=include_history,
+        )
+    )
+    _annotate_port_config(result, port_config)
+    print_json(result, colored=False)
+    if not result["ready"]:
+        raise typer.Exit(1)
 
 
 @cli.command("purple-session")
@@ -1119,6 +1222,7 @@ async def restore_purple_session(
     effective_conn_port = _purple_configured_port(port_config, "socks", conn_port, PURPLE_PROXY_SOCKS_PORT)
     probe = await collect_live_purple_reverse_proxy_probe(
         **_purple_probe_kwargs(
+            udid=udid,
             usbmux_address=usbmux_address,
             timeout=timeout,
             include_services=include_services,
@@ -1171,6 +1275,24 @@ async def restore_purple_evidence(
             help="Read PurpleReverseProxy socket ports from an extracted RestoreOS ramdisk root.",
         ),
     ] = None,
+    wait_restoreos: Annotated[
+        bool,
+        typer.Option("--wait-restoreos", help="Wait for a matching USB device to enter RestoreOS before collection."),
+    ] = False,
+    wait_timeout: Annotated[
+        float,
+        typer.Option("--wait-timeout", min=0.1, help="Maximum seconds to wait when --wait-restoreos is used."),
+    ] = 180.0,
+    wait_poll_interval: Annotated[
+        float,
+        typer.Option("--wait-poll-interval", min=0.1, help="Seconds between probes when --wait-restoreos is used."),
+    ] = 1.0,
+    include_wait_history: Annotated[
+        bool,
+        typer.Option(
+            "--include-wait-history", help="Include compact readiness snapshots when --wait-restoreos is used."
+        ),
+    ] = False,
     control_port: Annotated[
         int,
         typer.Option("--control-port", min=1, max=0xFFFF, help="Device-side PurpleReverseProxy control port."),
@@ -1275,15 +1397,63 @@ async def restore_purple_evidence(
         PURPLE_PROXY_NOTIFY_PORT,
     )
     effective_conn_port = _purple_configured_port(port_config, "socks", conn_port, PURPLE_PROXY_SOCKS_PORT)
-    live_probe = await collect_live_purple_reverse_proxy_probe(
-        **_purple_probe_kwargs(
-            usbmux_address=usbmux_address,
-            timeout=timeout,
-            include_services=include_services,
-            port_config=port_config,
-            include_identifiers=include_identifiers,
+    wait_result = None
+    if wait_restoreos:
+        wait_result = await wait_for_purple_restoreos(
+            **_purple_wait_kwargs(
+                udid=udid,
+                usbmux_address=usbmux_address,
+                timeout=wait_timeout,
+                poll_interval=wait_poll_interval,
+                probe_timeout=timeout,
+                include_services=include_services,
+                port_config=port_config,
+                include_identifiers=include_identifiers,
+                include_history=include_wait_history,
+            )
         )
-    )
+        live_probe = wait_result["last_probe"]
+        if not wait_result["ready"]:
+            result = {
+                "checked": True,
+                "experimental": True,
+                "command": "purple-evidence",
+                "include_response": include_response,
+                "include_identifiers": include_identifiers,
+                "wait_restoreos": wait_result,
+                "live_probe": live_probe,
+                "session": {
+                    "checked": False,
+                    "reason": "RestoreOS was not reached before --wait-timeout.",
+                },
+                "summary": {
+                    "probe_mode": live_probe.get("mode"),
+                    "probe_device_count": live_probe.get("device_count", 0),
+                    "probe_reachable_ports": _purple_session_reachable_ports(live_probe),
+                    "session_ok": False,
+                    "socks_probe_ok": None,
+                    "contains_raw_identifiers": include_identifiers,
+                    "ok": False,
+                },
+            }
+            _annotate_port_config(result, port_config)
+            if include_identifiers:
+                result["identifier_warning"] = (
+                    "Output contains raw device identifiers and unsanitized response dictionaries."
+                )
+            print_json(result, colored=False)
+            raise typer.Exit(1)
+    else:
+        live_probe = await collect_live_purple_reverse_proxy_probe(
+            **_purple_probe_kwargs(
+                udid=udid,
+                usbmux_address=usbmux_address,
+                timeout=timeout,
+                include_services=include_services,
+                port_config=port_config,
+                include_identifiers=include_identifiers,
+            )
+        )
     session = await run_purple_proxy_session(
         udid=udid,
         usbmux_address=usbmux_address,
@@ -1321,6 +1491,8 @@ async def restore_purple_evidence(
             "ok": session["summary"]["ok"],
         },
     }
+    if wait_result is not None:
+        result["wait_restoreos"] = wait_result
     _annotate_port_config(result, port_config)
     if include_identifiers:
         result["identifier_warning"] = "Output contains raw device identifiers and unsanitized response dictionaries."

@@ -867,6 +867,7 @@ def _mode_from_query_type(query_type: dict[str, Any]) -> str:
 
 async def collect_live_purple_reverse_proxy_probe(
     *,
+    udid: Optional[str] = None,
     usbmux_address: Optional[str] = None,
     timeout: float = 1.0,
     include_services: bool = False,
@@ -897,12 +898,19 @@ async def collect_live_purple_reverse_proxy_probe(
             "reason": f"usbmuxd_error:{e.__class__.__name__}",
         }
 
+    if udid is not None:
+        devices = [device for device in devices if device.matches_udid(udid)]
+
     if not devices:
         return {
             "checked": True,
             "mode": "no_usb_device",
             "device_count": 0,
-            "reason": "No USB device is visible through usbmux.",
+            "reason": (
+                "No matching USB device is visible through usbmux."
+                if udid is not None
+                else "No USB device is visible through usbmux."
+            ),
         }
 
     probe_ports = ports or PURPLE_REVERSE_PROXY_PORTS
@@ -927,7 +935,7 @@ async def collect_live_purple_reverse_proxy_probe(
         }
         if include_identifiers:
             device_result["identifiers"] = {
-                "device_id": getattr(device, "device_id", None),
+                "device_id": getattr(device, "devid", getattr(device, "device_id", None)),
                 "serial": device.serial,
                 "connection_type": device.connection_type,
             }
@@ -955,6 +963,99 @@ async def collect_live_purple_reverse_proxy_probe(
         "ports": probe_ports,
         "devices": probed_devices,
     }
+
+
+def _purple_probe_has_restored_device(probe: dict[str, Any]) -> bool:
+    return any(device.get("mode") == "restored" for device in probe.get("devices", []))
+
+
+def _purple_probe_wait_snapshot(attempt: int, elapsed: float, probe: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "attempt": attempt,
+        "elapsed": round(elapsed, 3),
+        "mode": probe.get("mode"),
+        "device_count": probe.get("device_count", 0),
+        "restored": _purple_probe_has_restored_device(probe),
+    }
+
+
+async def wait_for_purple_restoreos(
+    *,
+    udid: Optional[str] = None,
+    usbmux_address: Optional[str] = None,
+    timeout: float = 180.0,
+    poll_interval: float = 1.0,
+    probe_timeout: float = 1.0,
+    include_services: bool = False,
+    ports: Optional[list[dict[str, Any]]] = None,
+    include_identifiers: bool = False,
+    include_history: bool = False,
+) -> dict[str, Any]:
+    """
+    Poll usbmux until at least one matching USB device reports RestoreOS/restored.
+    """
+    start = asyncio.get_running_loop().time()
+    deadline = start + timeout
+    attempt_count = 0
+    last_probe: dict[str, Any] = {
+        "checked": False,
+        "reason": "No probe was attempted.",
+    }
+    history: list[dict[str, Any]] = []
+
+    while True:
+        attempt_count += 1
+        last_probe = await collect_live_purple_reverse_proxy_probe(
+            udid=udid,
+            usbmux_address=usbmux_address,
+            timeout=probe_timeout,
+            include_services=include_services,
+            ports=ports,
+            include_identifiers=include_identifiers,
+        )
+        elapsed = asyncio.get_running_loop().time() - start
+        snapshot = _purple_probe_wait_snapshot(attempt_count, elapsed, last_probe)
+        if include_history:
+            history.append(snapshot)
+        if snapshot["restored"]:
+            result = {
+                "checked": True,
+                "ready": True,
+                "expected_mode": "restored",
+                "mode": last_probe.get("mode"),
+                "attempt_count": attempt_count,
+                "elapsed": round(elapsed, 3),
+                "timeout": timeout,
+                "poll_interval": poll_interval,
+                "probe_timeout": probe_timeout,
+                "last_probe": last_probe,
+                "reason": "restoreos_reached",
+            }
+            if include_history:
+                result["history"] = history
+            return result
+
+        now = asyncio.get_running_loop().time()
+        if now >= deadline:
+            elapsed = now - start
+            result = {
+                "checked": True,
+                "ready": False,
+                "expected_mode": "restored",
+                "mode": last_probe.get("mode"),
+                "attempt_count": attempt_count,
+                "elapsed": round(elapsed, 3),
+                "timeout": timeout,
+                "poll_interval": poll_interval,
+                "probe_timeout": probe_timeout,
+                "last_probe": last_probe,
+                "reason": "timeout_waiting_for_restoreos",
+            }
+            if include_history:
+                result["history"] = history
+            return result
+
+        await asyncio.sleep(min(poll_interval, max(0.0, deadline - now)))
 
 
 def build_purple_reverse_proxy_info(firmware_root: Optional[Path] = None, deep: bool = False) -> dict[str, Any]:
