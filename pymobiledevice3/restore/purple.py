@@ -32,6 +32,7 @@ PURPLE_REVERSE_PROXY_PORTS = [
     {"name": "ctrl", "port": 1082, "purpose": "PurpleReverseProxy control socket"},
     {"name": "notify", "port": 1084, "purpose": "PurpleReverseProxy notify socket"},
 ]
+PURPLE_REVERSE_PROXY_PORT_PURPOSES = {port["name"]: port["purpose"] for port in PURPLE_REVERSE_PROXY_PORTS}
 PURPLE_REVERSE_PROXY_RELATED_FILES = {
     "purple_reverse_proxy": PURPLE_REVERSE_PROXY_EXECUTABLE_PATH,
     "device_library": PURPLE_REVERSE_PROXY_DEVICE_LIBRARY_PATH,
@@ -322,6 +323,7 @@ def build_purple_reverse_proxy_capabilities(
         "checked": True,
         "experimental": True,
         "firmware": info,
+        "port_config": build_purple_reverse_proxy_port_config(firmware_root),
         "capabilities": capabilities,
         "summary": {
             "capability_count": len(capabilities),
@@ -528,6 +530,73 @@ def parse_purple_reverse_proxy_launchd(plist_path: Path) -> dict[str, Any]:
         "standard_error_path": plist.get("StandardErrorPath"),
         "standard_out_path": plist.get("StandardOutPath"),
         "sockets": sockets,
+    }
+
+
+def _parse_launchd_port(value: Any) -> Optional[int]:
+    try:
+        port = int(str(value), 10)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= port <= 0xFFFF:
+        return None
+    return port
+
+
+def _purple_reverse_proxy_default_ports() -> dict[str, int]:
+    return {port["name"]: int(port["port"]) for port in PURPLE_REVERSE_PROXY_PORTS}
+
+
+def _purple_reverse_proxy_port_list(port_map: dict[str, int]) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": name,
+            "port": port_map[name],
+            "purpose": PURPLE_REVERSE_PROXY_PORT_PURPOSES[name],
+        }
+        for name in ("restore", "socks", "ctrl", "notify")
+    ]
+
+
+def build_purple_reverse_proxy_port_config(firmware_root: Optional[Path] = None) -> dict[str, Any]:
+    port_map = _purple_reverse_proxy_default_ports()
+    sources = dict.fromkeys(port_map, "default")
+    evidence: dict[str, Any] = {}
+    warnings = []
+    source = "defaults"
+
+    if firmware_root is not None:
+        source = "firmware_root"
+        launchd_path = firmware_root.expanduser() / PURPLE_REVERSE_PROXY_LAUNCHD_PATH
+        if launchd_path.is_file():
+            launchd = parse_purple_reverse_proxy_launchd(launchd_path)
+            for name in ("socks", "ctrl", "notify"):
+                socket_config = launchd.get("sockets", {}).get(name)
+                if not isinstance(socket_config, dict):
+                    warnings.append(f"missing_socket:{name}")
+                    continue
+                raw_port = socket_config.get("SockServiceName")
+                port = _parse_launchd_port(raw_port)
+                if port is None:
+                    warnings.append(f"invalid_sock_service_name:{name}")
+                    continue
+                port_map[name] = port
+                sources[name] = "firmware_root"
+                evidence[name] = {
+                    "launchd_socket": name,
+                    "SockServiceName": str(raw_port),
+                }
+        else:
+            warnings.append("launchd_plist_missing")
+
+    return {
+        "checked": True,
+        "source": source,
+        "ports": port_map,
+        "sources": sources,
+        "probe_ports": _purple_reverse_proxy_port_list(port_map),
+        "evidence": evidence,
+        "warnings": warnings,
     }
 
 
@@ -801,6 +870,7 @@ async def collect_live_purple_reverse_proxy_probe(
     usbmux_address: Optional[str] = None,
     timeout: float = 1.0,
     include_services: bool = False,
+    ports: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """
     Probe PurpleReverseProxy-related RestoreOS ports through usbmuxd.
@@ -833,11 +903,12 @@ async def collect_live_purple_reverse_proxy_probe(
             "reason": "No USB device is visible through usbmux.",
         }
 
+    probe_ports = ports or PURPLE_REVERSE_PROXY_PORTS
     probed_devices = []
     for index, device in enumerate(devices):
         query_type = await _query_usbmux_type(device, timeout=timeout, usbmux_address=usbmux_address)
         ports = []
-        for port_info in PURPLE_REVERSE_PROXY_PORTS:
+        for port_info in probe_ports:
             port_probe = await _probe_usbmux_port(
                 device,
                 port_info["port"],
@@ -872,7 +943,7 @@ async def collect_live_purple_reverse_proxy_probe(
         "checked": True,
         "mode": mode,
         "device_count": len(probed_devices),
-        "ports": PURPLE_REVERSE_PROXY_PORTS,
+        "ports": probe_ports,
         "devices": probed_devices,
     }
 

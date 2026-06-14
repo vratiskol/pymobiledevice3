@@ -37,6 +37,7 @@ from pymobiledevice3.restore.device import Device
 from pymobiledevice3.restore.purple import (
     build_purple_reverse_proxy_capabilities,
     build_purple_reverse_proxy_info,
+    build_purple_reverse_proxy_port_config,
     build_purple_reverse_proxy_restore_options,
     collect_live_purple_reverse_proxy_probe,
     collect_live_purple_reverse_proxy_status,
@@ -574,6 +575,28 @@ async def restore_purple_capabilities(
     print_json(result, colored=False)
 
 
+def _purple_port_config(firmware_root: Optional[Path]) -> Optional[dict[str, Any]]:
+    if firmware_root is None:
+        return None
+    return build_purple_reverse_proxy_port_config(firmware_root)
+
+
+def _purple_configured_port(
+    port_config: Optional[dict[str, Any]],
+    name: str,
+    cli_value: int,
+    default_value: int,
+) -> int:
+    if port_config is not None and cli_value == default_value:
+        return port_config["ports"][name]
+    return cli_value
+
+
+def _annotate_port_config(result: dict[str, Any], port_config: Optional[dict[str, Any]]) -> None:
+    if port_config is not None:
+        result["port_config"] = port_config
+
+
 @cli.command("purple-probe")
 @async_command
 async def restore_purple_probe(
@@ -581,6 +604,13 @@ async def restore_purple_probe(
         float,
         typer.Option("--timeout", min=0.1, help="Per-connection timeout for usbmux port and QueryType probes."),
     ] = 1.0,
+    firmware_root: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--firmware-root",
+            help="Read PurpleReverseProxy socket ports from an extracted RestoreOS ramdisk root.",
+        ),
+    ] = None,
     include_services: Annotated[
         bool,
         typer.Option(
@@ -596,13 +626,17 @@ async def restore_purple_probe(
     """
     Probe PurpleReverseProxy RestoreOS ports through usbmux without restoring a device.
     """
-    print_json(
-        await collect_live_purple_reverse_proxy_probe(
-            usbmux_address=usbmux_address,
-            timeout=timeout,
-            include_services=include_services,
-        )
-    )
+    port_config = _purple_port_config(firmware_root)
+    probe_kwargs = {
+        "usbmux_address": usbmux_address,
+        "timeout": timeout,
+        "include_services": include_services,
+    }
+    if port_config is not None:
+        probe_kwargs["ports"] = port_config["probe_ports"]
+    result = await collect_live_purple_reverse_proxy_probe(**probe_kwargs)
+    _annotate_port_config(result, port_config)
+    print_json(result, colored=False)
 
 
 @cli.command("purple-control")
@@ -647,6 +681,13 @@ async def restore_purple_control(
         bool,
         typer.Option("--include-response", help="Include the sanitized response dictionary in JSON output."),
     ] = False,
+    firmware_root: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--firmware-root",
+            help="Read PurpleReverseProxy control and SOCKS ports from an extracted RestoreOS ramdisk root.",
+        ),
+    ] = None,
     strict: Annotated[
         bool,
         typer.Option("--strict", help="Exit non-zero when the control operation is not reachable."),
@@ -676,16 +717,20 @@ async def restore_purple_control(
     else:
         command = PurpleProxyCommand.PING
 
+    port_config = _purple_port_config(firmware_root)
+    effective_port = _purple_configured_port(port_config, "ctrl", port, PURPLE_PROXY_CONTROL_PORT)
+    effective_conn_port = _purple_configured_port(port_config, "socks", conn_port, PURPLE_PROXY_SOCKS_PORT)
     result = await run_purple_proxy_control_command(
         command,
         udid=udid,
         usbmux_address=usbmux_address,
         timeout=timeout,
-        port=port,
+        port=effective_port,
         protocol_version=protocol_version,
-        conn_port=conn_port,
+        conn_port=effective_conn_port,
         include_response=include_response,
     )
+    _annotate_port_config(result, port_config)
     print_json(result, colored=False)
     if strict and (not result["reachable"] or (command is PurpleProxyCommand.PING and not result.get("pong"))):
         raise typer.Exit(1)
@@ -726,6 +771,13 @@ async def restore_purple_proxy_dict(
         bool,
         typer.Option("--include-response", help="Include the sanitized Ping response dictionary in JSON output."),
     ] = False,
+    firmware_root: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--firmware-root",
+            help="Read PurpleReverseProxy SOCKS and control ports from an extracted RestoreOS ramdisk root.",
+        ),
+    ] = None,
     strict: Annotated[
         bool,
         typer.Option("--strict", help="Exit non-zero when --ping is used and Ping is not reachable or not Pong."),
@@ -742,10 +794,13 @@ async def restore_purple_proxy_dict(
     """
     Model libReverseProxyDevice CopyProxyDictionaryWithOptions output for PurpleReverseProxy.
     """
+    port_config = _purple_port_config(firmware_root)
+    effective_socks_port = _purple_configured_port(port_config, "socks", socks_port, PURPLE_PROXY_SOCKS_PORT)
+    effective_control_port = _purple_configured_port(port_config, "ctrl", control_port, PURPLE_PROXY_CONTROL_PORT)
     result = build_purple_proxy_dictionary(
         url=url,
         host=proxy_host,
-        socks_port=socks_port,
+        socks_port=effective_socks_port,
         test_reachability=not no_test_reachability,
     )
     if ping:
@@ -754,9 +809,10 @@ async def restore_purple_proxy_dict(
             udid=udid,
             usbmux_address=usbmux_address,
             timeout=timeout,
-            port=control_port,
+            port=effective_control_port,
             include_response=include_response,
         )
+    _annotate_port_config(result, port_config)
     print_json(result, colored=False)
     if strict and ping and (not result["ping"]["reachable"] or not result["ping"].get("pong")):
         raise typer.Exit(1)
@@ -788,6 +844,13 @@ async def restore_purple_socks_probe(
         bool,
         typer.Option("--include-response", help="Include raw SOCKS response bytes as hex in JSON output."),
     ] = False,
+    firmware_root: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--firmware-root",
+            help="Read PurpleReverseProxy SOCKS port from an extracted RestoreOS ramdisk root.",
+        ),
+    ] = None,
     strict: Annotated[
         bool,
         typer.Option("--strict", help="Exit non-zero when the SOCKS probe summary is not ok."),
@@ -804,18 +867,21 @@ async def restore_purple_socks_probe(
     """
     Probe the PurpleReverseProxy SOCKS data plane without restoring a device.
     """
+    port_config = _purple_port_config(firmware_root)
+    effective_port = _purple_configured_port(port_config, "socks", port, PURPLE_PROXY_SOCKS_PORT)
     try:
         result = await run_purple_proxy_socks_probe(
             udid=udid,
             usbmux_address=usbmux_address,
             timeout=timeout,
-            port=port,
+            port=effective_port,
             connect_host=connect_host,
             connect_port=connect_port,
             include_response=include_response,
         )
     except ValueError as e:
         raise click.ClickException(str(e)) from None
+    _annotate_port_config(result, port_config)
     print_json(result, colored=False)
     if strict and not result["summary"]["ok"]:
         raise typer.Exit(1)
@@ -860,6 +926,13 @@ async def restore_purple_notify(
         int,
         typer.Option("--max-messages", min=1, help="Maximum notify dictionaries to collect when listening."),
     ] = 8,
+    firmware_root: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--firmware-root",
+            help="Read PurpleReverseProxy notify port from an extracted RestoreOS ramdisk root.",
+        ),
+    ] = None,
     strict: Annotated[
         bool,
         typer.Option("--strict", help="Exit non-zero when the notify operation is not reachable."),
@@ -881,18 +954,21 @@ async def restore_purple_notify(
         raise click.ClickException("Choose exactly one notify operation: --register or --set-log-level.")
 
     command = PurpleProxyCommand.REGISTER_NOTIFY if register else PurpleProxyCommand.SET_LOG_LEVEL
+    port_config = _purple_port_config(firmware_root)
+    effective_port = _purple_configured_port(port_config, "notify", port, PURPLE_PROXY_NOTIFY_PORT)
     result = await run_purple_proxy_notify_command(
         command,
         level=set_log_level,
         udid=udid,
         usbmux_address=usbmux_address,
         timeout=timeout,
-        port=port,
+        port=effective_port,
         include_response=include_response,
         expect_response=expect_response,
         listen_timeout=listen_timeout,
         max_messages=max_messages,
     )
+    _annotate_port_config(result, port_config)
     print_json(result, colored=False)
     if strict and not result["reachable"]:
         raise typer.Exit(1)
@@ -973,6 +1049,13 @@ async def restore_purple_session(
         int,
         typer.Option("--socks-connect-port", min=1, max=0xFFFF, help="Port for the optional session SOCKS CONNECT."),
     ] = 443,
+    firmware_root: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--firmware-root",
+            help="Read PurpleReverseProxy socket ports from an extracted RestoreOS ramdisk root.",
+        ),
+    ] = None,
     include_services: Annotated[
         bool,
         typer.Option(
@@ -996,19 +1079,36 @@ async def restore_purple_session(
     """
     Run the PurpleReverseProxy restore-session probe sequence.
     """
-    probe = await collect_live_purple_reverse_proxy_probe(
-        usbmux_address=usbmux_address,
-        timeout=timeout,
-        include_services=include_services,
+    port_config = _purple_port_config(firmware_root)
+    effective_control_port = _purple_configured_port(
+        port_config,
+        "ctrl",
+        control_port,
+        PURPLE_PROXY_CONTROL_PORT,
     )
+    effective_notify_port = _purple_configured_port(
+        port_config,
+        "notify",
+        notify_port,
+        PURPLE_PROXY_NOTIFY_PORT,
+    )
+    effective_conn_port = _purple_configured_port(port_config, "socks", conn_port, PURPLE_PROXY_SOCKS_PORT)
+    probe_kwargs = {
+        "usbmux_address": usbmux_address,
+        "timeout": timeout,
+        "include_services": include_services,
+    }
+    if port_config is not None:
+        probe_kwargs["ports"] = port_config["probe_ports"]
+    probe = await collect_live_purple_reverse_proxy_probe(**probe_kwargs)
     result = await run_purple_proxy_session(
         udid=udid,
         usbmux_address=usbmux_address,
         timeout=timeout,
-        control_port=control_port,
-        notify_port=notify_port,
+        control_port=effective_control_port,
+        notify_port=effective_notify_port,
         protocol_version=protocol_version,
-        conn_port=conn_port,
+        conn_port=effective_conn_port,
         log_level=log_level,
         url=url,
         proxy_host=proxy_host,
@@ -1019,6 +1119,7 @@ async def restore_purple_session(
         socks_connect_host=socks_connect_host,
         socks_connect_port=socks_connect_port,
     )
+    _annotate_port_config(result, port_config)
     result["phases"] = {
         "probe": probe,
         **result["phases"],

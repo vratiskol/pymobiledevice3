@@ -14,6 +14,7 @@ from pymobiledevice3.restore.purple import (
     apply_purple_reverse_proxy_restore_options,
     build_purple_reverse_proxy_capabilities,
     build_purple_reverse_proxy_info,
+    build_purple_reverse_proxy_port_config,
     build_purple_reverse_proxy_restore_options,
     collect_live_purple_reverse_proxy_probe,
     parse_purple_reverse_proxy_launchd,
@@ -42,6 +43,25 @@ class FakeService:
 
     async def close(self):
         self.closed = True
+
+
+def _write_purple_launchd_root(tmp_path, *, socks=2081, ctrl=2082, notify=2084):
+    launchd_path = tmp_path / PURPLE_REVERSE_PROXY_LAUNCHD_PATH
+    launchd_path.parent.mkdir(parents=True, exist_ok=True)
+    with launchd_path.open("wb") as plist_file:
+        plistlib.dump(
+            {
+                "Label": "com.apple.PurpleReverseProxy.ramdisk",
+                "ProgramArguments": ["/usr/libexec/PurpleReverseProxy", "--ramdisk"],
+                "Sockets": {
+                    "ctrl": {"SockServiceName": str(ctrl)},
+                    "notify": {"SockServiceName": str(notify)},
+                    "socks": {"SockServiceName": str(socks)},
+                },
+            },
+            plist_file,
+        )
+    return tmp_path
 
 
 def _macho64_with_uuid(uuid: bytes, payload: bytes = b"") -> bytes:
@@ -115,6 +135,28 @@ def test_parse_purple_reverse_proxy_launchd(tmp_path):
     assert parsed["sockets"]["ctrl"]["SockServiceName"] == "1082"
     assert parsed["sockets"]["notify"]["SockNodeName"] == "127.0.0.1"
     assert parsed["sockets"]["socks"]["SockServiceName"] == "1081"
+
+
+def test_build_purple_reverse_proxy_port_config_from_firmware_root(tmp_path):
+    root = _write_purple_launchd_root(tmp_path, socks=2081, ctrl=2082, notify=2084)
+
+    config = build_purple_reverse_proxy_port_config(root)
+
+    assert config["source"] == "firmware_root"
+    assert config["ports"] == {
+        "restore": 62078,
+        "socks": 2081,
+        "ctrl": 2082,
+        "notify": 2084,
+    }
+    assert config["sources"] == {
+        "restore": "default",
+        "socks": "firmware_root",
+        "ctrl": "firmware_root",
+        "notify": "firmware_root",
+    }
+    assert {port["name"]: port["port"] for port in config["probe_ports"]} == config["ports"]
+    assert config["warnings"] == []
 
 
 def test_build_purple_reverse_proxy_info_from_firmware_root(tmp_path):
@@ -219,6 +261,12 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
     capabilities_by_name = {capability["name"]: capability for capability in capabilities["capabilities"]}
     assert capabilities["summary"]["capability_count"] == 8
     assert capabilities["summary"]["firmware_verified_count"] == 6
+    assert capabilities["port_config"]["ports"] == {
+        "restore": 62078,
+        "socks": 1081,
+        "ctrl": 1082,
+        "notify": 1084,
+    }
     assert capabilities_by_name["restoreos_ramdisk_service"]["status"] == "firmware_verified"
     assert capabilities_by_name["restore_options"]["status"] == "firmware_verified"
     assert capabilities_by_name["control_protocol"]["status"] == "firmware_verified"
@@ -361,8 +409,52 @@ def test_restore_purple_probe_help():
 
     assert result.exit_code == 0
     assert "--timeout" in result.output
+    assert "--firmware-root" in result.output
     assert "--include-services" in result.output
     assert "--usbmux-address" in result.output
+
+
+def test_restore_purple_probe_uses_firmware_ports(tmp_path, monkeypatch):
+    root = _write_purple_launchd_root(tmp_path)
+
+    async def fake_collect_live_purple_reverse_proxy_probe(**kwargs):
+        assert kwargs["timeout"] == 0.5
+        assert kwargs["include_services"] is True
+        assert {port["name"]: port["port"] for port in kwargs["ports"]} == {
+            "restore": 62078,
+            "socks": 2081,
+            "ctrl": 2082,
+            "notify": 2084,
+        }
+        return {
+            "checked": True,
+            "mode": "no_usb_device",
+            "device_count": 0,
+            "ports": kwargs["ports"],
+        }
+
+    monkeypatch.setattr(
+        restore_cli, "collect_live_purple_reverse_proxy_probe", fake_collect_live_purple_reverse_proxy_probe
+    )
+
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "restore",
+            "purple-probe",
+            "--firmware-root",
+            str(root),
+            "--timeout",
+            "0.5",
+            "--include-services",
+        ],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["port_config"]["ports"]["socks"] == 2081
+    assert output["port_config"]["ports"]["ctrl"] == 2082
+    assert output["port_config"]["ports"]["notify"] == 2084
 
 
 def test_restore_purple_control_help():
@@ -376,6 +468,7 @@ def test_restore_purple_control_help():
     assert "--timeout" in result.output
     assert "--conn-port" in result.output
     assert "--include-response" in result.output
+    assert "--firmware-root" in result.output
     assert "--strict" in result.output
 
 
@@ -488,6 +581,36 @@ def test_restore_purple_control_wait_socket_prints_json(monkeypatch):
     assert output["reachable"] is True
 
 
+def test_restore_purple_control_uses_firmware_ports(tmp_path, monkeypatch):
+    root = _write_purple_launchd_root(tmp_path)
+
+    async def fake_run_purple_proxy_control_command(command, **kwargs):
+        assert command.value == "WaitSocket"
+        assert kwargs["port"] == 2082
+        assert kwargs["conn_port"] == 2081
+        return {
+            "checked": True,
+            "experimental": True,
+            "command": "WaitSocket",
+            "conn_port": kwargs["conn_port"],
+            "port": kwargs["port"],
+            "reachable": True,
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_control_command", fake_run_purple_proxy_control_command)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        ["restore", "purple-control", "--wait-socket", "--firmware-root", str(root)],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["port"] == 2082
+    assert output["conn_port"] == 2081
+    assert output["port_config"]["ports"]["ctrl"] == 2082
+
+
 def test_restore_purple_control_ping_prints_json(monkeypatch):
     async def fake_run_purple_proxy_control_command(command, **kwargs):
         assert command.value == "Ping"
@@ -554,6 +677,7 @@ def test_restore_purple_proxy_dict_help():
     assert "--proxy-host" in result.output
     assert "--no-test-reachability" in result.output
     assert "--ping" in result.output
+    assert "--firmware-root" in result.output
 
 
 def test_restore_purple_proxy_dict_prints_model_json():
@@ -633,6 +757,36 @@ def test_restore_purple_proxy_dict_ping_prints_redacted_json(monkeypatch):
     assert "sensitive-udid" not in result.output
 
 
+def test_restore_purple_proxy_dict_uses_firmware_ports(tmp_path, monkeypatch):
+    root = _write_purple_launchd_root(tmp_path)
+
+    async def fake_run_purple_proxy_control_command(command, **kwargs):
+        assert command.value == "Ping"
+        assert kwargs["port"] == 2082
+        return {
+            "checked": True,
+            "experimental": True,
+            "command": "Ping",
+            "port": kwargs["port"],
+            "reachable": True,
+            "pong": True,
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_control_command", fake_run_purple_proxy_control_command)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        ["restore", "purple-proxy-dict", "--ping", "--firmware-root", str(root)],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["proxy_url"] == "socks://127.0.0.1:2081/"
+    assert output["proxy_dictionary"]["SOCKSProxyPort"] == 2081
+    assert output["ping"]["port"] == 2082
+    assert output["port_config"]["ports"]["socks"] == 2081
+
+
 def test_restore_purple_proxy_dict_strict_fails_when_ping_is_not_pong(monkeypatch):
     async def fake_run_purple_proxy_control_command(command, **kwargs):
         return {
@@ -660,6 +814,7 @@ def test_restore_purple_socks_probe_help():
     assert "--connect-host" in result.output
     assert "--connect-port" in result.output
     assert "--include-response" in result.output
+    assert "--firmware-root" in result.output
     assert "--strict" in result.output
 
 
@@ -727,6 +882,37 @@ def test_restore_purple_socks_probe_prints_redacted_json(monkeypatch):
     assert output["connect"]["target_address_type"] == "domain"
     assert output["summary"]["ok"] is True
     assert "sensitive-udid" not in result.output
+
+
+def test_restore_purple_socks_probe_uses_firmware_port(tmp_path, monkeypatch):
+    root = _write_purple_launchd_root(tmp_path)
+
+    async def fake_run_purple_proxy_socks_probe(**kwargs):
+        assert kwargs["port"] == 2081
+        return {
+            "checked": True,
+            "experimental": True,
+            "protocol": "SOCKS5",
+            "port": kwargs["port"],
+            "reachable": True,
+            "summary": {
+                "handshake_ok": True,
+                "connect_succeeded": None,
+                "ok": True,
+            },
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_socks_probe", fake_run_purple_proxy_socks_probe)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        ["restore", "purple-socks-probe", "--firmware-root", str(root)],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["port"] == 2081
+    assert output["port_config"]["ports"]["socks"] == 2081
 
 
 def test_restore_purple_socks_probe_strict_fails_when_summary_is_not_ok(monkeypatch):
@@ -846,6 +1032,7 @@ def test_restore_purple_notify_help():
     assert "--listen-timeout" in result.output
     assert "--max-messages" in result.output
     assert "--expect-response" in result.output
+    assert "--firmware-root" in result.output
 
 
 def test_restore_purple_notify_requires_operation():
@@ -941,6 +1128,34 @@ def test_restore_purple_notify_set_log_level_prints_json(monkeypatch):
     assert output["sent"] is True
 
 
+def test_restore_purple_notify_uses_firmware_port(tmp_path, monkeypatch):
+    root = _write_purple_launchd_root(tmp_path)
+
+    async def fake_run_purple_proxy_notify_command(command, **kwargs):
+        assert command.value == "RegisterNotify"
+        assert kwargs["port"] == 2084
+        return {
+            "checked": True,
+            "experimental": True,
+            "command": "RegisterNotify",
+            "port": kwargs["port"],
+            "reachable": True,
+            "sent": True,
+        }
+
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_notify_command", fake_run_purple_proxy_notify_command)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        ["restore", "purple-notify", "--register", "--firmware-root", str(root)],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["port"] == 2084
+    assert output["port_config"]["ports"]["notify"] == 2084
+
+
 def test_restore_purple_notify_strict_fails_when_unreachable(monkeypatch):
     async def fake_run_purple_proxy_notify_command(command, **kwargs):
         return {
@@ -973,6 +1188,7 @@ def test_restore_purple_session_help():
     assert "--probe-socks" in result.output
     assert "--socks-connect-host" in result.output
     assert "--socks-connect-port" in result.output
+    assert "--firmware-root" in result.output
     assert "--include-services" in result.output
     assert "--strict" in result.output
 
@@ -1114,6 +1330,68 @@ def test_restore_purple_session_prints_orchestrated_json(monkeypatch):
     assert output["summary"]["probe_mode"] == "restored"
     assert output["summary"]["probe_reachable_ports"] == ["ctrl", "notify", "restore"]
     assert "sensitive-udid" not in result.output
+
+
+def test_restore_purple_session_uses_firmware_ports(tmp_path, monkeypatch):
+    root = _write_purple_launchd_root(tmp_path)
+
+    async def fake_collect_live_purple_reverse_proxy_probe(**kwargs):
+        assert {port["name"]: port["port"] for port in kwargs["ports"]} == {
+            "restore": 62078,
+            "socks": 2081,
+            "ctrl": 2082,
+            "notify": 2084,
+        }
+        return {
+            "checked": True,
+            "mode": "restored",
+            "device_count": 1,
+            "devices": [],
+        }
+
+    async def fake_run_purple_proxy_session(**kwargs):
+        assert kwargs["control_port"] == 2082
+        assert kwargs["notify_port"] == 2084
+        assert kwargs["conn_port"] == 2081
+        return {
+            "checked": True,
+            "experimental": True,
+            "phases": {
+                "set_log_level": {"checked": False, "reason": "--log-level was not provided."},
+                "register_notify": {"checked": True, "reachable": True},
+                "begin_control": {"checked": True, "reachable": True},
+                "ping": {"checked": True, "reachable": True, "pong": True},
+                "wait_socket": {"checked": True, "reachable": True, "conn_port": 2081},
+                "proxy_dictionary": {"checked": True, "proxy_url": "socks://127.0.0.1:2081/"},
+                "socks_probe": {"checked": False, "reason": "--probe-socks was not provided."},
+            },
+            "summary": {
+                "control_reachable": True,
+                "ping_pong": True,
+                "wait_socket_reachable": True,
+                "notify_registered": True,
+                "set_log_level_sent": None,
+                "socks_probe_ok": None,
+                "proxy_dictionary_ready": True,
+                "ok": True,
+            },
+        }
+
+    monkeypatch.setattr(
+        restore_cli, "collect_live_purple_reverse_proxy_probe", fake_collect_live_purple_reverse_proxy_probe
+    )
+    monkeypatch.setattr(restore_cli, "run_purple_proxy_session", fake_run_purple_proxy_session)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        ["restore", "purple-session", "--firmware-root", str(root)],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["phases"]["wait_socket"]["conn_port"] == 2081
+    assert output["port_config"]["ports"]["ctrl"] == 2082
+    assert output["port_config"]["ports"]["notify"] == 2084
 
 
 def test_restore_purple_session_strict_fails_when_summary_is_not_ok(monkeypatch):
