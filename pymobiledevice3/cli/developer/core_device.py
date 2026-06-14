@@ -3,8 +3,9 @@ import logging
 import posixpath
 import sys
 import time
+from collections.abc import Awaitable
 from pathlib import Path
-from typing import IO, Annotated, Optional
+from typing import IO, Annotated, Callable, Optional
 
 import click
 import typer
@@ -197,6 +198,9 @@ async def _probe_core_device_service(
     service = None
     try:
         service = await asyncio.wait_for(service_provider.start_service(service_name), timeout=timeout)
+        service_info = _core_device_service_info(service_provider, service_name)
+        if (service_info or {}).get("Properties", {}).get("UsesRemoteXPC"):
+            await asyncio.wait_for(service.connect(), timeout=timeout)
     except Exception as e:
         return {
             "connectable": False,
@@ -215,8 +219,104 @@ async def _probe_core_device_service(
                 logger.debug("failed to close CoreDevice diagnostic probe for %s", service_name, exc_info=True)
 
 
+def _core_device_inspection_error(exc: Exception) -> dict:
+    return {
+        "ok": False,
+        "error": {
+            "type": exc.__class__.__name__,
+            "message": str(exc),
+        },
+    }
+
+
+async def _core_device_inspection_check(
+    timeout: float,
+    action: Callable[[], Awaitable[object]],
+) -> dict:
+    try:
+        return {
+            "ok": True,
+            "value": await asyncio.wait_for(action(), timeout=timeout),
+        }
+    except Exception as e:
+        return _core_device_inspection_error(e)
+
+
+async def _inspect_core_device_state(service_provider: RemoteServiceDiscoveryService, timeout: float) -> dict:
+    """Collect read-only CoreDevice state useful for remote-control debugging."""
+    result = {
+        "device_info": {
+            "display_info": {"ok": False, "skipped": True, "reason": "service-not-advertised"},
+            "lockstate": {"ok": False, "skipped": True, "reason": "service-not-advertised"},
+        },
+        "display": {
+            "media_support_info": {"ok": False, "skipped": True, "reason": "service-not-advertised"},
+            "media_stream_server_status": {"ok": False, "skipped": True, "reason": "service-not-advertised"},
+        },
+        "universal_hid": {
+            "connected_services": {"ok": False, "skipped": True, "reason": "service-not-advertised"},
+            "known_static_surfaces": {
+                "main_touchscreen": DIGITIZER_SURFACE_MAIN_TOUCHSCREEN,
+                "touchscreen_gesture": DIGITIZER_SURFACE_TOUCHSCREEN_GESTURE,
+            },
+        },
+        "hints": [],
+    }
+
+    if _core_device_service_info(service_provider, DeviceInfoService.SERVICE_NAME) is not None:
+        try:
+            async with DeviceInfoService(service_provider) as service:
+                result["device_info"]["display_info"] = await _core_device_inspection_check(
+                    timeout, service.get_display_info
+                )
+                result["device_info"]["lockstate"] = await _core_device_inspection_check(timeout, service.get_lockstate)
+        except Exception as e:
+            result["device_info"]["display_info"] = _core_device_inspection_error(e)
+            result["device_info"]["lockstate"] = _core_device_inspection_error(e)
+
+    if _core_device_service_info(service_provider, DisplayService.SERVICE_NAME) is not None:
+        try:
+            async with DisplayService(service_provider) as service:
+                result["display"]["media_support_info"] = await _core_device_inspection_check(
+                    timeout, service.get_media_support_info
+                )
+                result["display"]["media_stream_server_status"] = await _core_device_inspection_check(
+                    timeout, service.get_media_stream_server_status
+                )
+        except Exception as e:
+            result["display"]["media_support_info"] = _core_device_inspection_error(e)
+            result["display"]["media_stream_server_status"] = _core_device_inspection_error(e)
+
+    if _core_device_service_info(service_provider, UniversalHIDServiceService.SERVICE_NAME) is not None:
+        try:
+            async with UniversalHIDServiceService(service_provider) as service:
+                result["universal_hid"]["connected_services"] = await _core_device_inspection_check(
+                    timeout, service.list_connected_services
+                )
+        except Exception as e:
+            result["universal_hid"]["connected_services"] = _core_device_inspection_error(e)
+
+    display_status = result["display"]["media_stream_server_status"]
+    hid_services = result["universal_hid"]["connected_services"]
+    if display_status.get("ok") is False and not display_status.get("skipped") and hid_services.get("ok") is True:
+        result["hints"].append(
+            "Touch injection requires an active media stream; if HID surfaces are visible but media status fails, "
+            "restart the device-side media stream path before testing gestures."
+        )
+    if display_status.get("ok") is True and hid_services.get("ok") is False and not hid_services.get("skipped"):
+        result["hints"].append(
+            "Media stream status is readable but Universal HID surfaces are not; remote viewing may work while touch "
+            "control still fails."
+        )
+
+    return result
+
+
 async def build_core_device_diagnose_payload(
-    service_provider: RemoteServiceDiscoveryService, probe: bool = True, timeout: float = 2.0
+    service_provider: RemoteServiceDiscoveryService,
+    probe: bool = True,
+    inspect: bool = True,
+    timeout: float = 2.0,
 ) -> dict:
     """Build a non-destructive CoreDevice/RSD readiness report."""
     peer_info = service_provider.peer_info or {}
@@ -236,6 +336,7 @@ async def build_core_device_diagnose_payload(
     failed_probes = [service for service in services if service["connectable"] is False]
     missing_services = [service for service in services if not service["advertised"]]
     capabilities = _core_device_capabilities(services)
+    inspections = await _inspect_core_device_state(service_provider, timeout) if inspect else None
 
     return {
         "rsd": {
@@ -255,6 +356,7 @@ async def build_core_device_diagnose_payload(
         },
         "summary": {
             "probe": probe,
+            "inspect": inspect,
             "timeout": timeout,
             "advertised_services_total": len(advertised_services),
             "known_core_device_services": len(services),
@@ -266,13 +368,16 @@ async def build_core_device_diagnose_payload(
         },
         "capabilities": capabilities,
         "services": services,
+        "inspections": inspections,
     }
 
 
 async def core_device_diagnose_task(
-    service_provider: RemoteServiceDiscoveryService, probe: bool, timeout: float
+    service_provider: RemoteServiceDiscoveryService, probe: bool, inspect: bool, timeout: float
 ) -> None:
-    print_json(await build_core_device_diagnose_payload(service_provider, probe=probe, timeout=timeout))
+    print_json(
+        await build_core_device_diagnose_payload(service_provider, probe=probe, inspect=inspect, timeout=timeout)
+    )
 
 
 @cli.command("diagnose")
@@ -286,13 +391,20 @@ async def core_device_diagnose(
             help="Open and close advertised CoreDevice services to check connectivity.",
         ),
     ] = True,
+    inspect: Annotated[
+        bool,
+        typer.Option(
+            "--inspect/--no-inspect",
+            help="Run read-only CoreDevice feature calls for display, lockstate, media, and HID status.",
+        ),
+    ] = True,
     timeout: Annotated[
         float,
         typer.Option("--timeout", min=0.1, help="Per-service probe timeout in seconds."),
     ] = 2.0,
 ) -> None:
     """Report CoreDevice/RSD service readiness for debugging remote-control failures."""
-    await core_device_diagnose_task(service_provider, probe, timeout)
+    await core_device_diagnose_task(service_provider, probe, inspect, timeout)
 
 
 async def core_device_list_directory_task(
