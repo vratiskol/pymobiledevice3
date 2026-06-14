@@ -205,6 +205,135 @@ def apply_purple_reverse_proxy_restore_options(restore_options: Any, options: di
         setattr(restore_options, key, value)
 
 
+def _firmware_status(value: Optional[bool]) -> str:
+    if value is True:
+        return "firmware_verified"
+    if value is False:
+        return "firmware_missing"
+    return "cataloged"
+
+
+def _deep_summary_value(info: dict[str, Any], key: str) -> Optional[bool]:
+    summary = info.get("deep", {}).get("summary")
+    if isinstance(summary, dict) and key in summary:
+        return bool(summary[key])
+    return None
+
+
+def _basic_restoreos_availability(info: dict[str, Any]) -> Optional[bool]:
+    firmware_root = info.get("firmware_root", {})
+    if not firmware_root.get("checked"):
+        return None
+    return bool(
+        firmware_root.get("executable", {}).get("is_file")
+        and firmware_root.get("device_library", {}).get("is_file")
+        and firmware_root.get("launchd_plist", {}).get("exists")
+    )
+
+
+def build_purple_reverse_proxy_capabilities(
+    firmware_root: Optional[Path] = None,
+    *,
+    deep: bool = False,
+) -> dict[str, Any]:
+    info = build_purple_reverse_proxy_info(firmware_root=firmware_root, deep=deep)
+    restoreos_available = _deep_summary_value(info, "available_in_restoreos_ramdisk")
+    if restoreos_available is None:
+        restoreos_available = _basic_restoreos_availability(info)
+
+    capabilities = [
+        {
+            "name": "restoreos_ramdisk_service",
+            "layer": "static_firmware",
+            "status": _firmware_status(restoreos_available),
+            "commands": ["restore purple-info", "restore purple-probe"],
+            "evidence": [
+                PURPLE_REVERSE_PROXY_CATALOG["launchd_label"],
+                str(PURPLE_REVERSE_PROXY_EXECUTABLE_PATH),
+                str(PURPLE_REVERSE_PROXY_DEVICE_LIBRARY_PATH),
+            ],
+            "requires_live_device": False,
+        },
+        {
+            "name": "restore_options",
+            "layer": "restore_update",
+            "status": _firmware_status(_deep_summary_value(info, "restore_options_evidence")),
+            "commands": ["restore purple-restore-options", "restore update"],
+            "evidence": [
+                PURPLE_REVERSE_PROXY_ENABLE_OPTION,
+                PURPLE_REVERSE_PROXY_DISABLE_OPTION,
+                PURPLE_REVERSE_PROXY_LOG_LEVEL_OPTION,
+                PURPLE_REVERSE_PROXY_SOCKS_HOST_OPTION,
+                PURPLE_REVERSE_PROXY_SOCKS_PORT_OPTION,
+            ],
+            "requires_live_device": False,
+        },
+        {
+            "name": "control_protocol",
+            "layer": "control_socket",
+            "status": _firmware_status(_deep_summary_value(info, "control_protocol_evidence")),
+            "commands": ["restore purple-control", "restore purple-session"],
+            "evidence": ["HelloCtrl", "BeginCtrl", "WaitSocket", "Ping", "Pong"],
+            "requires_live_device": True,
+        },
+        {
+            "name": "notify_protocol",
+            "layer": "notify_socket",
+            "status": _firmware_status(_deep_summary_value(info, "notify_protocol_evidence")),
+            "commands": ["restore purple-notify", "restore purple-session"],
+            "evidence": ["RegisterNotify", "SetLogLevel", "Level"],
+            "requires_live_device": True,
+        },
+        {
+            "name": "proxy_dictionary",
+            "layer": "host_model",
+            "status": _firmware_status(_deep_summary_value(info, "proxy_dictionary_evidence")),
+            "commands": ["restore purple-proxy-dict"],
+            "evidence": ["CopyProxyDictionaryWithOptions", "TestReachability", "socks://127.0.0.1:%d/"],
+            "requires_live_device": False,
+        },
+        {
+            "name": "socks_data_plane",
+            "layer": "socks_socket",
+            "status": "implemented",
+            "commands": ["restore purple-socks-probe", "restore purple-session --probe-socks"],
+            "evidence": ["SOCKS5 greeting", "SOCKS5 CONNECT"],
+            "requires_live_device": True,
+        },
+        {
+            "name": "notify_event_classification",
+            "layer": "host_summary",
+            "status": "implemented",
+            "commands": ["restore purple-notify", "restore purple-session"],
+            "evidence": ["proxy_online", "error", "log", "status", "unknown"],
+            "requires_live_device": True,
+        },
+        {
+            "name": "fdr_purple_reverse_proxy",
+            "layer": "fdr",
+            "status": _firmware_status(_deep_summary_value(info, "fdr_evidence")),
+            "commands": ["restore update"],
+            "evidence": PURPLE_REVERSE_PROXY_CATALOG["fdr_symbols"],
+            "requires_live_device": True,
+        },
+    ]
+
+    return {
+        "checked": True,
+        "experimental": True,
+        "firmware": info,
+        "capabilities": capabilities,
+        "summary": {
+            "capability_count": len(capabilities),
+            "implemented_count": sum(1 for capability in capabilities if capability["status"] == "implemented"),
+            "firmware_verified_count": sum(
+                1 for capability in capabilities if capability["status"] == "firmware_verified"
+            ),
+            "live_required_count": sum(1 for capability in capabilities if capability["requires_live_device"]),
+        },
+    }
+
+
 def _error_result(e: BaseException) -> dict[str, Any]:
     return {
         "reachable": False,

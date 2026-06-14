@@ -35,6 +35,7 @@ from pymobiledevice3.irecv import IRecv
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.restore.device import Device
 from pymobiledevice3.restore.purple import (
+    build_purple_reverse_proxy_capabilities,
     build_purple_reverse_proxy_info,
     build_purple_reverse_proxy_restore_options,
     collect_live_purple_reverse_proxy_probe,
@@ -517,6 +518,60 @@ async def restore_purple_info(
     else:
         info["live"] = await collect_live_purple_reverse_proxy_status(ecid=ecid, usbmux_address=usbmux_address)
     print_json(info)
+
+
+@cli.command("purple-capabilities")
+@async_command
+async def restore_purple_capabilities(
+    firmware_root: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--firmware-root",
+            help="Path to an extracted RestoreOS ramdisk root to inspect for PurpleReverseProxy artifacts.",
+        ),
+    ] = None,
+    deep: Annotated[
+        bool,
+        typer.Option("--deep", help="Include deep firmware evidence in the capability matrix."),
+    ] = False,
+    no_live: Annotated[
+        bool,
+        typer.Option("--no-live", help="Skip the redacted live usbmux port probe."),
+    ] = False,
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", min=0.1, help="Per-connection timeout for the live usbmux port probe."),
+    ] = 1.0,
+    include_services: Annotated[
+        bool,
+        typer.Option(
+            "--include-services",
+            help="Also try starting PurpleReverseProxy lockdown service names when lockdownd is reachable.",
+        ),
+    ] = False,
+    usbmux_address: Annotated[
+        Optional[str],
+        typer.Option("--usbmux-address", help="Address of the usbmuxd daemon (unix socket path or HOST:PORT)."),
+    ] = None,
+) -> None:
+    """
+    Print the PurpleReverseProxy static/model/live capability matrix.
+    """
+    result = build_purple_reverse_proxy_capabilities(firmware_root=firmware_root, deep=deep)
+    if no_live:
+        result["live_probe"] = {"checked": False, "reason": "--no-live was provided."}
+    else:
+        live_probe = await collect_live_purple_reverse_proxy_probe(
+            usbmux_address=usbmux_address,
+            timeout=timeout,
+            include_services=include_services,
+        )
+        result["live_probe"] = live_probe
+        result["summary"].update({
+            "live_probe_mode": live_probe.get("mode"),
+            "live_probe_device_count": live_probe.get("device_count", 0),
+        })
+    print_json(result, colored=False)
 
 
 @cli.command("purple-probe")

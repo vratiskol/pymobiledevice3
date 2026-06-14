@@ -12,6 +12,7 @@ from pymobiledevice3.restore.purple import (
     PURPLE_REVERSE_PROXY_CATALOG,
     PURPLE_REVERSE_PROXY_LAUNCHD_PATH,
     apply_purple_reverse_proxy_restore_options,
+    build_purple_reverse_proxy_capabilities,
     build_purple_reverse_proxy_info,
     build_purple_reverse_proxy_restore_options,
     collect_live_purple_reverse_proxy_probe,
@@ -214,6 +215,19 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
         "active_live_probe_required": True,
     }
 
+    capabilities = build_purple_reverse_proxy_capabilities(tmp_path, deep=True)
+    capabilities_by_name = {capability["name"]: capability for capability in capabilities["capabilities"]}
+    assert capabilities["summary"]["capability_count"] == 8
+    assert capabilities["summary"]["firmware_verified_count"] == 6
+    assert capabilities_by_name["restoreos_ramdisk_service"]["status"] == "firmware_verified"
+    assert capabilities_by_name["restore_options"]["status"] == "firmware_verified"
+    assert capabilities_by_name["control_protocol"]["status"] == "firmware_verified"
+    assert capabilities_by_name["notify_protocol"]["status"] == "firmware_verified"
+    assert capabilities_by_name["proxy_dictionary"]["status"] == "firmware_verified"
+    assert capabilities_by_name["socks_data_plane"]["status"] == "implemented"
+    assert capabilities_by_name["notify_event_classification"]["status"] == "implemented"
+    assert capabilities_by_name["fdr_purple_reverse_proxy"]["status"] == "firmware_verified"
+
 
 def test_build_purple_reverse_proxy_restore_options_enables_prp():
     result = build_purple_reverse_proxy_restore_options(enable=True, log_level=7)
@@ -259,6 +273,87 @@ def test_restore_purple_info_help():
     assert "--firmware-root" in result.output
     assert "--no-device" in result.output
     assert "--deep" in result.output
+
+
+def test_restore_purple_capabilities_help():
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-capabilities", "--help"])
+
+    assert result.exit_code == 0
+    assert "--firmware-root" in result.output
+    assert "--deep" in result.output
+    assert "--no-live" in result.output
+    assert "--timeout" in result.output
+    assert "--include-services" in result.output
+    assert "--usbmux-address" in result.output
+
+
+def test_restore_purple_capabilities_prints_matrix_without_live_probe():
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-capabilities", "--no-live"])
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["checked"] is True
+    assert output["summary"]["capability_count"] == 8
+    assert output["live_probe"] == {
+        "checked": False,
+        "reason": "--no-live was provided.",
+    }
+    capabilities_by_name = {capability["name"]: capability for capability in output["capabilities"]}
+    assert capabilities_by_name["socks_data_plane"]["status"] == "implemented"
+    assert capabilities_by_name["notify_event_classification"]["status"] == "implemented"
+
+
+def test_restore_purple_capabilities_adds_redacted_live_probe(monkeypatch):
+    def fake_build_purple_reverse_proxy_capabilities(firmware_root=None, *, deep=False):
+        assert firmware_root is None
+        assert deep is True
+        return {
+            "checked": True,
+            "experimental": True,
+            "firmware": {"checked": True},
+            "capabilities": [],
+            "summary": {"capability_count": 0},
+        }
+
+    async def fake_collect_live_purple_reverse_proxy_probe(**kwargs):
+        assert kwargs == {
+            "usbmux_address": "/tmp/usbmux",
+            "timeout": 0.5,
+            "include_services": True,
+        }
+        return {
+            "checked": True,
+            "mode": "restored",
+            "device_count": 1,
+            "devices": [{"index": 0, "mode": "restored"}],
+        }
+
+    monkeypatch.setattr(
+        restore_cli, "build_purple_reverse_proxy_capabilities", fake_build_purple_reverse_proxy_capabilities
+    )
+    monkeypatch.setattr(
+        restore_cli, "collect_live_purple_reverse_proxy_probe", fake_collect_live_purple_reverse_proxy_probe
+    )
+
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "restore",
+            "purple-capabilities",
+            "--deep",
+            "--timeout",
+            "0.5",
+            "--include-services",
+            "--usbmux-address",
+            "/tmp/usbmux",
+        ],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["live_probe"]["mode"] == "restored"
+    assert output["summary"]["live_probe_mode"] == "restored"
+    assert output["summary"]["live_probe_device_count"] == 1
 
 
 def test_restore_purple_probe_help():
