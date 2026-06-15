@@ -1,7 +1,4 @@
-import ctypes
-import ctypes.util
 import hashlib
-import platform
 import re
 import struct
 import uuid
@@ -10,6 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+from pymobiledevice3.apple_compression import AppleCompressionError, decompress_apple_compression
 
 DEFAULT_MAX_TRACEV3_FILE_BYTES = 16 * 1024 * 1024
 MAX_SOURCES_PER_TRACEV3_FINDING = 5
@@ -201,9 +200,9 @@ class Tracev3CatalogScanner:
             "field_indicators": _top_records(self.field_indicators, self.max_values),
             "files_scanned": self.files_scanned,
             "limitations": (
-                "Decodes tracev3 headers, catalog strings, compression wrappers, and "
-                "uncompressed firehose payloads. Apple Compression firehose bodies require "
-                "the platform decompressor before dynamic event arguments can be decoded."
+                "Decodes tracev3 headers, catalog strings, bv41 Apple Compression LZ4 "
+                "firehose bodies, and uncompressed firehose payloads. bvxn LZVN bodies "
+                "require the platform decompressor."
             ),
             "plmns": _top_records(self.plmns, self.max_values),
             "private_field_templates": self.private_field_templates,
@@ -222,9 +221,9 @@ class Tracev3CatalogScanner:
                 "header_strings": _top_records(self.tracev3_header_strings, self.max_values),
                 "headers": self.tracev3_headers[: self.max_values],
                 "limitations": (
-                    "The tracev3 structure is firmware-backed. Dynamic firehose event records "
-                    "are decoded only when their payload is already uncompressed or the host "
-                    "can provide Apple Compression decoding for bv41/bvxn bodies."
+                    "The tracev3 structure is firmware-backed. bv41 firehose bodies are "
+                    "decompressed locally; deeper dynamic value recovery still depends on "
+                    "mapping firehose records to their catalog format strings."
                 ),
                 "malformed_files": self.tracev3_malformed_files,
                 "tracev3_files": self.tracev3_files,
@@ -715,53 +714,10 @@ def _sensitive_string(value: str, *, include_sensitive: bool) -> str:
 
 
 def _decompress_tracev3_payload(payload: bytes, compression: dict[str, Any]) -> Optional[bytes]:
-    if compression.get("compression_algorithm") is not None:
-        decoded = _decode_macos_compression(payload, compression)
-        if decoded is not None:
-            return decoded
-
-    if compression.get("format") == "LZFSE":
-        try:
-            import lzfse  # type: ignore[import-not-found]
-        except ImportError:
-            return None
-        try:
-            return lzfse.decompress(payload)
-        except Exception:
-            return None
-    return None
-
-
-def _decode_macos_compression(payload: bytes, compression: dict[str, Any]) -> Optional[bytes]:
-    if platform.system() != "Darwin":
-        return None
-    library_path = ctypes.util.find_library("compression") or "/usr/lib/libcompression.dylib"
     try:
-        library = ctypes.CDLL(library_path)
-    except OSError:
+        return decompress_apple_compression(payload)
+    except AppleCompressionError:
         return None
-
-    dst_size = compression.get("uncompressed_size", 0)
-    algorithm = compression.get("compression_algorithm")
-    if not isinstance(dst_size, int) or dst_size <= 0 or not isinstance(algorithm, int):
-        return None
-
-    dst = ctypes.create_string_buffer(dst_size)
-    src = ctypes.create_string_buffer(payload, len(payload))
-    decode = library.compression_decode_buffer
-    decode.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_void_p,
-        ctypes.c_int,
-    ]
-    decode.restype = ctypes.c_size_t
-    decoded_size = decode(dst, dst_size, src, len(payload), None, algorithm)
-    if decoded_size == 0:
-        return None
-    return dst.raw[:decoded_size]
 
 
 def _iter_uuid_strings(payload: bytes, *, include_sensitive: bool, limit: int = 20) -> list[str]:

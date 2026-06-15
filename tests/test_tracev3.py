@@ -121,6 +121,20 @@ def test_decode_tracev3_firehose_payload_decodes_uncompressed_header_and_templat
     assert decoded["templates"][0]["arguments"][1]["privacy"] == "private"
 
 
+def test_decode_tracev3_firehose_payload_decompresses_bv41() -> None:
+    decompressed = struct.pack("<QIBB2s", 1234, 5678, 2, 3, b"\x00\x00") + b"mcc=%{public}d\x00"
+    compressed = _lz4_literal_only(decompressed)
+    payload = struct.pack("<4sII", b"bv41", len(decompressed), len(compressed)) + compressed + b"\x00\x00\x00\x00"
+
+    decoded = decode_tracev3_firehose_payload(payload)
+
+    assert decoded["compressed"] is True
+    assert decoded["decompressed"] is True
+    assert decoded["decompressed_size"] == len(decompressed)
+    assert decoded["header"]["mach_continuous_time"] == 1234
+    assert decoded["template_count"] == 1
+
+
 def test_decode_tracev3_format_values_decodes_scalars_and_redacts_private_values() -> None:
     template = "mcc=%{public}d mnc=%{private}hu carrier=%{public}s ok=%{public}B"
     payload = struct.pack("<iH", 208, 20) + b"ExampleCarrier\x00" + b"\x01"
@@ -149,3 +163,15 @@ def _tracev3_subchunk(tag: int, payload: bytes) -> bytes:
 def _fixed_string(value: str, size: int) -> bytes:
     data = value.encode()
     return data + (b"\x00" * (size - len(data)))
+
+
+def _lz4_literal_only(value: bytes) -> bytes:
+    if len(value) < 15:
+        return bytes([len(value) << 4]) + value
+    remaining = len(value) - 15
+    extension = bytearray()
+    while remaining >= 255:
+        extension.append(255)
+        remaining -= 255
+    extension.append(remaining)
+    return b"\xf0" + bytes(extension) + value
