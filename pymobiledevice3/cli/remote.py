@@ -10,7 +10,12 @@ from typing import Annotated, Optional, TextIO
 import typer
 from typer_injector import InjectingTyper
 
-from pymobiledevice3.bonjour import DEFAULT_BONJOUR_TIMEOUT, browse_remotepairing_manual_pairing
+from pymobiledevice3.bonjour import (
+    DEFAULT_BONJOUR_TIMEOUT,
+    REMOTEPAIRING_SERVICE_NAME,
+    REMOTED_SERVICE_NAME,
+    browse_remotepairing_manual_pairing,
+)
 from pymobiledevice3.cli.cli_common import (
     USBMUX_ENV_VARS,
     USBMUX_OPTION_HELP,
@@ -26,7 +31,7 @@ from pymobiledevice3.exceptions import NoDeviceConnectedError
 from pymobiledevice3.pair_records import PAIRING_RECORD_EXT, get_remote_pairing_record_filename
 from pymobiledevice3.remote.common import ConnectionType, TunnelProtocol
 from pymobiledevice3.remote.module_imports import MAX_IDLE_TIMEOUT, start_tunnel, verify_tunnel_imports
-from pymobiledevice3.remote.remote_service_discovery import RSD_PORT
+from pymobiledevice3.remote.remote_service_discovery import RSD_PORT, build_rsd_service_inventory
 from pymobiledevice3.remote.tunnel_service import (
     RemotePairingManualPairingService,
     get_core_device_tunnel_services,
@@ -49,9 +54,11 @@ async def browse_rsd(timeout: float = DEFAULT_BONJOUR_TIMEOUT) -> list[dict]:
         devices.append({
             "address": rsd.service.address[0],
             "port": RSD_PORT,
+            "bonjour_service": REMOTED_SERVICE_NAME,
             "UniqueDeviceID": rsd.peer_info["Properties"]["UniqueDeviceID"],
             "ProductType": rsd.peer_info["Properties"]["ProductType"],
             "OSVersion": rsd.peer_info["Properties"]["OSVersion"],
+            "service_inventory": build_rsd_service_inventory(rsd.peer_info),
         })
     return devices
 
@@ -62,7 +69,15 @@ async def browse_remotepairing(timeout: float = DEFAULT_BONJOUR_TIMEOUT) -> list
         devices.append({
             "address": remotepairing.hostname,
             "port": remotepairing.port,
+            "bonjour_service": REMOTEPAIRING_SERVICE_NAME,
             "identifier": remotepairing.remote_identifier,
+            "service_inventory": {
+                "transport": "RemotePairing",
+                "capabilities": {
+                    "coredevice_tunnel": True,
+                    "remote_pairing": True,
+                },
+            },
         })
     return devices
 

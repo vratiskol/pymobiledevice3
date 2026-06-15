@@ -31,6 +31,79 @@ class RSDDevice:
 # from remoted ([RSDRemoteNCMDeviceDevice createPortListener])
 RSD_PORT = 58783
 
+REMOTED_SERVICE_NAMES = frozenset({
+    "com.apple.remoted",
+    "com.apple.remoted.control",
+    "com.apple.remoted.coredevice",
+    "com.apple.remoted.compute-platform",
+    "com.apple.remoted.identity",
+    "com.apple.remoted.service",
+    "com.apple.remoted.watchdog",
+    "com.apple.RemoteServiceDiscovery",
+    "com.apple.remoteservicediscovery.events",
+})
+
+COREDEVICE_CAPABILITY_SERVICES = {
+    "app": ("com.apple.coredevice.appservice",),
+    "developer_tunnel": ("com.apple.internal.dt.coredevice.untrusted.tunnelservice",),
+    "diagnostics": ("com.apple.coredevice.diagnosticsservice",),
+    "display": ("com.apple.coredevice.displayservice",),
+    "files": ("com.apple.coredevice.fileservice.control", "com.apple.coredevice.fileservice.data"),
+    "hid": ("com.apple.coredevice.hid.indigo", "com.apple.coredevice.hid.universalhidservice"),
+    "location": ("com.apple.coredevice.locationservice",),
+    "screenshot": ("com.apple.coredevice.screencaptureservice",),
+}
+
+LOCKDOWN_REMOTE_SERVICES = (
+    "com.apple.mobile.lockdown.remote.trusted",
+    "com.apple.mobile.lockdown.remote.untrusted",
+)
+
+
+def classify_rsd_service_name(name: str) -> str:
+    if name in REMOTED_SERVICE_NAMES:
+        if name == "com.apple.remoted.compute-platform":
+            return "compute"
+        if name == "com.apple.remoted.identity":
+            return "identity"
+        if name == "com.apple.remoted.watchdog":
+            return "watchdog"
+        if name in {"com.apple.RemoteServiceDiscovery", "com.apple.remoteservicediscovery.events"}:
+            return "remote_service_discovery"
+        return "remoted"
+    if name.startswith("com.apple.coredevice.") or name == "com.apple.internal.dt.coredevice.untrusted.tunnelservice":
+        return "coredevice"
+    if name.startswith("com.apple.mobile.lockdown.remote."):
+        return "lockdown"
+    if name.startswith("com.apple.internal.devicecompute."):
+        return "compute"
+    return "other"
+
+
+def build_rsd_service_inventory(peer_info: Optional[dict]) -> dict:
+    services = peer_info.get("Services", {}) if isinstance(peer_info, dict) else {}
+    service_names = sorted(str(name) for name in services)
+    categories: dict[str, list[str]] = {}
+    for service_name in service_names:
+        categories.setdefault(classify_rsd_service_name(service_name), []).append(service_name)
+    capabilities = {
+        name: any(service_name in services for service_name in service_names)
+        for name, service_names in COREDEVICE_CAPABILITY_SERVICES.items()
+    }
+    capabilities["coredevice"] = bool(categories.get("coredevice"))
+    capabilities["lockdown_trusted"] = LOCKDOWN_REMOTE_SERVICES[0] in services
+    capabilities["lockdown_untrusted"] = LOCKDOWN_REMOTE_SERVICES[1] in services
+    capabilities["remoted"] = bool(categories.get("remoted"))
+    capabilities["remote_service_discovery"] = bool(categories.get("remote_service_discovery"))
+    capabilities["compute"] = bool(categories.get("compute"))
+    capabilities["identity"] = bool(categories.get("identity"))
+    capabilities["watchdog"] = bool(categories.get("watchdog"))
+    return {
+        "service_count": len(service_names),
+        "categories": categories,
+        "capabilities": capabilities,
+    }
+
 
 class RemoteServiceDiscoveryService(LockdownServiceProvider):
     def __init__(self, address: tuple[str, int], name: Optional[str] = None) -> None:
