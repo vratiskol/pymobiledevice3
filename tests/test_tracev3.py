@@ -75,6 +75,32 @@ def test_tracev3_catalog_scanner_redacts_raw_cell_values_by_default() -> None:
     assert "<redacted>" in str(report)
 
 
+def test_tracev3_catalog_scanner_reports_referenced_sysdiagnose_logs() -> None:
+    scanner = Tracev3CatalogScanner()
+    log_path = (
+        b"/private/var/db/sysdiagnose/com.apple.sysdiagnose/"
+        b"IN_PROGRESS_sysdiagnose_2026.06.12_17-45-46+0200_iPhone-OS_iPhone_23F77/"
+        b"logs/Baseband/ambtool_output.log\x00"
+    )
+    payload = _tracev3_chunk(0x1000, b"23F77\x00D37AP\x00") + _tracev3_chunk(
+        0x600D,
+        struct.pack("<QIBB2s", 1234, 5678, 2, 3, b"\x00\x00") + log_path,
+    )
+
+    scanner.scan_payload("system_logs.logarchive/Persist/0000000000000001.tracev3", payload)
+    report = scanner.build_report()
+
+    assert report["structure"]["referenced_logs_count"] == 1
+    assert report["structure"]["referenced_logs"] == [
+        {
+            "category": "baseband",
+            "count": 1,
+            "sources": ["system_logs.logarchive/Persist/0000000000000001.tracev3"],
+            "value": "logs/Baseband/ambtool_output.log",
+        }
+    ]
+
+
 def test_decode_tracev3_header_values_and_subchunks() -> None:
     generation = uuid.UUID("00112233-4455-6677-8899-aabbccddeeff")
     payload = (

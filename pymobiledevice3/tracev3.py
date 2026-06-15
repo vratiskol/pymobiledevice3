@@ -87,6 +87,23 @@ TRACEV3_HEADER_TEXT_PATTERN = re.compile(
     r"^(?:[0-9]{2}[A-Z][0-9]{2,4}[a-z]?|[A-Z][0-9]{2,4}[A-Z]{2}|"
     r"/var/db/timezone/zoneinfo/[A-Za-z0-9_+./-]+|[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12})$"
 )
+TRACEV3_LOG_REFERENCE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.+-])"
+    r"(?P<path>/?(?:[A-Za-z0-9_.+@=%{}-]+/)*[A-Za-z0-9_.+@=%{}-]+\.log)"
+    r"(?![A-Za-z0-9_.+-])",
+    re.IGNORECASE,
+)
+TRACEV3_LOG_REFERENCE_STRIP = " \t\r\n\x00\"'`.,;:()[]{}<>"
+TRACEV3_LOG_REFERENCE_CATEGORIES = {
+    "baseband": ("baseband", "bbticket"),
+    "cellular": ("commcenter", "coretelephony", "cellular", "carrier", "sim"),
+    "wifi": ("wifi", "wi-fi", "airport", "wifid"),
+    "location": ("locationd", "geod", "location", "gps"),
+    "network": ("network", "mdnsresponder", "ipconfig", "ifconfig"),
+    "power": ("battery", "power", "thermal"),
+    "security": ("keychain", "lockdown", "security", "tcc", "trustd"),
+    "crash": ("crashreporter", "panic"),
+}
 RAW_FIELD_REDACTION_PATTERNS = (
     re.compile(r"\b(cell(?:ular)?[ _-]?(?:id|identity)|cellid|ci|eci|ecgi)\b\s*[:=,]\s*([0-9A-Fa-fx]{3,})", re.I),
     re.compile(r"\b(lac|tac|pci|sid|nid)\b\s*[:=,]\s*([0-9A-Fa-fx]{2,})", re.I),
@@ -164,6 +181,7 @@ class Tracev3CatalogScanner:
         self.tracev3_headers: list[dict[str, Any]] = []
         self.tracev3_header_strings: dict[str, dict[str, Any]] = {}
         self.tracev3_malformed_files = 0
+        self.tracev3_referenced_logs: dict[str, dict[str, Any]] = {}
         self.tracev3_value_samples: list[dict[str, Any]] = []
         self.templates: dict[str, dict[str, Any]] = {}
         self.tower_lookup_ready_templates = 0
@@ -227,6 +245,8 @@ class Tracev3CatalogScanner:
                     "mapping firehose records to their catalog format strings."
                 ),
                 "malformed_files": self.tracev3_malformed_files,
+                "referenced_logs": _top_records(self.tracev3_referenced_logs, self.max_values),
+                "referenced_logs_count": len(self.tracev3_referenced_logs),
                 "tracev3_files": self.tracev3_files,
             },
             "templates": _top_records(self.templates, self.max_values),
@@ -274,6 +294,7 @@ class Tracev3CatalogScanner:
                     if len(self.tracev3_catalog_chunks) < self.max_values:
                         self.tracev3_catalog_chunks.append(_truncate_tracev3_detail(catalog, self.max_values))
                     for text in catalog["strings"]:
+                        self._scan_log_references(path, text)
                         if CELLULAR_TRACEV3_TEXT.search(text):
                             self._scan_string(path, text)
                 elif chunk.tag == TRACEV3_FIREHOSE_TAG:
@@ -294,6 +315,7 @@ class Tracev3CatalogScanner:
                     if len(self.tracev3_firehose_blocks) < self.max_values:
                         self.tracev3_firehose_blocks.append(_truncate_tracev3_detail(firehose, self.max_values))
                     for text in firehose.get("strings", []):
+                        self._scan_log_references(path, text)
                         if CELLULAR_TRACEV3_TEXT.search(text):
                             self._scan_string(path, text)
                     for value in firehose.get("decoded_values", []):
@@ -356,6 +378,16 @@ class Tracev3CatalogScanner:
             self.private_field_templates += 1
         if record["count"] == 1 and tower_lookup_ready:
             self.tower_lookup_ready_templates += 1
+
+    def _scan_log_references(self, path: str, text: str) -> None:
+        for reference in _iter_tracev3_log_references(text):
+            self._record_source(
+                self.tracev3_referenced_logs,
+                reference,
+                path,
+                category=_tracev3_log_reference_category(reference),
+                value=reference,
+            )
 
     def _record_source(self, records: dict[str, dict[str, Any]], key: str, source: str, **extra: Any) -> None:
         record = records.setdefault(key, {"count": 0, "sources": [], **extra})
@@ -886,6 +918,75 @@ def _clean_tracev3_string(text: str, *, include_sensitive: bool) -> str:
     if len(text) > MAX_TRACEV3_STRING_LENGTH:
         text = text[: MAX_TRACEV3_STRING_LENGTH - 1] + "..."
     return text
+
+
+def _iter_tracev3_log_references(text: str) -> Iterator[str]:
+    for match in TRACEV3_LOG_REFERENCE_PATTERN.finditer(text.replace("\\", "/")):
+        reference = _normalize_tracev3_log_reference(match.group("path"))
+        if reference:
+            yield reference
+
+
+def _normalize_tracev3_log_reference(value: str) -> Optional[str]:
+    value = value.replace("\\", "/").strip(TRACEV3_LOG_REFERENCE_STRIP)
+    log_index = value.lower().find(".log")
+    if log_index == -1:
+        return None
+    value = value[: log_index + 4].strip(TRACEV3_LOG_REFERENCE_STRIP)
+    if not value:
+        return None
+
+    parts = [part for part in value.split("/") if part and part != "."]
+    if not parts:
+        return None
+
+    for index, part in enumerate(parts):
+        if "sysdiagnose_" in part.lower():
+            tail = parts[index + 1 :]
+            return "/".join(tail) if tail else parts[-1]
+
+    lower_parts = [part.lower() for part in parts]
+    for marker in (
+        ("private", "var", "db", "sysdiagnose"),
+        ("var", "db", "sysdiagnose"),
+    ):
+        marker_index = _find_path_marker(lower_parts, marker)
+        if marker_index == -1:
+            continue
+        tail = parts[marker_index + len(marker) :]
+        while tail and (tail[0].lower().startswith("com.apple.sysdiagnose") or "sysdiagnose_" in tail[0].lower()):
+            tail = tail[1:]
+        return "/".join(tail) if tail else parts[-1]
+
+    for marker in (
+        ("private", "var", "mobile", "Library", "Logs"),
+        ("var", "mobile", "Library", "Logs"),
+    ):
+        marker_index = _find_path_marker(lower_parts, tuple(part.lower() for part in marker))
+        if marker_index == -1:
+            continue
+        tail = parts[marker_index + len(marker) :]
+        return "Library/Logs/" + "/".join(tail) if tail else parts[-1]
+
+    if len(parts) > 6:
+        return "/".join(parts[-6:])
+    return "/".join(parts)
+
+
+def _find_path_marker(parts: list[str], marker: tuple[str, ...]) -> int:
+    marker_len = len(marker)
+    for index in range(0, len(parts) - marker_len + 1):
+        if tuple(parts[index : index + marker_len]) == marker:
+            return index
+    return -1
+
+
+def _tracev3_log_reference_category(reference: str) -> str:
+    lower = reference.lower()
+    for category, needles in TRACEV3_LOG_REFERENCE_CATEGORIES.items():
+        if any(needle in lower for needle in needles):
+            return category
+    return "log"
 
 
 def _looks_like_log_template(text: str) -> bool:
