@@ -105,10 +105,25 @@ TRACEV3_LOG_REFERENCE_CATEGORIES = {
     "crash": ("crashreporter", "panic"),
 }
 RAW_FIELD_REDACTION_PATTERNS = (
+    re.compile(r"\b(kCTCellMonitorCellId)\b\s*[:=,]\s*([0-9A-Fa-fx]{3,})", re.I),
     re.compile(r"\b(cell(?:ular)?[ _-]?(?:id|identity)|cellid|ci|eci|ecgi)\b\s*[:=,]\s*([0-9A-Fa-fx]{3,})", re.I),
     re.compile(r"\b(lac|tac|pci|sid|nid)\b\s*[:=,]\s*([0-9A-Fa-fx]{2,})", re.I),
     re.compile(r"\b(?:lat|latitude|lon|lng|longitude)\b\s*[:=,]\s*[+-]?[0-9]{1,3}\.[0-9]{3,}", re.I),
 )
+TRACEV3_CELL_FIELD_VALUE_PATTERN = r"(?P<value><redacted>|0x[0-9A-Fa-f]+|[0-9A-Fa-f]+)"
+TRACEV3_CELL_FIELD_PATTERNS = {
+    "cell_id": re.compile(
+        r"\b(?:kCTCellMonitorCellId|cell\s*id|cellid|cellular[ _-]?identity|ci|eci|ecgi)\b"
+        rf"\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}",
+        re.I,
+    ),
+    "lac": re.compile(rf"\bLAC\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "mcc": re.compile(r"\b(?:kCTCellMonitorMCC|MCC)\b\s*[:=,]\s*(?P<value>[0-9]{3})", re.I),
+    "mnc": re.compile(r"\b(?:kCTCellMonitorMNC|MNC)\b\s*[:=,]\s*(?P<value>[0-9]{1,3})", re.I),
+    "pci": re.compile(rf"\b(?:PCI|physCellId)\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "tac": re.compile(rf"\bTAC\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+}
+TRACEV3_RAT_PATTERN = re.compile(r"\b(?:5G|NR|LTE|4G|UMTS|WCDMA|GSM|EDGE|GPRS|CDMA|eHRPD)\b", re.IGNORECASE)
 
 FIELD_PATTERNS = {
     "cell_id": re.compile(r"\b(?:cell\s*id|cellid|cellular[ _-]?identity|ci|eci|ecgi)\b", re.I),
@@ -127,6 +142,50 @@ INDICATOR_PATTERNS = {
     "serving_cell": re.compile(r"\bserving cell\b|\bServingCell\b", re.I),
     "supl": re.compile(r"\bSUPL\b|\bsupl\b", re.I),
     "timing_advance": re.compile(r"\btimingadvance\b|\bta\b", re.I),
+}
+TRACEV3_MCC_COUNTRIES = {
+    "202": "Greece",
+    "204": "Netherlands",
+    "206": "Belgium",
+    "208": "France",
+    "214": "Spain",
+    "222": "Italy",
+    "228": "Switzerland",
+    "234": "United Kingdom",
+    "235": "United Kingdom",
+    "238": "Denmark",
+    "242": "Norway",
+    "244": "Finland",
+    "262": "Germany",
+    "268": "Portugal",
+    "270": "Luxembourg",
+    "272": "Ireland",
+    "274": "Iceland",
+    "302": "Canada",
+    "310": "United States",
+    "311": "United States",
+    "312": "United States",
+    "313": "United States",
+    "314": "United States",
+    "315": "United States",
+    "316": "United States",
+    "334": "Mexico",
+    "404": "India",
+    "405": "India",
+    "440": "Japan",
+    "450": "South Korea",
+    "454": "Hong Kong",
+    "460": "China",
+    "466": "Taiwan",
+    "505": "Australia",
+    "510": "Indonesia",
+    "520": "Thailand",
+    "525": "Singapore",
+    "530": "New Zealand",
+    "602": "Egypt",
+    "604": "Morocco",
+    "655": "South Africa",
+    "724": "Brazil",
 }
 
 
@@ -162,7 +221,9 @@ class Tracev3CatalogScanner:
         self.max_values = max_values
         self.max_sources = max_sources
         self.bytes_scanned = 0
+        self.cell_towers: dict[tuple[tuple[str, str], ...], dict[str, Any]] = {}
         self.cellular_files: dict[str, dict[str, Any]] = {}
+        self.cellular_field_values: dict[str, dict[str, Any]] = {}
         self.catalog_strings: dict[str, dict[str, Any]] = {}
         self.field_indicators: dict[str, dict[str, Any]] = {}
         self.files_scanned = 0
@@ -209,6 +270,10 @@ class Tracev3CatalogScanner:
     def build_report(self) -> dict[str, Any]:
         return {
             "bytes_scanned": self.bytes_scanned,
+            "cell_towers": _top_records(self.cell_towers, self.max_values),
+            "cell_towers_count": len(self.cell_towers),
+            "cellular_field_values": _top_records(self.cellular_field_values, self.max_values),
+            "cellular_field_values_count": len(self.cellular_field_values),
             "cellular_files": _top_records(self.cellular_files, self.max_values),
             "cellular_files_count": len(self.cellular_files),
             "catalog_strings": _top_records(self.catalog_strings, self.max_values),
@@ -301,6 +366,7 @@ class Tracev3CatalogScanner:
                     payload = data[chunk.payload_offset : chunk.payload_end]
                     firehose = decode_tracev3_firehose_payload(
                         payload,
+                        include_all_strings=True,
                         include_sensitive=self.include_sensitive,
                         max_values=self.max_values,
                     )
@@ -314,7 +380,9 @@ class Tracev3CatalogScanner:
                     self.tracev3_dynamic_arguments_decoded += firehose.get("dynamic_arguments_decoded", 0)
                     if len(self.tracev3_firehose_blocks) < self.max_values:
                         self.tracev3_firehose_blocks.append(_truncate_tracev3_detail(firehose, self.max_values))
-                    for text in firehose.get("strings", []):
+                    strings = firehose.get("strings", [])
+                    self._scan_cell_tower_strings(path, strings)
+                    for text in strings:
                         self._scan_log_references(path, text)
                         if CELLULAR_TRACEV3_TEXT.search(text):
                             self._scan_string(path, text)
@@ -331,6 +399,7 @@ class Tracev3CatalogScanner:
         if not text:
             return
         self._record_source(self.catalog_strings, text, path, value=text)
+        self._scan_cellular_field_values(path, text)
 
         for name, pattern in INDICATOR_PATTERNS.items():
             if pattern.search(text):
@@ -378,6 +447,40 @@ class Tracev3CatalogScanner:
             self.private_field_templates += 1
         if record["count"] == 1 and tower_lookup_ready:
             self.tower_lookup_ready_templates += 1
+
+    def _scan_cellular_field_values(self, path: str, text: str) -> dict[str, str]:
+        fields = _extract_tracev3_cell_fields(text)
+        for field, value in fields.items():
+            self._record_source(
+                self.cellular_field_values,
+                f"{field}:{value}",
+                path,
+                field=field,
+                value=value,
+            )
+        return fields
+
+    def _scan_cell_tower_strings(self, path: str, strings: list[str]) -> None:
+        fields: dict[str, str] = {}
+        for text in strings:
+            extracted = _extract_tracev3_cell_fields(text)
+            if not any(field != "rat" for field in extracted):
+                continue
+            for field, value in extracted.items():
+                fields.setdefault(field, value)
+        self._record_cell_tower(path, fields)
+
+    def _record_cell_tower(self, path: str, fields: dict[str, str]) -> None:
+        if "cell_id" not in fields:
+            return
+        if not any(field in fields for field in ("mcc", "mnc", "lac", "tac", "pci")):
+            return
+        if "mcc" in fields:
+            fields.setdefault("country", _mcc_country(fields["mcc"]))
+        key = tuple(sorted(fields.items()))
+        record = self.cell_towers.setdefault(key, {"count": 0, "sources": [], **fields})
+        record["count"] += 1
+        _append_source(record["sources"], path, self.max_sources)
 
     def _scan_log_references(self, path: str, text: str) -> None:
         for reference in _iter_tracev3_log_references(text):
@@ -525,6 +628,7 @@ def decode_tracev3_firehose_payload(
     payload: bytes,
     *,
     include_sensitive: bool = False,
+    include_all_strings: bool = False,
     max_values: int = 50,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
@@ -572,9 +676,9 @@ def decode_tracev3_firehose_payload(
     result.update({
         "dynamic_arguments_decoded": 0,
         "string_count": len(strings),
-        "strings": strings[:max_values],
+        "strings": strings if include_all_strings else strings[:max_values],
         "template_count": len(templates),
-        "templates": templates[:max_values],
+        "templates": templates if include_all_strings else templates[:max_values],
     })
     return result
 
@@ -918,6 +1022,22 @@ def _clean_tracev3_string(text: str, *, include_sensitive: bool) -> str:
     if len(text) > MAX_TRACEV3_STRING_LENGTH:
         text = text[: MAX_TRACEV3_STRING_LENGTH - 1] + "..."
     return text
+
+
+def _extract_tracev3_cell_fields(text: str) -> dict[str, str]:
+    fields = {}
+    for field, pattern in TRACEV3_CELL_FIELD_PATTERNS.items():
+        match = pattern.search(text)
+        if match:
+            fields[field] = match.group("value")
+    rat = TRACEV3_RAT_PATTERN.search(text)
+    if rat:
+        fields["rat"] = rat.group(0).upper()
+    return fields
+
+
+def _mcc_country(mcc: str) -> str:
+    return TRACEV3_MCC_COUNTRIES.get(mcc, "unknown")
 
 
 def _iter_tracev3_log_references(text: str) -> Iterator[str]:

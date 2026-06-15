@@ -101,6 +101,41 @@ def test_tracev3_catalog_scanner_reports_referenced_sysdiagnose_logs() -> None:
     ]
 
 
+def test_tracev3_catalog_scanner_reports_kct_cell_monitor_fields() -> None:
+    scanner = Tracev3CatalogScanner()
+    payload = _tracev3_chunk(0x1000, b"23F77\x00D37AP\x00") + _tracev3_chunk(
+        0x600D,
+        struct.pack("<QIBB2s", 1234, 5678, 2, 3, b"\x00\x00")
+        + b"CDMA\x00"
+        + b"kCTCellMonitorCellId = 137096039;\x00"
+        + b"kCTCellMonitorMCC = 208;\x00"
+        + b"kCTCellMonitorMNC = 20;\x00",
+    )
+
+    scanner.scan_payload("system_logs.logarchive/logdata.LiveData.tracev3", payload)
+    report = scanner.build_report()
+
+    assert "137096039" not in str(report)
+    assert report["cell_towers"] == [
+        {
+            "cell_id": "<redacted>",
+            "country": "France",
+            "count": 1,
+            "mcc": "208",
+            "mnc": "20",
+            "sources": ["system_logs.logarchive/logdata.LiveData.tracev3"],
+        }
+    ]
+    assert {
+        (record["field"], record["value"])
+        for record in report["cellular_field_values"]
+    } >= {
+        ("cell_id", "<redacted>"),
+        ("mcc", "208"),
+        ("mnc", "20"),
+    }
+
+
 def test_decode_tracev3_header_values_and_subchunks() -> None:
     generation = uuid.UUID("00112233-4455-6677-8899-aabbccddeeff")
     payload = (
