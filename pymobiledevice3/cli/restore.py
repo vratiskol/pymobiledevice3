@@ -28,6 +28,7 @@ from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.restore.device import Device
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore import Restore
+from pymobiledevice3.restore.usbc_flasher import build_usbc_flasher_inventory
 from pymobiledevice3.services.diagnostics import DiagnosticsService
 from pymobiledevice3.utils import file_download, start_ipython_shell
 
@@ -261,6 +262,24 @@ async def restore_ramdisk(device: DeviceDep, ipsw_ctx: IPSWCtxDep) -> None:
     Boot only the update ramdisk without performing a restore (IPSW path or URL accepted).
     """
     await restore_ramdisk_task(device, ipsw_ctx)
+
+
+@cli.command("usbc-info")
+def restore_usbc_info(
+    firmware_root: Annotated[
+        Path,
+        typer.Option(
+            "--firmware-root",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+            help="Path to an extracted RestoreOS or firmware root to scan for USBC flasher support.",
+        ),
+    ],
+) -> None:
+    """inspect read-only USBC firmware flasher metadata from an extracted firmware root"""
+    print_json(build_usbc_flasher_inventory(firmware_root))
 
 
 @cli.command("update")
