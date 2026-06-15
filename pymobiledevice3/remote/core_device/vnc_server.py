@@ -24,6 +24,7 @@ Protocol reference: RFC 6143 (RFB 3.8).
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import socket
@@ -122,6 +123,101 @@ _ENC_DESKTOP_SIZE = -223
 _ENC_LAST_RECT = -224
 
 _SERVER_NAME = b"iPhone screen (pymobiledevice3)"
+
+_MEDIA_FIRMWARE_MARKERS = {
+    "screen_viewing": "com.apple.coredevice.screenViewing",
+    "screenshot": "com.apple.coredevice.screenshot",
+    "screen_sharing_negotiator": "AVCMediaStreamNegotiatorSettingsCoreDeviceScreenSharing",
+    "mic_negotiator": "AVCMediaStreamNegotiatorSettingsCoreDeviceMic",
+    "system_audio_negotiator": "AVCMediaStreamNegotiatorSettingsCoreDeviceSystemAudio",
+}
+
+_STREAM_CONFIG_KEYS = (
+    "AudioStreamMode",
+    "CustomHeight",
+    "CustomWidth",
+    "IsltrpEnabled",
+    "LocalSSRC",
+    "RTCPTimeoutEnabled",
+    "RTCPTimeoutInterval",
+    "RemoteSSRC",
+    "RxPayloadType",
+    "SourcePort",
+)
+
+
+def _json_log(value: dict) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _top_level_keys(value: object) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    return sorted(str(k) for k in value.keys())
+
+
+def _collect_string_markers(value: object, markers: dict[str, str]) -> list[str]:
+    found: set[str] = set()
+
+    def visit(item: object) -> None:
+        if isinstance(item, str):
+            for name, marker in markers.items():
+                if marker in item:
+                    found.add(name)
+        elif isinstance(item, dict):
+            for key, child in item.items():
+                visit(key)
+                visit(child)
+        elif isinstance(item, (list, tuple, set)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return sorted(found)
+
+
+def _stream_config_diagnostics(stream_type: str, cfg: dict) -> dict:
+    source_port = cfg.get("SourcePort")
+    local_ssrc = cfg.get("LocalSSRC")
+    remote_ssrc = cfg.get("RemoteSSRC")
+    return {
+        "type": stream_type,
+        "dimensions": {
+            "width": cfg.get("CustomWidth") if isinstance(cfg.get("CustomWidth"), int) else None,
+            "height": cfg.get("CustomHeight") if isinstance(cfg.get("CustomHeight"), int) else None,
+        },
+        "payload": {
+            "rx_payload_type": cfg.get("RxPayloadType"),
+            "audio_stream_mode": cfg.get("AudioStreamMode"),
+            "ltrp_enabled": cfg.get("IsltrpEnabled"),
+        },
+        "rtcp": {
+            "feedback_available": bool(source_port and local_ssrc and remote_ssrc),
+            "source_port_present": bool(source_port),
+            "local_ssrc_present": bool(local_ssrc),
+            "remote_ssrc_present": bool(remote_ssrc),
+            "timeout_enabled": cfg.get("RTCPTimeoutEnabled"),
+            "timeout_interval": cfg.get("RTCPTimeoutInterval"),
+        },
+        "present_keys": [key for key in _STREAM_CONFIG_KEYS if key in cfg],
+    }
+
+
+def _media_preflight_diagnostics(media_support: object, server_status: object, *, audio_enabled: bool) -> dict:
+    return {
+        "firmware_markers": _MEDIA_FIRMWARE_MARKERS,
+        "audio_requested": audio_enabled,
+        "media_support": {
+            "available": isinstance(media_support, dict),
+            "top_level_keys": _top_level_keys(media_support),
+            "matched_markers": _collect_string_markers(media_support, _MEDIA_FIRMWARE_MARKERS),
+        },
+        "server_status": {
+            "available": isinstance(server_status, dict),
+            "top_level_keys": _top_level_keys(server_status),
+            "matched_markers": _collect_string_markers(server_status, _MEDIA_FIRMWARE_MARKERS),
+        },
+    }
 
 # Named iOS hardware buttons → (usage_page, usage_code). Same table as
 # ``cli/developer/core_device.py``; replicated rather than imported so
@@ -374,6 +470,23 @@ class VncStreamServer:
         # ``_hid_lock`` so a burst of keystrokes at startup doesn't race
         # multiple createService calls.
         self._kb_service_id: Optional[int] = None
+
+    async def _log_media_preflight(self, svc: DisplayService) -> None:
+        media_support: object = None
+        server_status: object = None
+        errors = {}
+        try:
+            media_support = await svc.get_media_support_info()
+        except Exception as exc:
+            errors["media_support"] = type(exc).__name__
+        try:
+            server_status = await svc.get_media_stream_server_status()
+        except Exception as exc:
+            errors["server_status"] = type(exc).__name__
+        diagnostics = _media_preflight_diagnostics(media_support, server_status, audio_enabled=self._audio_enabled)
+        if errors:
+            diagnostics["errors"] = errors
+        logger.info("CoreDevice media preflight: %s", _json_log(diagnostics))
 
     # ----- HEVC -> BGRA callback marshalling --------------------------------
     def _on_frame_from_worker(self, bgra: bytes) -> None:
@@ -1339,6 +1452,7 @@ class VncStreamServer:
         shared_session_id = uuid.uuid4()
         svc = DisplayService(self._rsd)
         await svc.connect()
+        await self._log_media_preflight(svc)
         local_ip = svc.service.local_address[0]
         answer = await svc.start_video_stream(
             receiver_ip=local_ip,
@@ -1353,6 +1467,7 @@ class VncStreamServer:
         if not isinstance(sid, uuid.UUID):
             sid = uuid.UUID(sid)
         cfg = answer["connection"].get("streamConfig", {})
+        logger.info("CoreDevice video negotiation: %s", _json_log(_stream_config_diagnostics("video", cfg)))
         logger.info(
             "video stream up: %dx%d HEVC, sender_port=%s",
             int(cfg.get("CustomWidth", 0)),
@@ -1372,10 +1487,10 @@ class VncStreamServer:
         self._active_sock = sock
         if self._rtcp_dest and self._local_ssrc and self._remote_ssrc:
             logger.info(
-                "RTCP feedback enabled: dest=%s, ours=%d, theirs=%d",
-                self._rtcp_dest,
-                self._local_ssrc,
-                self._remote_ssrc,
+                "RTCP feedback enabled: source_port_present=%s local_ssrc_present=%s remote_ssrc_present=%s",
+                bool(source_port),
+                bool(self._local_ssrc),
+                bool(self._remote_ssrc),
             )
         else:
             logger.warning(
@@ -1412,6 +1527,7 @@ class VncStreamServer:
                 audio_sid_raw = audio_answer["connection"]["options"]["avcMediaStreamOptionClientSessionID"]["uuid"]
                 audio_sid = audio_sid_raw if isinstance(audio_sid_raw, uuid.UUID) else uuid.UUID(audio_sid_raw)
                 audio_cfg = audio_answer["connection"].get("streamConfig", {})
+                logger.info("CoreDevice audio negotiation: %s", _json_log(_stream_config_diagnostics("audio", audio_cfg)))
                 a_source_port = int(audio_cfg.get("SourcePort", 0))
                 self._audio_local_ssrc = int(audio_cfg.get("RemoteSSRC", 0))
                 self._audio_remote_ssrc = int(audio_cfg.get("LocalSSRC", 0))
