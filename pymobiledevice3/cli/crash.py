@@ -1,11 +1,14 @@
+import json
 from pathlib import Path
 from typing import Annotated, Optional
 
 import typer
 from typer_injector import InjectingTyper
 
-from pymobiledevice3.cli.cli_common import ServiceProviderDep, async_command
+from pymobiledevice3.cli.cli_common import ServiceProviderDep, async_command, print_json
 from pymobiledevice3.services.crash_reports import CrashReportsManager, CrashReportsShell
+from pymobiledevice3.sysdiagnose import DEFAULT_MAX_FILE_BYTES, analyze_sysdiagnose
+from pymobiledevice3.tracev3 import DEFAULT_MAX_TRACEV3_FILE_BYTES
 
 cli = InjectingTyper(
     name="crash",
@@ -191,3 +194,71 @@ async def crash_sysdiagnose(
     print("Press Power+VolUp+VolDown for 0.215 seconds")
     async with CrashReportsManager(service_provider) as crash_manager:
         await crash_manager.get_new_sysdiagnose(str(out), erase=erase, timeout=timeout)
+
+
+@cli.command("sysdiagnose-report")
+def crash_sysdiagnose_report(
+    source: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            file_okay=True,
+            dir_okay=True,
+            readable=True,
+            resolve_path=True,
+            help="Sysdiagnose archive (.tar, .tar.gz, .zip) or extracted sysdiagnose directory.",
+        ),
+    ],
+    output: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--output",
+            "-o",
+            dir_okay=False,
+            writable=True,
+            help="Write report JSON to a file instead of stdout.",
+        ),
+    ] = None,
+    include_sensitive: Annotated[
+        bool,
+        typer.Option(
+            "--include-sensitive",
+            help="Include raw phone/SIM identifiers and exact coordinates. Defaults to redacted hashes/counts.",
+        ),
+    ] = False,
+    max_file_bytes: Annotated[
+        int,
+        typer.Option(
+            "--max-file-bytes",
+            min=1,
+            help="Maximum size of each archive member to parse as text/plist/json.",
+        ),
+    ] = DEFAULT_MAX_FILE_BYTES,
+    scan_unified_log: Annotated[
+        bool,
+        typer.Option(
+            "--scan-unified-log/--no-scan-unified-log",
+            help="Scan system_logs.logarchive tracev3 files for forensic message templates.",
+        ),
+    ] = True,
+    max_tracev3_file_bytes: Annotated[
+        int,
+        typer.Option(
+            "--max-tracev3-file-bytes",
+            min=1,
+            help="Maximum size of each logarchive member to scan for tracev3 strings.",
+        ),
+    ] = DEFAULT_MAX_TRACEV3_FILE_BYTES,
+) -> None:
+    """Build a forensic JSON report from a local sysdiagnose archive or directory."""
+    report = analyze_sysdiagnose(
+        source,
+        include_sensitive=include_sensitive,
+        max_file_bytes=max_file_bytes,
+        max_tracev3_file_bytes=max_tracev3_file_bytes,
+        scan_unified_log=scan_unified_log,
+    )
+    if output is None:
+        print_json(report)
+    else:
+        output.write_text(json.dumps(report, sort_keys=True, indent=4) + "\n")

@@ -32,6 +32,15 @@ pymobiledevice3 diagnostics restart
 
 # Pull crash reports
 pymobiledevice3 crash pull /path/to/crashes
+
+# Build a redacted forensic report from a sysdiagnose archive or directory
+pymobiledevice3 crash sysdiagnose-report /path/to/sysdiagnose.tar.gz --output sysdiagnose-report.json
+
+# Skip Apple Unified Log tracev3 catalog scanning when only fast plist/text parsing is needed
+pymobiledevice3 crash sysdiagnose-report /path/to/sysdiagnose.tar.gz --no-scan-unified-log
+
+# Include raw phone/SIM identifiers and exact coordinates when case handling allows it
+pymobiledevice3 crash sysdiagnose-report /path/to/sysdiagnose.tar.gz --include-sensitive
 ```
 
 ## Files, Apps, and Backup
