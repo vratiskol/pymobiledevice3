@@ -30,12 +30,19 @@ PYMOBILEDEVICE3_RESTORE_MESSAGE_HANDLERS = frozenset({
     "BasebandUpdaterOutputData",
     "BBUpdateStatusMsg",
     "CheckpointMsg",
+    "CrashLog",
     "DataRequestMsg",
+    "FDRSubmit",
     "PreviousRestoreLogMsg",
     "ProgressMsg",
+    "ProvisioningAck",
+    "ProvisioningInfo",
+    "ProvisioningStatusMsg",
+    "ReceivedFinalStatusMsg",
     "RestoreAttestation",
     "RestoredCrash",
     "StatusMsg",
+    "USBLog",
 })
 PYMOBILEDEVICE3_DATA_REQUEST_HANDLERS = frozenset({
     "BasebandData",
@@ -133,6 +140,19 @@ def _progress_operation_name(operation: Any) -> Any:
     return operation
 
 
+def _first_present(message: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in message:
+            return message[key]
+    return None
+
+
+def _payload_size(value: Any) -> Optional[int]:
+    if isinstance(value, (bytes, str, list, tuple, dict)):
+        return len(value)
+    return None
+
+
 def _summary_text_for_restore_message(msg_type: str, fields: dict[str, Any], severity: str) -> str:
     if msg_type in ("DataRequestMsg", "AsyncDataRequestMsg"):
         data_type = fields.get("data_type") or "unknown"
@@ -158,6 +178,21 @@ def _summary_text_for_restore_message(msg_type: str, fields: dict[str, Any], sev
     if msg_type == "CheckpointMsg":
         checkpoint = fields.get("checkpoint")
         return f"checkpoint {checkpoint}" if checkpoint is not None else "restore checkpoint"
+    if msg_type == "CrashLog":
+        return "restore crash log available"
+    if msg_type == "FDRSubmit":
+        return "FDR submit request"
+    if msg_type == "ProvisioningInfo":
+        return "provisioning info available"
+    if msg_type == "ProvisioningStatusMsg":
+        status = fields.get("status")
+        return f"provisioning status {status}" if status is not None else "provisioning status update"
+    if msg_type == "ProvisioningAck":
+        return "provisioning acknowledged"
+    if msg_type == "ReceivedFinalStatusMsg":
+        return "final restore status acknowledged"
+    if msg_type == "USBLog":
+        return "USB restore log available"
     if severity == "warning":
         return f"unhandled restore message {msg_type}"
     return msg_type
@@ -218,6 +253,15 @@ def summarize_restore_message(
             "backtrace": sanitize_restore_protocol_value(backtrace, include_identifiers=include_identifiers),
         }
         severity = "error"
+    elif msg_type == "CrashLog":
+        log = _first_present(message, "CrashLog", "Log")
+        fields = {
+            "log_available": log is not None,
+            "log_size": _payload_size(log),
+        }
+        if log is not None:
+            fields["log"] = sanitize_restore_protocol_value(log, include_identifiers=include_identifiers)
+        severity = "warning"
     elif msg_type == "RestoreAttestation":
         fields = {
             "handled_by_pymobiledevice3": True,
@@ -232,6 +276,54 @@ def summarize_restore_message(
             "checkpoint": message.get("Checkpoint") or message.get("CheckpointID"),
             "operation": message.get("Operation"),
         }
+    elif msg_type == "FDRSubmit":
+        fdr_keys = sorted(key for key in message if key != "MsgType")
+        fields = {
+            "keys": fdr_keys,
+            "urls": {
+                key: sanitize_restore_protocol_value(value, include_identifiers=include_identifiers)
+                for key, value in message.items()
+                if key != "MsgType" and "URL" in key.upper()
+            },
+            "memory_commit": message.get("FDRMemoryCommit"),
+        }
+        severity = "request"
+    elif msg_type == "ProvisioningInfo":
+        fields = {
+            "keys": sorted(key for key in message if key != "MsgType"),
+            "status": _first_present(message, "Status", "ProvisioningStatus"),
+        }
+    elif msg_type == "ProvisioningStatusMsg":
+        status = _first_present(message, "Status", "ProvisioningStatus", "ProvisioningStatusCode")
+        error = _first_present(message, "Error", "ErrorCode", "ErrorDescription")
+        fields = {
+            "status": status,
+            "operation": _first_present(message, "Operation", "Step", "Stage"),
+            "error": sanitize_restore_protocol_value(error, include_identifiers=include_identifiers),
+        }
+        if error not in (None, 0, ""):
+            severity = "error"
+    elif msg_type == "ProvisioningAck":
+        fields = {
+            "acknowledged": _first_present(message, "Acknowledged", "Ack"),
+            "status": _first_present(message, "Status", "ProvisioningStatus"),
+        }
+    elif msg_type == "ReceivedFinalStatusMsg":
+        status = _first_present(message, "Status", "FinalStatus", "Result")
+        fields = {
+            "status": status,
+            "error": KNOWN_RESTORE_STATUS_ERRORS.get(status) if isinstance(status, int) else None,
+        }
+        if isinstance(status, int):
+            severity = "success" if status == 0 else "error"
+    elif msg_type == "USBLog":
+        log = _first_present(message, "USBLog", "Log")
+        fields = {
+            "log_available": log is not None,
+            "log_size": _payload_size(log),
+        }
+        if log is not None:
+            fields["log"] = sanitize_restore_protocol_value(log, include_identifiers=include_identifiers)
     elif msg_type == "AsyncWait":
         fields = {"async_context": message.get("AsyncContext")}
     elif msg_type == "BasebandUpdaterOutputData":

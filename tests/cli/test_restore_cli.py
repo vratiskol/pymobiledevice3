@@ -123,7 +123,17 @@ def test_restore_options_info_reports_python_gaps() -> None:
 
     assert "SupportedDataTypes" in output["python"]["default_option_keys"]
     assert "RecoveryOSAppleLogo" in output["gaps"]["supported_data_types_without_handler"]
-    assert "CrashLog" in output["gaps"]["supported_message_types_without_handler"]
+    assert "CrashLog" not in output["gaps"]["supported_message_types_without_handler"]
+    assert "MsgType" in output["gaps"]["supported_message_types_without_handler"]
+    assert output["python"]["firmware_option_groups"]["fdr"]["message_types"]["FDRSubmit"][
+        "implemented_by_pymobiledevice3"
+    ] is True
+    assert "FDRCAURL" in output["python"]["firmware_option_groups"]["fdr"]["option_keys"][
+        "missing_from_default_options"
+    ]
+    assert output["python"]["firmware_option_groups"]["recovery_os"]["data_types"]["RecoveryOSASRImage"][
+        "implemented_by_pymobiledevice3"
+    ] is True
 
 
 def test_restore_options_info_reads_ipsw_manifest(tmp_path) -> None:

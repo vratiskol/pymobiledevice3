@@ -87,6 +87,58 @@ RESTORE_OPTION_IPSW_COMPONENTS = (
     "SystemVolume",
     "SystemVolumeCanonicalMetadata",
 )
+FIRMWARE_RESTORE_OPTION_GROUPS = {
+    "fdr": {
+        "option_keys": (
+            "FDRCAURL",
+            "FDRDataStoreURL",
+            "FDRSealingURL",
+            "FDRTrustObjectURL",
+            "FDRSkipDataPreservation",
+            "FDREnableSso",
+            "FDRIgnoreDevBoardFailures",
+            "FDRMemoryStorePath",
+        ),
+        "data_types": (
+            "FDRMemoryCommit",
+            "FDRTrustData",
+        ),
+        "message_types": (
+            "FDRSubmit",
+        ),
+    },
+    "recovery_os": {
+        "option_keys": (
+            "RecoveryOSBundlePath",
+            "RecoveryOSOnly",
+            "RecoveryOSFailureIsFatal",
+            "RetainRecoveryOS",
+            "InstallRecoveryOS",
+            "ForceInstallRecoveryOS",
+            "AuthInstallRecoveryOSVariant",
+        ),
+        "data_types": (
+            "RecoveryOSASRImage",
+            "RecoveryOSAppleLogo",
+            "RecoveryOSDeviceTree",
+            "RecoveryOSFileAssetImage",
+            "RecoveryOSIBEC",
+            "RecoveryOSIBootFWFilesImages",
+            "RecoveryOSImage",
+            "RecoveryOSKernelCache",
+            "RecoveryOSLocalPolicy",
+            "RecoveryOSRootTicketData",
+            "RecoveryOSStaticTrustCache",
+            "RecoveryOSVersionData",
+        ),
+        "message_types": (
+            "ProvisioningInfo",
+            "ProvisioningStatusMsg",
+            "ProvisioningAck",
+            "ReceivedFinalStatusMsg",
+        ),
+    },
+}
 
 
 cli = InjectingTyper(
@@ -415,6 +467,39 @@ def _restore_plist_info(restore_plist: Optional[dict]) -> Optional[dict]:
     }
 
 
+def _firmware_restore_option_group_info(default_option_keys: list[str]) -> dict:
+    default_option_key_set = set(default_option_keys)
+    return {
+        group_name: {
+            "option_keys": {
+                "present_in_default_options": [
+                    option_key for option_key in group["option_keys"] if option_key in default_option_key_set
+                ],
+                "missing_from_default_options": [
+                    option_key for option_key in group["option_keys"] if option_key not in default_option_key_set
+                ],
+            },
+            "data_types": {
+                data_type: {
+                    "advertised": data_type in SUPPORTED_DATA_TYPES,
+                    "supported_by_restore_options": SUPPORTED_DATA_TYPES.get(data_type),
+                    "implemented_by_pymobiledevice3": data_type in PYMOBILEDEVICE3_DATA_REQUEST_HANDLERS,
+                }
+                for data_type in group["data_types"]
+            },
+            "message_types": {
+                msg_type: {
+                    "advertised": msg_type in SUPPORTED_MESSAGE_TYPES,
+                    "supported_by_restore_options": SUPPORTED_MESSAGE_TYPES.get(msg_type),
+                    "implemented_by_pymobiledevice3": msg_type in PYMOBILEDEVICE3_RESTORE_MESSAGE_HANDLERS,
+                }
+                for msg_type in group["message_types"]
+            },
+        }
+        for group_name, group in FIRMWARE_RESTORE_OPTION_GROUPS.items()
+    }
+
+
 def build_restore_options_info(ipsw: Optional[Path] = None, include_defaults: bool = False) -> dict:
     default_options = RestoreOptions().to_dict()
     default_option_keys = sorted(key for key in default_options if key != "UUID")
@@ -427,6 +512,7 @@ def build_restore_options_info(ipsw: Optional[Path] = None, include_defaults: bo
             "supported_message_types": SUPPORTED_MESSAGE_TYPES,
             "implemented_data_request_handlers": sorted(PYMOBILEDEVICE3_DATA_REQUEST_HANDLERS),
             "implemented_message_handlers": sorted(PYMOBILEDEVICE3_RESTORE_MESSAGE_HANDLERS),
+            "firmware_option_groups": _firmware_restore_option_group_info(default_option_keys),
         },
         "gaps": {
             "supported_data_types_without_handler": data_type_gaps,

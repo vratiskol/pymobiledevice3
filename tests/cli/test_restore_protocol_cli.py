@@ -214,6 +214,30 @@ def test_build_restore_message_report_can_include_raw_messages():
     assert output["warnings"][0]["fields"]["log"] == "<bytes:2>"
 
 
+def test_build_restore_message_report_decodes_fdr_and_recovery_messages():
+    output = protocol.build_restore_message_report([
+        {
+            "MsgType": "FDRSubmit",
+            "FDRDataStoreURL": "https://example.test/fdr",
+            "FDRMemoryCommit": True,
+        },
+        {"MsgType": "ProvisioningStatusMsg", "Status": 0, "Step": "seal"},
+        {"MsgType": "ProvisioningAck", "Acknowledged": True},
+        {"MsgType": "ReceivedFinalStatusMsg", "Status": 0},
+        {"MsgType": "USBLog", "USBLog": "serial=raw-serial ok"},
+        {"MsgType": "CrashLog", "CrashLog": b"\x01\x02"},
+    ])
+
+    assert output["summary"]["unimplemented"] == 0
+    assert output["messages"][0]["severity"] == "request"
+    assert output["messages"][0]["fields"]["urls"] == {"FDRDataStoreURL": "https://example.test/fdr"}
+    assert output["messages"][1]["summary"] == "provisioning status 0"
+    assert output["messages"][2]["fields"]["acknowledged"] is True
+    assert output["messages"][3]["severity"] == "success"
+    assert output["messages"][4]["fields"]["log"] == "serial=<redacted> ok"
+    assert output["messages"][5]["fields"]["log"] == "<bytes:2>"
+
+
 def test_restore_message_report_redacts_identifier_markers_in_logs():
     output = protocol.build_restore_message_report([
         {
