@@ -90,8 +90,21 @@ def test_decode_tracev3_header_values_and_subchunks() -> None:
     assert header["timebase"] == {"denom": 3, "numer": 125}
     assert header["wall_time"]["utc"] == "2026-06-12T15:44:46.554385+00:00"
     assert header["timezone"]["name"] == "Europe/Paris"
+    assert header["build_version"] == "23F77"
+    assert header["hardware_model"] == "D37AP"
+    assert header["device"] == {
+        "display_name": "iPhone 15",
+        "hardware_model": "d37ap",
+        "product_type": "iPhone15,4",
+    }
     assert header["system"]["build"] == "23F77"
+    assert header["system"]["build_version"] == "23F77"
     assert header["system"]["hardware"] == "D37AP"
+    assert header["system"]["hardware_model"] == "D37AP"
+    assert header["system"]["device"]["display_name"] == "iPhone 15"
+    assert header["generation"]["build_id"].startswith("sha256_12:")
+    assert header["generation"]["redacted"] is True
+    assert header["generation"]["uuid_format"] == "RFC4122"
     assert header["generation"]["uuid"].startswith("sha256_12:")
     assert str(generation) not in str(header)
 

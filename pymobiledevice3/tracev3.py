@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from pymobiledevice3.apple_compression import AppleCompressionError, decompress_apple_compression
+from pymobiledevice3.irecv_devices import IRECV_DEVICES
 
 DEFAULT_MAX_TRACEV3_FILE_BYTES = 16 * 1024 * 1024
 MAX_SOURCES_PER_TRACEV3_FINDING = 5
@@ -664,19 +665,33 @@ def _decode_tracev3_header_subchunk(
         result["continuous_time"] = struct.unpack_from("<Q", payload)[0]
     elif subtag == 0x6101 and len(payload) >= 56:
         unknown0, unknown1 = struct.unpack_from("<ii", payload)
+        build_version = _read_c_string(payload[8:24])
+        hardware_model = _read_c_string(payload[24:56])
+        device = _device_info_from_hardware_model(hardware_model)
         result["system"] = {
-            "build": _read_c_string(payload[8:24]),
-            "hardware": _read_c_string(payload[24:56]),
+            "build": build_version,
+            "build_version": build_version,
+            "hardware": hardware_model,
+            "hardware_model": hardware_model,
             "unknown0": unknown0,
             "unknown1": unknown1,
         }
+        result["build_version"] = build_version
+        result["hardware_model"] = hardware_model
+        if device is not None:
+            result["device"] = device
+            result["system"]["device"] = device
     elif subtag == 0x6102 and len(payload) >= 24:
         generation_uuid = str(uuid.UUID(bytes=payload[:16]))
+        generation_id = _sensitive_string(generation_uuid, include_sensitive=include_sensitive)
         unknown0, unknown1 = struct.unpack_from("<ii", payload, 16)
         result["generation"] = {
+            "build_id": generation_id,
+            "redacted": not include_sensitive,
             "unknown0": unknown0,
             "unknown1": unknown1,
-            "uuid": _sensitive_string(generation_uuid, include_sensitive=include_sensitive),
+            "uuid": generation_id,
+            "uuid_format": "RFC4122",
         }
     elif subtag == 0x6103 and payload:
         timezone_path = _read_c_string(payload)
@@ -696,6 +711,19 @@ def _looks_like_tracev3_firehose_header(header: dict[str, Any]) -> bool:
 
 def _read_c_string(data: bytes) -> str:
     return data.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+
+
+def _device_info_from_hardware_model(hardware_model: str) -> Optional[dict[str, Any]]:
+    normalized = hardware_model.lower()
+    for device in IRECV_DEVICES:
+        if device.hardware_model.lower() != normalized:
+            continue
+        return {
+            "display_name": device.display_name,
+            "hardware_model": device.hardware_model,
+            "product_type": device.product_type,
+        }
+    return None
 
 
 def _utc_isoformat(seconds: int, microseconds: int) -> Optional[str]:
