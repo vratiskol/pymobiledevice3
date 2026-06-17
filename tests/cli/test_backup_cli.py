@@ -43,3 +43,22 @@ def test_backup_full_help_describes_conditional_default():
     assert "full for an" in normalized_output
     assert "empty or incomplete backup" in normalized_output
     assert "directory" in normalized_output
+
+
+def test_backup2_has_diagnose_command():
+    runner = CliRunner()
+
+    result = runner.invoke(__main__.app, ["backup2", "--help"])
+
+    assert result.exit_code == 0
+    assert "diagnose" in result.output
+
+
+def test_backup2_diagnose_help_describes_sanitized_output():
+    runner = CliRunner()
+
+    result = runner.invoke(__main__.app, ["backup2", "diagnose", "--help"])
+
+    assert result.exit_code == 0
+    assert "sanitized" in result.output
+    assert "backup readiness" in result.output
