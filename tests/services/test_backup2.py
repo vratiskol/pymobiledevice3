@@ -12,7 +12,11 @@ from pymobiledevice3.exceptions import ConnectionFailedError, ConnectionTerminat
 from pymobiledevice3.lockdown import LockdownClient
 from pymobiledevice3.services.device_link import DeviceLink
 from pymobiledevice3.services.mobilebackup2 import (
+    BACKUP_EXCLUSION_NAMES,
+    BACKUP_EXCLUSION_REGEXES,
     BACKUP_OBSERVED_NOTIFICATIONS,
+    BACKUP_SELECTION_NAMES,
+    BACKUP_SELECTION_REGEXES,
     BACKUP_SELECTIONS,
     NP_LOCAL_AUTH_DISMISSED,
     NP_LOCAL_AUTH_PRESENTED,
@@ -75,14 +79,77 @@ async def test_encrypted_backup(lockdown: LockdownClient, tmp_path: Path) -> Non
 def test_resolve_backup_selection_sms() -> None:
     rules = Mobilebackup2Service.resolve_backup_selection(["sms"])
 
-    assert len(rules) == 1
+    assert len(rules) == 3
     assert rules[0].matches_device_name("HomeDomain/Library/SMS/sms.db")
     assert rules[0].matches_device_name("HomeDomain-Library/SMS/sms.db")
     assert rules[0].matches_device_name("/.b/6/Library/SMS/sms.db")
+    assert rules[1].matches_device_name("HomeDomain-Library/SMS/sms.db-shm")
+    assert rules[2].matches_device_name("HomeDomain-Library/SMS/sms.db-wal")
 
 
-def test_backup_selection_presets_include_contacts_call_history_and_bookmarks() -> None:
-    assert {"contacts", "call_history", "bookmarks"} <= set(BACKUP_SELECTIONS)
+def test_backup_selection_presets_include_common_artifacts() -> None:
+    assert {"contacts", "call_history", "bookmarks", "knowledge", "safari_history", "sms", "tcc"} <= set(
+        BACKUP_SELECTIONS
+    )
+
+
+def test_backup_selection_names_include_regex_backed_presets() -> None:
+    assert "database_artifacts" in BACKUP_SELECTION_REGEXES
+    assert "database_artifacts" in BACKUP_SELECTION_NAMES
+
+
+def test_backup_exclusion_names_include_photo_preset() -> None:
+    assert "photos" in BACKUP_EXCLUSION_REGEXES
+    assert "photos" in BACKUP_EXCLUSION_NAMES
+    assert "photos" not in BACKUP_SELECTION_NAMES
+
+
+def test_resolve_backup_selection_regexes_database_artifacts() -> None:
+    patterns = Mobilebackup2Service.resolve_backup_selection_regexes(["database_artifacts"])
+    callback = Mobilebackup2Service.regex_filter_callback(patterns)
+
+    assert callback(BackupFile(device_name="HomeDomain-Library/SMS/sms.db-wal"))
+    assert callback(BackupFile(domain="HomeDomain", relative_path="Library/Safari/History.db"))
+    assert callback(BackupFile(domain="HomeDomain", relative_path="Library/Preferences/com.apple.Preferences.plist"))
+    assert not callback(BackupFile(domain="CameraRollDomain", relative_path="Media/DCIM/100APPLE/IMG_0001.JPG"))
+
+
+def test_resolve_backup_exclusion_regexes_photos() -> None:
+    patterns = Mobilebackup2Service.resolve_backup_exclusion_regexes(["photos"])
+    callback = Mobilebackup2Service.regex_filter_callback(patterns)
+
+    assert callback(BackupFile(device_name="CameraRollDomain-Media/DCIM/100APPLE/IMG_0001.HEIC"))
+    assert callback(BackupFile(domain="CameraRollDomain", relative_path="Media/PhotoData/Photos.sqlite"))
+    assert not callback(BackupFile(domain="HomeDomain", relative_path="Library/SMS/sms.db"))
+    assert not callback(BackupFile(domain="MediaDomain", relative_path="Library/SMS"))
+
+
+def test_resolve_backup_exclusion_exact_artifact_presets() -> None:
+    rules = Mobilebackup2Service.resolve_backup_exclusion(["sms"])
+
+    assert any(rule.matches_manifest_entry("HomeDomain", "Library/SMS/sms.db") for rule in rules)
+    assert any(rule.matches_manifest_entry("HomeDomain", "Library/SMS/sms.db-shm") for rule in rules)
+    assert any(rule.matches_manifest_entry("HomeDomain", "Library/SMS/sms.db-wal") for rule in rules)
+
+
+def test_resolve_backup_selection_exact_artifact_presets() -> None:
+    rules = Mobilebackup2Service.resolve_backup_selection(["safari_history", "knowledge", "tcc"])
+
+    assert any(rule.matches_manifest_entry("HomeDomain", "Library/Safari/History.db-wal") for rule in rules)
+    assert any(
+        rule.matches_manifest_entry(
+            "AppDomain-com.apple.mobilesafari", "Library/Preferences/com.apple.Safari.History.plist"
+        )
+        for rule in rules
+    )
+    assert any(
+        rule.matches_manifest_entry(
+            "AppDomainGroup-group.com.apple.PegasusConfiguration", "EngagedCompletions/Cache.db"
+        )
+        for rule in rules
+    )
+    assert any(rule.matches_manifest_entry("HomeDomain", "Library/CoreDuet/Knowledge/knowledgeC.db") for rule in rules)
+    assert any(rule.matches_manifest_entry("HomeDomain", "Library/TCC/TCC.db-shm") for rule in rules)
 
 
 def test_regex_filter_callback_matches_upload_and_manifest_forms() -> None:
@@ -106,6 +173,32 @@ def test_combine_filter_callbacks_matches_when_any_callback_matches() -> None:
     assert callback(BackupFile(device_name="HomeDomain-Library/SMS/sms.db"))
     assert callback(BackupFile(device_name="HomeDomain-Library/Preferences/com.apple.Preferences.plist"))
     assert not callback(BackupFile(device_name="HomeDomain-Library/Notes/NotesV7.store"))
+
+
+def test_combine_include_exclude_filter_callbacks_excludes_after_include() -> None:
+    include_callback = Mobilebackup2Service.regex_filter_callback(
+        Mobilebackup2Service.resolve_backup_selection_regexes(["database_artifacts"])
+    )
+    exclude_callback = Mobilebackup2Service.regex_filter_callback(
+        Mobilebackup2Service.resolve_backup_exclusion_regexes(["photos"])
+    )
+    callback = Mobilebackup2Service.combine_include_exclude_filter_callbacks(include_callback, exclude_callback)
+
+    assert callback is not None
+    assert callback(BackupFile(domain="HomeDomain", relative_path="Library/SMS/sms.db"))
+    assert not callback(BackupFile(domain="CameraRollDomain", relative_path="Media/PhotoData/Photos.sqlite"))
+    assert not callback(BackupFile(domain="HomeDomain", relative_path="Library/Notes/notes.store"))
+
+
+def test_combine_include_exclude_filter_callbacks_exclude_only_keeps_nonmatching_files() -> None:
+    exclude_callback = Mobilebackup2Service.regex_filter_callback(
+        Mobilebackup2Service.resolve_backup_exclusion_regexes(["photos"])
+    )
+    callback = Mobilebackup2Service.combine_include_exclude_filter_callbacks(None, exclude_callback)
+
+    assert callback is not None
+    assert callback(BackupFile(domain="HomeDomain", relative_path="Library/SMS/sms.db"))
+    assert not callback(BackupFile(domain="CameraRollDomain", relative_path="Media/DCIM/100APPLE/IMG_0001.HEIC"))
 
 
 def test_selection_filter_callback_matches_upload_and_manifest_forms() -> None:
@@ -278,6 +371,50 @@ def test_prune_backup_directory_keeps_hashed_backup_file_layout(tmp_path: Path) 
 
     assert keep_path.exists()
     assert not drop_path.exists()
+
+
+def test_prune_backup_directory_excludes_selected_files(tmp_path: Path) -> None:
+    device_directory = tmp_path / "device"
+    device_directory.mkdir()
+    manifest_db = device_directory / "Manifest.db"
+    sms_file_id = "3d0d7e5fb2ce288813306e4d4636395e047a3d28"
+    photo_file_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    with closing(sqlite3.connect(manifest_db)) as connection:
+        connection.execute("CREATE TABLE Files (fileID TEXT, domain TEXT, relativePath TEXT)")
+        connection.executemany(
+            "INSERT INTO Files (fileID, domain, relativePath) VALUES (?, ?, ?)",
+            [
+                (sms_file_id, "HomeDomain", "Library/SMS/sms.db"),
+                (photo_file_id, "CameraRollDomain", "Media/DCIM/100APPLE/IMG_0001.HEIC"),
+            ],
+        )
+        connection.commit()
+
+    (device_directory / "Info.plist").write_text("")
+    (device_directory / "Manifest.plist").write_text("")
+    (device_directory / "Status.plist").write_text("")
+    sms_path = device_directory / sms_file_id[:2] / sms_file_id
+    sms_path.parent.mkdir()
+    sms_path.write_text("sms")
+    photo_path = device_directory / photo_file_id[:2] / photo_file_id
+    photo_path.parent.mkdir()
+    photo_path.write_text("photo")
+    exclude_callback = Mobilebackup2Service.regex_filter_callback(
+        Mobilebackup2Service.resolve_backup_exclusion_regexes(["photos"])
+    )
+
+    Mobilebackup2Service.prune_backup_directory(
+        device_directory,
+        Mobilebackup2Service.combine_include_exclude_filter_callbacks(None, exclude_callback),
+    )
+
+    with closing(sqlite3.connect(manifest_db)) as connection:
+        rows = connection.execute("SELECT fileID, domain, relativePath FROM Files").fetchall()
+
+    assert rows == [(sms_file_id, "HomeDomain", "Library/SMS/sms.db")]
+    assert sms_path.exists()
+    assert not photo_path.exists()
 
 
 @pytest.mark.asyncio

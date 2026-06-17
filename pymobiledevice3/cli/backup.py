@@ -10,9 +10,17 @@ from tqdm import tqdm
 from typer_injector import InjectingTyper
 
 from pymobiledevice3.cli.cli_common import ServiceProviderDep, async_command
-from pymobiledevice3.services.mobilebackup2 import BACKUP_SELECTIONS, Mobilebackup2Service
+from pymobiledevice3.services.mobilebackup2 import BACKUP_EXCLUSION_NAMES, BACKUP_SELECTION_NAMES, Mobilebackup2Service
 
 logger = logging.getLogger(__name__)
+BACKUP_SELECTION_HELP = (
+    "Preserve only selected backup payload presets. Repeat to keep multiple presets. "
+    f"Available: {', '.join(BACKUP_SELECTION_NAMES)}"
+)
+BACKUP_EXCLUSION_HELP = (
+    "Exclude selected backup payload presets from the preserved local output and manifest. The device may still "
+    f"transmit excluded data during backup. Repeat to exclude multiple presets. Available: {', '.join(BACKUP_EXCLUSION_NAMES)}"
+)
 
 
 cli = InjectingTyper(
@@ -65,8 +73,8 @@ BackupSelectionOption = Annotated[
     Optional[list[str]],
     typer.Option(
         "--only",
-        click_type=click.Choice(sorted(BACKUP_SELECTIONS), case_sensitive=False),
-        help="Preserve only selected backup payload presets. Repeat to keep multiple presets.",
+        click_type=click.Choice(BACKUP_SELECTION_NAMES, case_sensitive=False),
+        help=BACKUP_SELECTION_HELP,
     ),
 ]
 BackupRegexOption = Annotated[
@@ -75,6 +83,26 @@ BackupRegexOption = Annotated[
         "--only-regex",
         callback=validate_regex_patterns,
         help="Preserve only backup payloads whose device path or manifest path matches this regex. Repeat to keep multiple regexes.",
+    ),
+]
+BackupExclusionOption = Annotated[
+    Optional[list[str]],
+    typer.Option(
+        "--exclude",
+        click_type=click.Choice(BACKUP_EXCLUSION_NAMES, case_sensitive=False),
+        help=BACKUP_EXCLUSION_HELP,
+    ),
+]
+BackupExcludeRegexOption = Annotated[
+    Optional[list[str]],
+    typer.Option(
+        "--exclude-regex",
+        callback=validate_regex_patterns,
+        help=(
+            "Exclude backup payloads whose device path or manifest path matches this regex from the preserved local "
+            "output and manifest. The device may still transmit excluded data during backup. Repeat to exclude "
+            "multiple regexes."
+        ),
     ),
 ]
 
@@ -96,6 +124,8 @@ async def backup(
     ] = False,
     only: BackupSelectionOption = None,
     only_regex: BackupRegexOption = None,
+    exclude: BackupExclusionOption = None,
+    exclude_regex: BackupExcludeRegexOption = None,
     password: PasswordOption = "",
     unback: Annotated[
         bool,
@@ -111,18 +141,26 @@ async def backup(
     All backup data will be written to BACKUP_DIRECTORY, under a directory named with the device's udid.
     """
     backup_directory.mkdir(parents=True, exist_ok=True)
-    preserve_rules = tuple(
-        rule for selection_name in (only or ()) for rule in BACKUP_SELECTIONS[selection_name.lower()]
-    )
-    filter_callback = Mobilebackup2Service.combine_filter_callbacks(
+    preserve_rules = Mobilebackup2Service.resolve_backup_selection(only)
+    preserve_regexes = Mobilebackup2Service.resolve_backup_selection_regexes(only)
+    exclude_rules = Mobilebackup2Service.resolve_backup_exclusion(exclude)
+    exclude_regexes = Mobilebackup2Service.resolve_backup_exclusion_regexes(exclude)
+    include_callback = Mobilebackup2Service.combine_filter_callbacks(
         Mobilebackup2Service.selection_filter_callback(preserve_rules) if preserve_rules else None,
+        Mobilebackup2Service.regex_filter_callback(preserve_regexes) if preserve_regexes else None,
         Mobilebackup2Service.regex_filter_callback(only_regex) if only_regex else None,
     )
+    exclude_callback = Mobilebackup2Service.combine_filter_callbacks(
+        Mobilebackup2Service.selection_filter_callback(exclude_rules) if exclude_rules else None,
+        Mobilebackup2Service.regex_filter_callback(exclude_regexes) if exclude_regexes else None,
+        Mobilebackup2Service.regex_filter_callback(exclude_regex) if exclude_regex else None,
+    )
+    filter_callback = Mobilebackup2Service.combine_include_exclude_filter_callbacks(include_callback, exclude_callback)
 
     async with Mobilebackup2Service(service_provider) as backup_client:
         if filter_callback is not None and not password and await backup_client.get_will_encrypt():
             raise typer.BadParameter(
-                "--password is required when using --only or --only-regex with encrypted backups.",
+                "--password is required when using backup include or exclude filters with encrypted backups.",
                 param_hint="--password",
             )
 

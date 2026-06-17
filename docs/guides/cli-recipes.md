@@ -55,7 +55,16 @@ pymobiledevice3 backup2 backup --only whatsapp DIRECTORY
 pymobiledevice3 backup2 backup --only contacts DIRECTORY
 pymobiledevice3 backup2 backup --only call_history DIRECTORY
 pymobiledevice3 backup2 backup --only bookmarks DIRECTORY
-pymobiledevice3 backup2 backup --only-regex '\\.(plist|db|db-shm|db-wal|sqlite|sqlite-shm|sqlite-wal|sqlitedb|sqlitedb-shm|sqlitedb-wal|storedata|storedata-shm|storedata-wal)$' DIRECTORY
+pymobiledevice3 backup2 backup --only safari_history DIRECTORY
+pymobiledevice3 backup2 backup --only knowledge DIRECTORY
+pymobiledevice3 backup2 backup --only tcc DIRECTORY
+pymobiledevice3 backup2 backup --only database_artifacts DIRECTORY
+
+# Exclude selected payloads from the preserved local backup output and manifest.
+# The device may still transmit excluded data during backup.
+pymobiledevice3 backup2 backup --exclude photos DIRECTORY
+pymobiledevice3 backup2 backup --only database_artifacts --exclude photos DIRECTORY
+pymobiledevice3 backup2 backup --exclude-regex '^CameraRollDomain[/-]' DIRECTORY
 
 # Restore backup
 pymobiledevice3 backup2 restore DIRECTORY
