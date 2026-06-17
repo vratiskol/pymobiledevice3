@@ -5,6 +5,7 @@ import typer
 from typer_injector import InjectingTyper
 
 from pymobiledevice3.cli.cli_common import ServiceProviderDep, async_command
+from pymobiledevice3.exceptions import SysdiagnoseTimeoutError
 from pymobiledevice3.services.crash_reports import CrashReportsManager, CrashReportsShell
 
 cli = InjectingTyper(
@@ -188,6 +189,10 @@ async def crash_sysdiagnose(
     ] = None,
 ) -> None:
     """get a sysdiagnose archive from device (requires user interaction)"""
-    print("Press Power+VolUp+VolDown for 0.215 seconds")
+    print("Press Power+VolUp+VolDown for 0.215 seconds", flush=True)
     async with CrashReportsManager(service_provider) as crash_manager:
-        await crash_manager.get_new_sysdiagnose(str(out), erase=erase, timeout=timeout)
+        try:
+            await crash_manager.get_new_sysdiagnose(str(out), erase=erase, timeout=timeout)
+        except SysdiagnoseTimeoutError as e:
+            typer.echo(f"Error: {e}", err=True)
+            raise typer.Exit(code=1) from None
