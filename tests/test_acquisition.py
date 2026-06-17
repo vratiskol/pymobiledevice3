@@ -1,4 +1,5 @@
 import hashlib
+import plistlib
 
 from pymobiledevice3.acquisition import (
     DIRECTORY_DIGEST_ALGORITHM,
@@ -78,6 +79,34 @@ def test_classify_artifact_detects_common_acquisition_artifacts(tmp_path) -> Non
     assert classify_artifact(backup_root) == "itunes_backup_root"
     assert classify_artifact(crash) == "crash_report"
     assert classify_artifact(sysdiagnose) == "sysdiagnose_archive"
+
+
+def test_classify_artifact_detects_forensic_collection_artifacts(tmp_path) -> None:
+    packet_capture = tmp_path / "device-traffic.pcapng"
+    packet_capture.write_bytes(b"pcap")
+    legacy_packet_capture = tmp_path / "device-traffic.pcap"
+    legacy_packet_capture.write_bytes(b"pcap")
+    logarchive = tmp_path / "system_logs.logarchive"
+    logarchive.mkdir()
+    (logarchive / "logdata").write_bytes(b"log")
+    file_relay_archive = tmp_path / "CrashReporter.cpio.gz"
+    file_relay_archive.write_bytes(b"archive")
+    diagnostics_archive = tmp_path / "os_trace_2026.tar"
+    diagnostics_archive.write_bytes(b"archive")
+    mobilebackup_domains = tmp_path / "Domains.plist"
+    with mobilebackup_domains.open("wb") as out:
+        plistlib.dump({"SystemDomains": {}, "Version": "24.0"}, out)
+    generic_domains = tmp_path / "OtherDomains.plist"
+    with generic_domains.open("wb") as out:
+        plistlib.dump({"Domains": {}}, out)
+
+    assert classify_artifact(packet_capture) == "packet_capture"
+    assert classify_artifact(legacy_packet_capture) == "packet_capture"
+    assert classify_artifact(logarchive) == "logarchive"
+    assert classify_artifact(file_relay_archive) == "file_relay_archive"
+    assert classify_artifact(diagnostics_archive) == "diagnostics_archive"
+    assert classify_artifact(mobilebackup_domains) == "mobilebackup_domains_plist"
+    assert classify_artifact(generic_domains) == "plist"
 
 
 def test_build_device_context_redacts_identifiers_by_default() -> None:

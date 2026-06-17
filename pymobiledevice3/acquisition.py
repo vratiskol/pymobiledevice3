@@ -1,11 +1,50 @@
 import datetime
 import hashlib
+import plistlib
 from pathlib import Path
 from typing import Any, Optional
 
 MANIFEST_SCHEMA_VERSION = 1
 DIRECTORY_DIGEST_ALGORITHM = "sha256-relative-path-manifest-v1"
 BACKUP_MARKER_FILES = {"Info.plist", "Manifest.plist", "Status.plist"}
+PACKET_CAPTURE_SUFFIXES = {".pcap", ".pcapng"}
+ARCHIVE_SUFFIX_CHAINS = {".tar", ".tar.bz2", ".tar.gz", ".tar.xz", ".tgz", ".zip"}
+FILE_RELAY_ARCHIVE_SUFFIX_CHAINS = {".cpio", ".cpio.gz"}
+FILE_RELAY_ARCHIVE_NAME_HINTS = {
+    "accounts",
+    "addressbook",
+    "applesupport",
+    "baseband",
+    "corelocation",
+    "crashreporter",
+    "hfsmeta",
+    "keyboard",
+    "lockdown",
+    "mobileasset",
+    "mobilebackup",
+    "mobilecal",
+    "mobiledelete",
+    "mobileinstallation",
+    "mobilenotes",
+    "nanddebuginfo",
+    "network",
+    "photos",
+    "systemconfiguration",
+    "tmp",
+    "ubiquity",
+    "userdatabases",
+    "varfs",
+    "voicemail",
+    "vpn",
+    "wifi",
+    "wirelessautomation",
+}
+DIAGNOSTICS_ARCHIVE_NAME_HINTS = (
+    "diagnostic",
+    "diagnostics",
+    "os_trace",
+    "os-trace",
+)
 DEVICE_CONTEXT_KEYS = {
     "BuildVersion": "build_version",
     "DeviceClass": "device_class",
@@ -51,7 +90,10 @@ def summarize_artifact(path: Path, *, hash_files: bool = True) -> dict:
 
 
 def classify_artifact(path: Path) -> str:
+    name = path.name.lower()
     if path.is_dir():
+        if name.endswith(".logarchive"):
+            return "logarchive"
         if _is_itunes_backup(path):
             return "itunes_backup"
         if any(child.is_dir() and _is_itunes_backup(child) for child in path.iterdir()):
@@ -59,14 +101,51 @@ def classify_artifact(path: Path) -> str:
         return "directory"
 
     suffixes = [suffix.lower() for suffix in path.suffixes]
-    name = path.name.lower()
+    suffix_chain = "".join(suffixes)
     if any(suffix in {".crash", ".ips", ".panic"} for suffix in suffixes):
         return "crash_report"
+    if path.suffix.lower() in PACKET_CAPTURE_SUFFIXES:
+        return "packet_capture"
+    if name.endswith(".logarchive"):
+        return "logarchive"
+    if _is_mobilebackup_domains_plist(path):
+        return "mobilebackup_domains_plist"
     if "sysdiagnose" in name and suffixes:
         return "sysdiagnose_archive"
+    if _is_file_relay_archive(name, suffix_chain):
+        return "file_relay_archive"
+    if _is_diagnostics_archive(name, suffix_chain):
+        return "diagnostics_archive"
     if path.suffix.lower() == ".plist":
         return "plist"
     return "file"
+
+
+def _is_file_relay_archive(name: str, suffix_chain: str) -> bool:
+    if suffix_chain not in FILE_RELAY_ARCHIVE_SUFFIX_CHAINS:
+        return False
+    if "file_relay" in name or "file-relay" in name:
+        return True
+    archive_name = name.removesuffix(suffix_chain)
+    return _normalize_artifact_name(archive_name) in FILE_RELAY_ARCHIVE_NAME_HINTS
+
+
+def _is_diagnostics_archive(name: str, suffix_chain: str) -> bool:
+    return suffix_chain in ARCHIVE_SUFFIX_CHAINS and any(hint in name for hint in DIAGNOSTICS_ARCHIVE_NAME_HINTS)
+
+
+def _is_mobilebackup_domains_plist(path: Path) -> bool:
+    if path.name.lower() != "domains.plist":
+        return False
+    try:
+        data = plistlib.loads(path.read_bytes())
+    except (OSError, plistlib.InvalidFileException, TypeError, ValueError):
+        return False
+    return isinstance(data, dict) and isinstance(data.get("SystemDomains"), dict) and "Version" in data
+
+
+def _normalize_artifact_name(name: str) -> str:
+    return name.replace("-", "").replace("_", "")
 
 
 def _summarize_file(path: Path, *, hash_file: bool) -> dict:
