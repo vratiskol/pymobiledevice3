@@ -26,6 +26,7 @@ from pymobiledevice3.exceptions import ConnectionFailedError, ConnectionFailedTo
 from pymobiledevice3.irecv import IRecv
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.restore.device import Device
+from pymobiledevice3.restore.firmware_inventory import build_restore_firmware_inventory
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore import Restore
 from pymobiledevice3.services.diagnostics import DiagnosticsService
@@ -261,6 +262,53 @@ async def restore_ramdisk(device: DeviceDep, ipsw_ctx: IPSWCtxDep) -> None:
     Boot only the update ramdisk without performing a restore (IPSW path or URL accepted).
     """
     await restore_ramdisk_task(device, ipsw_ctx)
+
+
+@cli.command("firmware-info")
+def restore_firmware_info(
+    ipsw_root: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--ipsw-root",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+            help="Path to an extracted IPSW root containing BuildManifest.plist and/or Restore.plist.",
+        ),
+    ] = None,
+    firmware_root: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--firmware-root",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+            help="Path to an extracted RestoreOS or firmware root to scan for component inventory.",
+        ),
+    ] = None,
+    product: Annotated[
+        Optional[str],
+        typer.Option(help="Product type to resolve model-specific FDR metadata, for example iPhone18,2."),
+    ] = None,
+    include_components: Annotated[
+        bool,
+        typer.Option(help="Include per-component BuildManifest rows instead of only summary counts."),
+    ] = False,
+) -> None:
+    """inspect read-only restore manifest and RestoreOS component metadata"""
+    try:
+        print_json(
+            build_restore_firmware_inventory(
+                ipsw_root=ipsw_root,
+                firmware_root=firmware_root,
+                product=product,
+                include_components=include_components,
+            )
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
 
 
 @cli.command("update")
