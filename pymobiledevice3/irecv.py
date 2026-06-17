@@ -86,8 +86,8 @@ class IRecv:
         return self._device_info["SRNM"]
 
     @property
-    def iboot_version(self) -> str:
-        return self._device_info["SRTG"]
+    def iboot_version(self) -> Optional[str]:
+        return self._device_info.get("SRTG")
 
     @property
     def is_image4_supported(self):

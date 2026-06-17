@@ -50,8 +50,12 @@ class FakeIRecv:
             "auto-boot": b"true\x00ignored",
             "build-version": b"iBoot-9999\x00",
             "serial-number": b"sensitive-serial\x00",
-            "missing": None,
-        }[name]
+        "missing": None,
+    }[name]
+
+
+class FakeIRecvNoSrtg(FakeIRecv):
+    iboot_version = None
 
 
 class FakeRestoredClient:
@@ -212,6 +216,13 @@ def test_irecv_restore_info_decodes_recovery_mode() -> None:
     assert info["iboot"]["flags"]["effective_security_mode"] is True
     assert info["iboot"]["flags"]["effective_production_mode"] is True
     assert info["nonces"]["sep_nonce"] == "ccdd"
+
+
+def test_irecv_restore_info_allows_missing_iboot_version() -> None:
+    info = restore._irecv_restore_info(FakeIRecvNoSrtg())
+
+    assert info["mode"]["name"] == "RECOVERY_MODE_4"
+    assert info["iboot"]["version"] is None
 
 
 def test_restored_restore_info_includes_query_type_and_debug_info() -> None:
