@@ -46,11 +46,13 @@ from pymobiledevice3.restore.purple import (
 from pymobiledevice3.restore.purple_proxy import (
     PURPLE_PROXY_CONTROL_PORT,
     PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
+    PURPLE_PROXY_CONN_PROTOCOL_VERSION,
     PURPLE_PROXY_LOOPBACK_HOST,
     PURPLE_PROXY_NOTIFY_PORT,
     PURPLE_PROXY_SOCKS_PORT,
     PurpleProxyCommand,
     build_purple_proxy_dictionary,
+    probe_purple_proxy_conn,
     run_purple_proxy_control_command,
     run_purple_proxy_notify_command,
     run_purple_proxy_session,
@@ -262,9 +264,14 @@ def _irecv_public_state() -> Optional[RestoreExitState]:
     state: RestoreExitState = {
         "state": "recovery" if mode.is_recovery else "dfu",
         "mode": mode.name,
+        "mode_value": mode.value,
     }
     with contextlib.suppress(Exception):
         state["product_type"] = irecv.product_type
+    with contextlib.suppress(Exception):
+        state["hardware_model"] = irecv.hardware_model
+    with contextlib.suppress(Exception):
+        state["ecid"] = f"0x{irecv.ecid:x}"
     return state
 
 
@@ -660,7 +667,7 @@ async def restore_purple_control(
     ] = False,
     wait_socket: Annotated[
         bool,
-        typer.Option("--wait-socket", help="Send WaitSocket with ConnPort to the PurpleReverseProxy control port."),
+        typer.Option("--wait-socket", help="Report firmware-internal WaitSocket status; no device command is sent."),
     ] = False,
     ping: Annotated[
         bool,
@@ -680,7 +687,7 @@ async def restore_purple_control(
     ] = PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
     conn_port: Annotated[
         int,
-        typer.Option("--conn-port", min=1, max=0xFFFF, help="ConnPort value to send with WaitSocket."),
+        typer.Option("--conn-port", min=1, max=0xFFFF, help="ConnPort value to include in WaitSocket status output."),
     ] = PURPLE_PROXY_SOCKS_PORT,
     include_response: Annotated[
         bool,
@@ -834,6 +841,14 @@ async def restore_purple_socks_probe(
         int,
         typer.Option("--port", min=1, max=0xFFFF, help="Device-side PurpleReverseProxy SOCKS port."),
     ] = PURPLE_PROXY_SOCKS_PORT,
+    conn_protocol_version: Annotated[
+        int,
+        typer.Option(
+            "--conn-protocol-version",
+            min=0,
+            help="Retained for output compatibility; SOCKS probe does not send HelloConn.",
+        ),
+    ] = PURPLE_PROXY_CONN_PROTOCOL_VERSION,
     connect_host: Annotated[
         Optional[str],
         typer.Option(
@@ -880,6 +895,7 @@ async def restore_purple_socks_probe(
             usbmux_address=usbmux_address,
             timeout=timeout,
             port=effective_port,
+            conn_protocol_version=conn_protocol_version,
             connect_host=connect_host,
             connect_port=connect_port,
             include_response=include_response,
@@ -889,6 +905,78 @@ async def restore_purple_socks_probe(
     _annotate_port_config(result, port_config)
     print_json(result, colored=False)
     if strict and not result["summary"]["ok"]:
+        raise typer.Exit(1)
+
+
+@cli.command("purple-conn")
+@async_command
+async def restore_purple_conn(
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", min=0.1, help="Timeout for connecting and waiting for a conn reply."),
+    ] = 1.0,
+    port: Annotated[
+        int,
+        typer.Option(
+            "--port",
+            min=1,
+            max=0xFFFF,
+            help="Dynamic PurpleReverseProxy ConnPort returned by BeginCtrl and ControlSync.",
+        ),
+    ] = PURPLE_PROXY_SOCKS_PORT,
+    conn_protocol_version: Annotated[
+        int,
+        typer.Option(
+            "--conn-protocol-version",
+            min=0,
+            help="ConnProtoVersion value to send with HelloConn.",
+        ),
+    ] = PURPLE_PROXY_CONN_PROTOCOL_VERSION,
+    include_response: Annotated[
+        bool,
+        typer.Option("--include-response", help="Include the sanitized conn response dictionary in JSON output."),
+    ] = False,
+    include_identifiers: Annotated[
+        bool,
+        typer.Option("--include-identifiers", help="Include raw conn identifiers in JSON output."),
+    ] = False,
+    firmware_root: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--firmware-root",
+            help="Read PurpleReverseProxy conn port from an extracted RestoreOS ramdisk root.",
+        ),
+    ] = None,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Exit non-zero when the conn operation is not reachable."),
+    ] = False,
+    udid: Annotated[
+        Optional[str],
+        typer.Option("--udid", "--serial", help="Target device serial/UDID; never printed in command output."),
+    ] = None,
+    usbmux_address: Annotated[
+        Optional[str],
+        typer.Option("--usbmux-address", help="Address of the usbmuxd daemon (unix socket path or HOST:PORT)."),
+    ] = None,
+) -> None:
+    """
+    Probe the PurpleReverseProxy conn handshake without restoring a device.
+    """
+    port_config = _purple_port_config(firmware_root)
+    effective_port = _purple_configured_port(port_config, "socks", port, PURPLE_PROXY_SOCKS_PORT)
+    result = await probe_purple_proxy_conn(
+        udid=udid,
+        usbmux_address=usbmux_address,
+        timeout=timeout,
+        port=effective_port,
+        protocol_version=conn_protocol_version,
+        include_response=include_response,
+        include_identifiers=include_identifiers,
+    )
+    _annotate_port_config(result, port_config)
+    print_json(result, colored=False)
+    if strict and not result["reachable"]:
         raise typer.Exit(1)
 
 
@@ -1018,6 +1106,10 @@ def _purple_wait_kwargs(
     timeout: float,
     poll_interval: float,
     probe_timeout: float,
+    stable_attempts: int,
+    stable_seconds: float,
+    poll_backoff_factor: float,
+    max_poll_interval: float,
     include_services: bool,
     port_config: Optional[dict[str, Any]],
     include_identifiers: bool = False,
@@ -1029,6 +1121,10 @@ def _purple_wait_kwargs(
         "timeout": timeout,
         "poll_interval": poll_interval,
         "probe_timeout": probe_timeout,
+        "stable_attempts": stable_attempts,
+        "stable_seconds": stable_seconds,
+        "poll_backoff_factor": poll_backoff_factor,
+        "max_poll_interval": max_poll_interval,
         "include_services": include_services,
         "include_identifiers": include_identifiers,
         "include_history": include_history,
@@ -1053,6 +1149,38 @@ async def restore_purple_wait(
         float,
         typer.Option("--poll-interval", min=0.1, help="Seconds between readiness probes."),
     ] = 1.0,
+    stable_attempts: Annotated[
+        int,
+        typer.Option(
+            "--stable-attempts",
+            min=1,
+            help="Consecutive restored probes required before reporting readiness.",
+        ),
+    ] = 2,
+    stable_seconds: Annotated[
+        float,
+        typer.Option(
+            "--stable-seconds",
+            min=0.0,
+            help="Seconds the device must remain restored before reporting readiness.",
+        ),
+    ] = 0.0,
+    poll_backoff_factor: Annotated[
+        float,
+        typer.Option(
+            "--poll-backoff-factor",
+            min=1.0,
+            help="Multiply the poll interval after each failed attempt to reduce restore-mode hammering.",
+        ),
+    ] = 1.0,
+    max_poll_interval: Annotated[
+        float,
+        typer.Option(
+            "--max-poll-interval",
+            min=0.1,
+            help="Upper bound for the adaptive poll interval when backoff is enabled.",
+        ),
+    ] = 5.0,
     firmware_root: Annotated[
         Optional[Path],
         typer.Option(
@@ -1098,6 +1226,10 @@ async def restore_purple_wait(
             timeout=timeout,
             poll_interval=poll_interval,
             probe_timeout=probe_timeout,
+            stable_attempts=stable_attempts,
+            stable_seconds=stable_seconds,
+            poll_backoff_factor=poll_backoff_factor,
+            max_poll_interval=max_poll_interval,
             include_services=include_services,
             port_config=port_config,
             include_identifiers=include_identifiers,
@@ -1131,7 +1263,12 @@ async def restore_purple_session(
     ] = PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
     conn_port: Annotated[
         int,
-        typer.Option("--conn-port", min=1, max=0xFFFF, help="ConnPort value to send with WaitSocket."),
+        typer.Option(
+            "--conn-port",
+            min=1,
+            max=0xFFFF,
+            help="Initial PurpleReverseProxy SOCKS port; BeginCtrl returns the dynamic ConnPort.",
+        ),
     ] = PURPLE_PROXY_SOCKS_PORT,
     log_level: Annotated[
         Optional[int],
@@ -1163,7 +1300,7 @@ async def restore_purple_session(
     ] = 8,
     probe_socks: Annotated[
         bool,
-        typer.Option("--probe-socks", help="Also run a SOCKS5 data-plane probe on --conn-port after WaitSocket."),
+        typer.Option("--probe-socks", help="Also run a SOCKS5 data-plane probe on the launchd SOCKS port."),
     ] = False,
     socks_connect_host: Annotated[
         Optional[str],
@@ -1287,6 +1424,38 @@ async def restore_purple_evidence(
         float,
         typer.Option("--wait-poll-interval", min=0.1, help="Seconds between probes when --wait-restoreos is used."),
     ] = 1.0,
+    wait_stable_attempts: Annotated[
+        int,
+        typer.Option(
+            "--wait-stable-attempts",
+            min=1,
+            help="Consecutive restored probes required before the wait completes.",
+        ),
+    ] = 2,
+    wait_stable_seconds: Annotated[
+        float,
+        typer.Option(
+            "--wait-stable-seconds",
+            min=0.0,
+            help="Seconds the device must remain restored before the wait completes.",
+        ),
+    ] = 0.0,
+    wait_poll_backoff_factor: Annotated[
+        float,
+        typer.Option(
+            "--wait-poll-backoff-factor",
+            min=1.0,
+            help="Adaptive wait poll backoff factor used while the device is not stable yet.",
+        ),
+    ] = 1.0,
+    wait_max_poll_interval: Annotated[
+        float,
+        typer.Option(
+            "--wait-max-poll-interval",
+            min=0.1,
+            help="Upper bound for the adaptive poll interval while waiting for RestoreOS.",
+        ),
+    ] = 5.0,
     include_wait_history: Annotated[
         bool,
         typer.Option(
@@ -1307,7 +1476,12 @@ async def restore_purple_evidence(
     ] = PURPLE_PROXY_CONTROL_PROTOCOL_VERSION,
     conn_port: Annotated[
         int,
-        typer.Option("--conn-port", min=1, max=0xFFFF, help="ConnPort value to send with WaitSocket."),
+        typer.Option(
+            "--conn-port",
+            min=1,
+            max=0xFFFF,
+            help="Initial PurpleReverseProxy SOCKS port; BeginCtrl returns the dynamic ConnPort.",
+        ),
     ] = PURPLE_PROXY_SOCKS_PORT,
     log_level: Annotated[
         int,
@@ -1351,7 +1525,7 @@ async def restore_purple_evidence(
     ] = 8,
     probe_socks: Annotated[
         bool,
-        typer.Option("--probe-socks/--no-probe-socks", help="Run a SOCKS5 data-plane probe after WaitSocket."),
+        typer.Option("--probe-socks/--no-probe-socks", help="Run a SOCKS5 data-plane probe on the launchd SOCKS port."),
     ] = True,
     socks_connect_host: Annotated[
         Optional[str],
@@ -1410,6 +1584,10 @@ async def restore_purple_evidence(
                 timeout=wait_timeout,
                 poll_interval=wait_poll_interval,
                 probe_timeout=timeout,
+                stable_attempts=wait_stable_attempts,
+                stable_seconds=wait_stable_seconds,
+                poll_backoff_factor=wait_poll_backoff_factor,
+                max_poll_interval=wait_max_poll_interval,
                 include_services=include_services,
                 port_config=port_config,
                 include_identifiers=include_identifiers,
@@ -1535,6 +1713,26 @@ async def restore_purple_restore_options(
         Optional[int],
         typer.Option("--socks-port", min=1, max=0xFFFF, help="Set ARUService SOCKSPort in RestoreOptions."),
     ] = None,
+    proxy_enable: Annotated[
+        bool,
+        typer.Option("--proxy-enable", help="Set RestoreOS proxy EnableProxy in RestoreOptions."),
+    ] = False,
+    proxy_enable_ssl: Annotated[
+        bool,
+        typer.Option("--proxy-enable-ssl", help="Set RestoreOS proxy EnableProxySsl in RestoreOptions."),
+    ] = False,
+    proxy_for_https: Annotated[
+        bool,
+        typer.Option("--proxy-for-https", help="Set RestoreOS proxy ForHttps in RestoreOptions."),
+    ] = False,
+    proxy_socks_host: Annotated[
+        Optional[str],
+        typer.Option("--proxy-socks-host", help="Set RestoreOS proxy UseSOCKSHost in RestoreOptions."),
+    ] = None,
+    proxy_socks_port: Annotated[
+        Optional[int],
+        typer.Option("--proxy-socks-port", min=1, max=0xFFFF, help="Set RestoreOS proxy UseSOCKSPort in RestoreOptions."),
+    ] = None,
 ) -> None:
     """
     Build the experimental PurpleReverseProxy RestoreOptions patch without restoring a device.
@@ -1546,6 +1744,11 @@ async def restore_purple_restore_options(
             log_level=log_level,
             socks_host=socks_host,
             socks_port=socks_port,
+            proxy_enable=proxy_enable,
+            proxy_enable_ssl=proxy_enable_ssl,
+            proxy_for_https=proxy_for_https,
+            proxy_socks_host=proxy_socks_host,
+            proxy_socks_port=proxy_socks_port,
         )
     except ValueError as e:
         raise click.ClickException(str(e)) from None
@@ -1592,6 +1795,31 @@ async def restore_update(
         Optional[int],
         typer.Option("--purple-socks-port", min=1, max=0xFFFF, help="Set ARUService SOCKSPort in RestoreOptions."),
     ] = None,
+    purple_proxy_enable: Annotated[
+        bool,
+        typer.Option("--purple-proxy-enable", help="Set RestoreOS proxy EnableProxy in RestoreOptions."),
+    ] = False,
+    purple_proxy_enable_ssl: Annotated[
+        bool,
+        typer.Option("--purple-proxy-enable-ssl", help="Set RestoreOS proxy EnableProxySsl in RestoreOptions."),
+    ] = False,
+    purple_proxy_for_https: Annotated[
+        bool,
+        typer.Option("--purple-proxy-for-https", help="Set RestoreOS proxy ForHttps in RestoreOptions."),
+    ] = False,
+    purple_proxy_socks_host: Annotated[
+        Optional[str],
+        typer.Option("--purple-proxy-socks-host", help="Set RestoreOS proxy UseSOCKSHost in RestoreOptions."),
+    ] = None,
+    purple_proxy_socks_port: Annotated[
+        Optional[int],
+        typer.Option(
+            "--purple-proxy-socks-port",
+            min=1,
+            max=0xFFFF,
+            help="Set RestoreOS proxy UseSOCKSPort in RestoreOptions.",
+        ),
+    ] = None,
 ) -> None:
     """
     Update or restore the device using an IPSW (local path or URL).
@@ -1603,6 +1831,11 @@ async def restore_update(
         or purple_log_level is not None
         or purple_socks_host is not None
         or purple_socks_port is not None
+        or purple_proxy_enable
+        or purple_proxy_enable_ssl
+        or purple_proxy_for_https
+        or purple_proxy_socks_host is not None
+        or purple_proxy_socks_port is not None
     ):
         try:
             purple_restore_options = build_purple_reverse_proxy_restore_options(
@@ -1611,6 +1844,11 @@ async def restore_update(
                 log_level=purple_log_level,
                 socks_host=purple_socks_host,
                 socks_port=purple_socks_port,
+                proxy_enable=purple_proxy_enable,
+                proxy_enable_ssl=purple_proxy_enable_ssl,
+                proxy_for_https=purple_proxy_for_https,
+                proxy_socks_host=purple_proxy_socks_host,
+                proxy_socks_port=purple_proxy_socks_port,
             )["restore_options"]
         except ValueError as e:
             raise click.ClickException(str(e)) from None

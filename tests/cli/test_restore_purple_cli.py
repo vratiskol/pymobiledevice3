@@ -17,6 +17,7 @@ from pymobiledevice3.restore.purple import (
     build_purple_reverse_proxy_port_config,
     build_purple_reverse_proxy_restore_options,
     collect_live_purple_reverse_proxy_probe,
+    collect_live_purple_reverse_proxy_status,
     parse_purple_reverse_proxy_launchd,
     wait_for_purple_restoreos,
 )
@@ -92,6 +93,11 @@ def test_purple_reverse_proxy_catalog_exposes_restoreos_identifiers():
         "log_level": "PRPLogLevel",
         "socks_host": "SOCKSHost",
         "socks_port": "SOCKSPort",
+        "proxy_enable": "EnableProxy",
+        "proxy_enable_ssl": "EnableProxySsl",
+        "proxy_for_https": "ForHttps",
+        "proxy_socks_host": "UseSOCKSHost",
+        "proxy_socks_port": "UseSOCKSPort",
         "disable_when_socks_host_is_set": True,
     }
     assert PURPLE_REVERSE_PROXY_CATALOG["notify_commands"] == ["RegisterNotify", "SetLogLevel"]
@@ -206,7 +212,7 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
 
     purple_proxy = _macho64_with_uuid(
         TEST_UUID,
-        b"HelloCtrl BeginCtrl CtrlProtoVersion WaitSocket NotifyConn RegisterNotify SetLogLevel Level "
+        b"HelloCtrl HelloConn BeginCtrl CtrlConn CtrlProtoVersion ConnProtoVersion Identifier WaitSocket NotifyConn RegisterNotify SetLogLevel Level "
         b"com.apple.private.PurpleReverseProxy.allowed",
     )
     files = {
@@ -216,13 +222,17 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
             b"_kCFStreamPropertySOCKSProxyHost _kCFStreamPropertySOCKSProxyPort "
             b"RegisterNotify SetLogLevel Level RPSocketReadDictionary com.apple.PurpleReverseProxy.RPSocket"
         ),
-        "usr/local/bin/restored_update": b"/usr/lib/libReverseProxyDevice.dylib FDRSubmit PRPLogLevel",
+            "usr/local/bin/restored_update": (
+                b"/usr/lib/libReverseProxyDevice.dylib FDRSubmit PRPLogLevel "
+                b"EnableProxy EnableProxySsl ForHttps SocksProxySettings SOCKSProxyHost SOCKSProxyPort"
+            ),
         "usr/lib/libFDR.dylib": b"_AMFDRHttpCopyPurpleReverseProxyInformation",
         "usr/lib/libamsupport.dylib": (
             b"UsePurpleReverseProxy DisableReverseProxy _kAMSupportHttpOptionUsePurpleReverseProxy"
         ),
         "System/Library/PrivateFrameworks/AppleRestoreUtils.framework/XPCServices/ARUService.xpc/ARUService": (
-            b"DisableReverseProxy SOCKSHost SOCKSPort RestoreOptions com.apple.private.PurpleReverseProxy.allowed"
+            b"DisableReverseProxy EnableProxy EnableProxySsl ForHttps UseSOCKSHost UseSOCKSPort "
+            b"SOCKSHost SOCKSPort RestoreOptions com.apple.private.PurpleReverseProxy.allowed"
         ),
     }
     for relative_path, data in files.items():
@@ -236,13 +246,17 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
     assert deep["files"]["purple_reverse_proxy"]["sha256"] == hashlib.sha256(purple_proxy).hexdigest()
     assert deep["files"]["purple_reverse_proxy"]["macho"]["uuids"] == [{"uuid": "00112233-4455-6677-8899-aabbccddeeff"}]
     assert deep["strings"]["purple_reverse_proxy"]["markers"]["HelloCtrl"] is True
+    assert deep["strings"]["purple_reverse_proxy"]["markers"]["HelloConn"] is True
     assert deep["strings"]["purple_reverse_proxy"]["markers"]["RegisterNotify"] is True
     assert deep["strings"]["device_library"]["markers"]["SetLogLevel"] is True
     assert deep["strings"]["device_library"]["markers"]["CopyProxyDictionaryWithOptions"] is True
     assert deep["strings"]["device_library"]["markers"]["Ping"] is True
     assert deep["strings"]["device_library"]["markers"]["Pong"] is True
     assert deep["strings"]["restored_update"]["markers"]["PRPLogLevel"] is True
+    assert deep["strings"]["restored_update"]["markers"]["EnableProxy"] is True
+    assert deep["strings"]["restored_update"]["markers"]["SocksProxySettings"] is True
     assert deep["strings"]["aru_service"]["markers"]["SOCKSHost"] is True
+    assert deep["strings"]["aru_service"]["markers"]["UseSOCKSHost"] is True
     assert deep["strings"]["amsupport_library"]["markers"]["UsePurpleReverseProxy"] is True
     assert deep["strings"]["fdr_library"]["markers"]["_AMFDRHttpCopyPurpleReverseProxyInformation"] is True
     assert deep["entitlements"]["com.apple.private.PurpleReverseProxy.allowed"]["present"] is True
@@ -252,6 +266,7 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
         "disable_option_evidence": True,
         "fdr_evidence": True,
         "control_protocol_evidence": True,
+        "connection_protocol_evidence": True,
         "notify_protocol_evidence": True,
         "proxy_dictionary_evidence": True,
         "restore_options_evidence": True,
@@ -261,8 +276,8 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
 
     capabilities = build_purple_reverse_proxy_capabilities(tmp_path, deep=True)
     capabilities_by_name = {capability["name"]: capability for capability in capabilities["capabilities"]}
-    assert capabilities["summary"]["capability_count"] == 8
-    assert capabilities["summary"]["firmware_verified_count"] == 6
+    assert capabilities["summary"]["capability_count"] == 10
+    assert capabilities["summary"]["firmware_verified_count"] == 8
     assert capabilities["port_config"]["ports"] == {
         "restore": 62078,
         "socks": 1081,
@@ -272,6 +287,8 @@ def test_build_purple_reverse_proxy_info_deep_from_firmware_root(tmp_path):
     assert capabilities_by_name["restoreos_ramdisk_service"]["status"] == "firmware_verified"
     assert capabilities_by_name["restore_options"]["status"] == "firmware_verified"
     assert capabilities_by_name["control_protocol"]["status"] == "firmware_verified"
+    assert capabilities_by_name["internal_accept_helper"]["status"] == "firmware_verified"
+    assert capabilities_by_name["connection_protocol"]["status"] == "firmware_verified"
     assert capabilities_by_name["notify_protocol"]["status"] == "firmware_verified"
     assert capabilities_by_name["proxy_dictionary"]["status"] == "firmware_verified"
     assert capabilities_by_name["socks_data_plane"]["status"] == "implemented"
@@ -300,9 +317,32 @@ def test_build_purple_reverse_proxy_restore_options_socks_disables_prp():
     assert result["notes"] == ["SOCKSHost disables PurpleReverseProxy according to ARUService RestoreOptions evidence."]
 
 
+def test_build_purple_reverse_proxy_restore_options_exposes_proxy_keys():
+    result = build_purple_reverse_proxy_restore_options(
+        proxy_enable=True,
+        proxy_enable_ssl=True,
+        proxy_for_https=True,
+        proxy_socks_host="127.0.0.1",
+        proxy_socks_port=4321,
+    )
+
+    assert result["restore_options"] == {
+        "EnableProxy": True,
+        "EnableProxySsl": True,
+        "ForHttps": True,
+        "UseSOCKSHost": "127.0.0.1",
+        "UseSOCKSPort": 4321,
+    }
+    assert result["evidence"]["proxy_options"] == "ARUService/restored_update EnableProxy / EnableProxySsl / ForHttps"
+    assert result["evidence"]["proxy_socks"] == "ARUService UseSOCKSHost / UseSOCKSPort"
+
+
 def test_build_purple_reverse_proxy_restore_options_rejects_conflicts():
     with pytest.raises(ValueError, match="mutually exclusive"):
         build_purple_reverse_proxy_restore_options(enable=True, disable=True)
+
+    with pytest.raises(ValueError, match="UseSOCKSPort requires UseSOCKSHost"):
+        build_purple_reverse_proxy_restore_options(proxy_socks_port=4321)
 
 
 def test_apply_purple_reverse_proxy_restore_options_updates_object():
@@ -343,7 +383,7 @@ def test_restore_purple_capabilities_prints_matrix_without_live_probe():
     assert result.exit_code == 0
     output = json.loads(result.output)
     assert output["checked"] is True
-    assert output["summary"]["capability_count"] == 8
+    assert output["summary"]["capability_count"] == 10
     assert output["live_probe"] == {
         "checked": False,
         "reason": "--no-live was provided.",
@@ -840,11 +880,12 @@ def test_restore_purple_proxy_dict_strict_fails_when_ping_is_not_pong(monkeypatc
 
 
 def test_restore_purple_socks_probe_help():
-    result = CliRunner().invoke(__main__.app, ["restore", "purple-socks-probe", "--help"])
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-socks-probe", "--help"], env={"COLUMNS": "200"})
 
     assert result.exit_code == 0
     assert "--timeout" in result.output
     assert "--port" in result.output
+    assert "--conn-protocol-version" in result.output
     assert "--connect-host" in result.output
     assert "--connect-port" in result.output
     assert "--include-response" in result.output
@@ -859,6 +900,7 @@ def test_restore_purple_socks_probe_prints_redacted_json(monkeypatch):
             "usbmux_address": "/tmp/usbmux",
             "timeout": 0.5,
             "port": 1234,
+            "conn_protocol_version": 2,
             "connect_host": "example.test",
             "connect_port": 443,
             "include_response": True,
@@ -870,6 +912,7 @@ def test_restore_purple_socks_probe_prints_redacted_json(monkeypatch):
             "port": 1234,
             "include_response": True,
             "reachable": True,
+            "requires_control_connection": True,
             "handshake": {
                 "accepted": True,
                 "response_hex": "0500",
@@ -929,6 +972,7 @@ def test_restore_purple_socks_probe_uses_firmware_port(tmp_path, monkeypatch):
             "protocol": "SOCKS5",
             "port": kwargs["port"],
             "reachable": True,
+            "requires_control_connection": True,
             "summary": {
                 "handshake_ok": True,
                 "connect_succeeded": None,
@@ -971,8 +1015,101 @@ def test_restore_purple_socks_probe_strict_fails_when_summary_is_not_ok(monkeypa
     assert json.loads(result.output)["summary"]["ok"] is False
 
 
+def test_restore_purple_conn_help():
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-conn", "--help"], env={"COLUMNS": "200"})
+
+    assert result.exit_code == 0
+    assert "--timeout" in result.output
+    assert "--port" in result.output
+    assert "--conn-protocol-version" in result.output
+    assert "--include-response" in result.output
+    assert "--include-identifiers" in result.output
+    assert "--firmware-root" in result.output
+    assert "--strict" in result.output
+
+
+def test_restore_purple_conn_prints_redacted_json(monkeypatch):
+    async def fake_probe_purple_proxy_conn(**kwargs):
+        assert kwargs == {
+            "udid": "sensitive-udid",
+            "usbmux_address": "/tmp/usbmux",
+            "timeout": 0.5,
+            "port": 1234,
+            "protocol_version": 2,
+            "include_response": True,
+            "include_identifiers": False,
+        }
+        return {
+            "checked": True,
+            "experimental": True,
+            "command": "HelloConn",
+            "port": 1234,
+            "protocol_version": 2,
+            "include_response": True,
+            "reachable": True,
+            "response_keys": ["ConnProtoVersion", "Identifier"],
+            "identifier": "<redacted>",
+            "response": {"Identifier": "<redacted>", "ConnProtoVersion": 2},
+        }
+
+    monkeypatch.setattr(restore_cli, "probe_purple_proxy_conn", fake_probe_purple_proxy_conn)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "restore",
+            "purple-conn",
+            "--timeout",
+            "0.5",
+            "--port",
+            "1234",
+            "--include-response",
+            "--udid",
+            "sensitive-udid",
+            "--usbmux-address",
+            "/tmp/usbmux",
+        ],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["reachable"] is True
+    assert output["response"]["Identifier"] == "<redacted>"
+    assert "sensitive-udid" not in result.output
+
+
+def test_restore_purple_conn_uses_firmware_port(tmp_path, monkeypatch):
+    root = _write_purple_launchd_root(tmp_path)
+
+    async def fake_probe_purple_proxy_conn(**kwargs):
+        assert kwargs["port"] == 2081
+        return {
+            "checked": True,
+            "experimental": True,
+            "command": "HelloConn",
+            "port": kwargs["port"],
+            "protocol_version": 2,
+            "include_response": False,
+            "reachable": True,
+            "response_keys": ["ConnProtoVersion", "Identifier"],
+            "identifier": "<redacted>",
+        }
+
+    monkeypatch.setattr(restore_cli, "probe_purple_proxy_conn", fake_probe_purple_proxy_conn)
+
+    result = CliRunner().invoke(
+        __main__.app,
+        ["restore", "purple-conn", "--firmware-root", str(root)],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.output)
+    assert output["port"] == 2081
+    assert output["port_config"]["ports"]["socks"] == 2081
+
+
 def test_restore_purple_restore_options_help():
-    result = CliRunner().invoke(__main__.app, ["restore", "purple-restore-options", "--help"])
+    result = CliRunner().invoke(__main__.app, ["restore", "purple-restore-options", "--help"], env={"COLUMNS": "200"})
 
     assert result.exit_code == 0
     assert "--enable" in result.output
@@ -980,12 +1117,31 @@ def test_restore_purple_restore_options_help():
     assert "--log-level" in result.output
     assert "--socks-host" in result.output
     assert "--socks-port" in result.output
+    assert "--proxy-enable" in result.output
+    assert "--proxy-enable-ssl" in result.output
+    assert "--proxy-for-https" in result.output
+    assert "--proxy-socks-host" in result.output
+    assert "--proxy-socks-port" in result.output
+    assert "--fdr-enable-proxy" not in result.output
 
 
 def test_restore_purple_restore_options_prints_patch_json():
     result = CliRunner().invoke(
         __main__.app,
-        ["restore", "purple-restore-options", "--enable", "--log-level", "7"],
+        [
+            "restore",
+            "purple-restore-options",
+            "--enable",
+            "--log-level",
+            "7",
+            "--proxy-enable",
+            "--proxy-enable-ssl",
+            "--proxy-for-https",
+            "--proxy-socks-host",
+            "127.0.0.1",
+            "--proxy-socks-port",
+            "4321",
+        ],
     )
 
     assert result.exit_code == 0
@@ -993,8 +1149,14 @@ def test_restore_purple_restore_options_prints_patch_json():
     assert output["restore_options"] == {
         "UsePurpleReverseProxy": True,
         "PRPLogLevel": 7,
+        "EnableProxy": True,
+        "EnableProxySsl": True,
+        "ForHttps": True,
+        "UseSOCKSHost": "127.0.0.1",
+        "UseSOCKSPort": 4321,
     }
     assert output["evidence"]["log_level"] == "restored_update PRPLogLevel"
+    assert output["evidence"]["proxy_options"] == "ARUService/restored_update EnableProxy / EnableProxySsl / ForHttps"
 
 
 def test_restore_purple_restore_options_rejects_conflicting_flags():
@@ -1013,6 +1175,12 @@ def test_restore_update_help_exposes_purple_flags():
     assert "--purple-log-level" in result.output
     assert "--purple-socks-host" in result.output
     assert "--purple-socks-port" in result.output
+    assert "--purple-proxy-enable" in result.output
+    assert "--purple-proxy-enable-ssl" in result.output
+    assert "--purple-proxy-for-https" in result.output
+    assert "--purple-proxy-socks-host" in result.output
+    assert "--purple-proxy-socks-port" in result.output
+    assert "--purple-fdr-enable-proxy" not in result.output
 
 
 @pytest.mark.asyncio
@@ -1253,6 +1421,10 @@ def test_restore_purple_wait_help():
     assert "--firmware-root" in result.output
     assert "--include-identifiers" in result.output
     assert "--include-history" in result.output
+    assert "--stable-attempts" in result.output
+    assert "--stable-seconds" in result.output
+    assert "--poll-backoff-factor" in result.output
+    assert "--max-poll-interval" in result.output
 
 
 def test_restore_purple_wait_prints_ready_json(tmp_path, monkeypatch):
@@ -1263,6 +1435,10 @@ def test_restore_purple_wait_prints_ready_json(tmp_path, monkeypatch):
         assert kwargs["timeout"] == 2.0
         assert kwargs["probe_timeout"] == 0.5
         assert kwargs["poll_interval"] == 0.2
+        assert kwargs["stable_attempts"] == 2
+        assert kwargs["stable_seconds"] == 0.0
+        assert kwargs["poll_backoff_factor"] == 1.0
+        assert kwargs["max_poll_interval"] == 5.0
         assert kwargs["include_identifiers"] is True
         assert kwargs["include_history"] is True
         assert {port["name"]: port["port"] for port in kwargs["ports"]} == {
@@ -1379,15 +1555,20 @@ def test_restore_purple_evidence_collects_raw_output(tmp_path, monkeypatch):
                     "messages": [{"Event": "ProxyOnline", "SerialNumber": "fake-sensitive-serial"}],
                 },
                 "begin_control": {"checked": True, "reachable": True},
-                "ping": {"checked": True, "reachable": True, "pong": True},
-                "wait_socket": {"checked": True, "reachable": True},
+                "control_sync": {"checked": True, "reachable": True, "sync": True},
+                "ping": {"checked": False, "reason": "Not part of the BeginCtrl/ControlSync negotiation flow."},
+                "wait_socket": {
+                    "checked": False,
+                    "reason": "WaitSocket is an internal firmware accept helper, not a host wire command.",
+                },
                 "proxy_dictionary": {"checked": True},
                 "socks_probe": {"checked": True, "summary": {"ok": True}},
             },
             "summary": {
                 "control_reachable": True,
-                "ping_pong": True,
-                "wait_socket_reachable": True,
+                "control_sync_received": True,
+                "ping_pong": False,
+                "wait_socket_reachable": False,
                 "notify_registered": True,
                 "set_log_level_sent": True,
                 "socks_probe_ok": True,
@@ -1453,15 +1634,20 @@ def test_restore_purple_evidence_can_include_trace(monkeypatch):
             "phases": {
                 "register_notify": {"checked": True, "reachable": True},
                 "begin_control": {"checked": True, "reachable": True},
-                "ping": {"checked": True, "reachable": True, "pong": True},
-                "wait_socket": {"checked": True, "reachable": True},
+                "control_sync": {"checked": True, "reachable": True, "sync": True},
+                "ping": {"checked": False, "reason": "Not part of the BeginCtrl/ControlSync negotiation flow."},
+                "wait_socket": {
+                    "checked": False,
+                    "reason": "WaitSocket is an internal firmware accept helper, not a host wire command.",
+                },
                 "proxy_dictionary": {"checked": True},
                 "socks_probe": {"checked": True, "summary": {"ok": True}},
             },
             "summary": {
                 "control_reachable": True,
-                "ping_pong": True,
-                "wait_socket_reachable": True,
+                "control_sync_received": True,
+                "ping_pong": False,
+                "wait_socket_reachable": False,
                 "notify_registered": True,
                 "set_log_level_sent": True,
                 "socks_probe_ok": True,
@@ -1491,6 +1677,10 @@ def test_restore_purple_evidence_waits_for_restoreos(tmp_path, monkeypatch):
         assert kwargs["timeout"] == 3.0
         assert kwargs["poll_interval"] == 0.2
         assert kwargs["probe_timeout"] == 0.5
+        assert kwargs["stable_attempts"] == 2
+        assert kwargs["stable_seconds"] == 0.0
+        assert kwargs["poll_backoff_factor"] == 1.0
+        assert kwargs["max_poll_interval"] == 5.0
         assert kwargs["include_identifiers"] is True
         assert kwargs["include_history"] is True
         assert {port["name"]: port["port"] for port in kwargs["ports"]} == {
@@ -1525,15 +1715,20 @@ def test_restore_purple_evidence_waits_for_restoreos(tmp_path, monkeypatch):
             "phases": {
                 "register_notify": {"checked": True, "reachable": True},
                 "begin_control": {"checked": True, "reachable": True},
-                "ping": {"checked": True, "reachable": True, "pong": True},
-                "wait_socket": {"checked": True, "reachable": True},
+                "control_sync": {"checked": True, "reachable": True, "sync": True},
+                "ping": {"checked": False, "reason": "Not part of the BeginCtrl/ControlSync negotiation flow."},
+                "wait_socket": {
+                    "checked": False,
+                    "reason": "WaitSocket is an internal firmware accept helper, not a host wire command.",
+                },
                 "proxy_dictionary": {"checked": True},
                 "socks_probe": {"checked": True, "summary": {"ok": True}},
             },
             "summary": {
                 "control_reachable": True,
-                "ping_pong": True,
-                "wait_socket_reachable": True,
+                "control_sync_received": True,
+                "ping_pong": False,
+                "wait_socket_reachable": False,
                 "notify_registered": True,
                 "set_log_level_sent": True,
                 "socks_probe_ok": True,
@@ -1672,8 +1867,12 @@ def test_restore_purple_session_prints_orchestrated_json(monkeypatch):
                     "messages": [{"SerialNumber": "<redacted>", "Event": "ProxyOnline"}],
                 },
                 "begin_control": {"checked": True, "command": "BeginCtrl", "reachable": True},
-                "ping": {"checked": True, "command": "Ping", "reachable": True, "pong": True},
-                "wait_socket": {"checked": True, "command": "WaitSocket", "reachable": True},
+                "control_sync": {"checked": True, "command": "ControlSync", "reachable": True, "sync": True},
+                "ping": {"checked": False, "reason": "Not part of the BeginCtrl/ControlSync negotiation flow."},
+                "wait_socket": {
+                    "checked": False,
+                    "reason": "WaitSocket is an internal firmware accept helper, not a host wire command.",
+                },
                 "proxy_dictionary": {"checked": True, "proxy_url": "socks://127.0.0.1:4321/"},
                 "socks_probe": {
                     "checked": True,
@@ -1688,8 +1887,9 @@ def test_restore_purple_session_prints_orchestrated_json(monkeypatch):
             },
             "summary": {
                 "control_reachable": True,
-                "ping_pong": True,
-                "wait_socket_reachable": True,
+                "control_sync_received": True,
+                "ping_pong": False,
+                "wait_socket_reachable": False,
                 "notify_registered": True,
                 "set_log_level_sent": True,
                 "socks_probe_ok": True,
@@ -1782,15 +1982,20 @@ def test_restore_purple_session_uses_firmware_ports(tmp_path, monkeypatch):
                 "set_log_level": {"checked": False, "reason": "--log-level was not provided."},
                 "register_notify": {"checked": True, "reachable": True},
                 "begin_control": {"checked": True, "reachable": True},
-                "ping": {"checked": True, "reachable": True, "pong": True},
-                "wait_socket": {"checked": True, "reachable": True, "conn_port": 2081},
+                "control_sync": {"checked": True, "reachable": True, "sync": True},
+                "ping": {"checked": False, "reason": "Not part of the BeginCtrl/ControlSync negotiation flow."},
+                "wait_socket": {
+                    "checked": False,
+                    "reason": "WaitSocket is an internal firmware accept helper, not a host wire command.",
+                },
                 "proxy_dictionary": {"checked": True, "proxy_url": "socks://127.0.0.1:2081/"},
                 "socks_probe": {"checked": False, "reason": "--probe-socks was not provided."},
             },
             "summary": {
                 "control_reachable": True,
-                "ping_pong": True,
-                "wait_socket_reachable": True,
+                "control_sync_received": True,
+                "ping_pong": False,
+                "wait_socket_reachable": False,
                 "notify_registered": True,
                 "set_log_level_sent": None,
                 "socks_probe_ok": None,
@@ -1811,7 +2016,7 @@ def test_restore_purple_session_uses_firmware_ports(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     output = json.loads(result.output)
-    assert output["phases"]["wait_socket"]["conn_port"] == 2081
+    assert output["phases"]["control_sync"]["sync"] is True
     assert output["port_config"]["ports"]["ctrl"] == 2082
     assert output["port_config"]["ports"]["notify"] == 2084
 
@@ -1865,12 +2070,115 @@ async def test_collect_live_purple_reverse_proxy_probe_without_usb_device(monkey
 
     from pymobiledevice3.restore import purple
 
+    def fake_collect_live_purple_usb_inventory(ecid=None):
+        return {
+            "checked": True,
+            "source": "pyusb",
+            "mode": "no_usb_device",
+            "device_count": 0,
+            "reason": "No Apple recovery/DFU USB device is visible.",
+        }
+
     monkeypatch.setattr(purple.usbmux, "list_devices", fake_list_devices)
+    monkeypatch.setattr(purple, "collect_live_purple_usb_inventory", fake_collect_live_purple_usb_inventory)
 
     result = await collect_live_purple_reverse_proxy_probe()
 
     assert result["mode"] == "no_usb_device"
     assert result["device_count"] == 0
+    assert result["usb_inventory"] == fake_collect_live_purple_usb_inventory()
+
+
+@pytest.mark.asyncio
+async def test_collect_live_purple_reverse_proxy_status_reports_irecv_recovery_state(monkeypatch):
+    from pymobiledevice3.restore import purple
+
+    class FakeMode:
+        name = "RECOVERY_MODE_2"
+        value = 0x1281
+        is_recovery = True
+
+    class FakeIRecv:
+        mode = FakeMode()
+        product_type = "iPhone15,4"
+        hardware_model = "D74AP"
+        ecid = 0x123456789ABCDEF
+
+    def fake_collect_live_purple_usb_inventory(ecid=None):
+        return {
+            "checked": True,
+            "source": "pyusb",
+            "mode": "recovery",
+            "device_count": 1,
+            "devices": [
+                {
+                    "checked": True,
+                    "source": "pyusb",
+                    "state": "recovery",
+                    "mode": "RECOVERY_MODE_2",
+                    "mode_value": 0x1281,
+                    "selected_interface_altsettings": [
+                        {"interface_number": 0, "alternate_setting": 0},
+                        {"interface_number": 1, "alternate_setting": 0},
+                    ],
+                    "device": {
+                        "vendor_id": "0x05ac",
+                        "product_id": "0x1281",
+                        "manufacturer": "Apple Inc.",
+                        "product": "Apple Mobile Device (Recovery Mode)",
+                        "serial_number": "SDOM:01 CPID:8120 CPRV:11 CPFM:03 SCEP:01 BDID:08 ECID:0123456789ABCDEF IBFL:3D SIKA:00 SRNM:[PYMD3TEST0]",
+                        "ecid": "0x123456789abcdef",
+                        "hardware_model": "8120",
+                        "board_id": "08",
+                        "chip_id": "8120",
+                        "speed": "high",
+                    },
+                    "configuration": {
+                        "value": 1,
+                        "interface_count": 2,
+                        "total_length": 57,
+                    },
+                    "interfaces": [],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(purple, "IRecv", lambda timeout=0.2: FakeIRecv())
+    monkeypatch.setattr(purple, "collect_live_purple_usb_inventory", fake_collect_live_purple_usb_inventory)
+
+    result = await collect_live_purple_reverse_proxy_status()
+
+    assert result == {
+        "checked": True,
+        "mode": "recovery",
+        "usb_inventory": fake_collect_live_purple_usb_inventory(),
+        "boot_state": {
+            "checked": True,
+            "source": "irecv",
+            "state": "recovery",
+            "ready": False,
+            "recovery_mode": True,
+            "dfu_mode": False,
+            "irecv": {
+                "state": "recovery",
+                "mode": "RECOVERY_MODE_2",
+                "mode_value": 0x1281,
+                "product_type": "iPhone15,4",
+                "hardware_model": "D74AP",
+                "ecid": "0x123456789abcdef",
+            },
+        },
+        "irecv": {
+            "state": "recovery",
+            "mode": "RECOVERY_MODE_2",
+            "mode_value": 0x1281,
+            "product_type": "iPhone15,4",
+            "hardware_model": "D74AP",
+            "ecid": "0x123456789abcdef",
+        },
+        "purple_reverse_proxy_available": False,
+        "reason": "Recovery/DFU devices are not visible through usbmuxd.",
+    }
 
 
 @pytest.mark.asyncio
@@ -1889,17 +2197,37 @@ async def test_collect_live_purple_reverse_proxy_probe_restored_ports_are_redact
 
     from pymobiledevice3.restore import purple
 
+    def fake_collect_live_purple_usb_inventory(ecid=None):
+        return {
+            "checked": True,
+            "source": "pyusb",
+            "mode": "restored",
+            "device_count": 1,
+            "devices": [{"checked": True, "source": "pyusb", "mode": "restored"}],
+        }
+
     monkeypatch.setattr(purple.usbmux, "list_devices", fake_list_devices)
     monkeypatch.setattr(purple.ServiceConnection, "create_using_usbmux", fake_create_using_usbmux)
+    monkeypatch.setattr(purple, "collect_live_purple_usb_inventory", fake_collect_live_purple_usb_inventory)
 
     result = await collect_live_purple_reverse_proxy_probe(timeout=0.1)
 
     assert result["mode"] == "restored"
     assert result["device_count"] == 1
+    assert result["usb_inventory"] == fake_collect_live_purple_usb_inventory()
     device = result["devices"][0]
     assert device["query_type"] == {
         "reachable": True,
         "type": "com.apple.mobile.restored",
+        "restore_protocol_version": 15,
+    }
+    assert device["boot_state"] == {
+        "checked": True,
+        "source": "usbmux_query_type",
+        "state": "restored",
+        "ready": True,
+        "reachable": True,
+        "query_type": "com.apple.mobile.restored",
         "restore_protocol_version": 15,
     }
     ports_by_name = {port["name"]: port for port in device["ports"]}
@@ -1928,12 +2256,23 @@ async def test_collect_live_purple_reverse_proxy_probe_can_include_identifiers(m
 
     from pymobiledevice3.restore import purple
 
+    def fake_collect_live_purple_usb_inventory(ecid=None):
+        return {
+            "checked": True,
+            "source": "pyusb",
+            "mode": "restored",
+            "device_count": 1,
+            "devices": [{"checked": True, "source": "pyusb", "mode": "restored"}],
+        }
+
     monkeypatch.setattr(purple.usbmux, "list_devices", fake_list_devices)
     monkeypatch.setattr(purple.ServiceConnection, "create_using_usbmux", fake_create_using_usbmux)
+    monkeypatch.setattr(purple, "collect_live_purple_usb_inventory", fake_collect_live_purple_usb_inventory)
 
     result = await collect_live_purple_reverse_proxy_probe(timeout=0.1, include_identifiers=True)
 
     assert result["include_identifiers"] is True
+    assert result["usb_inventory"] == fake_collect_live_purple_usb_inventory()
     assert result["devices"][0]["identifiers"] == {
         "device_id": 123,
         "serial": "fake-sensitive-serial",
@@ -1950,6 +2289,12 @@ async def test_wait_for_purple_restoreos_polls_until_restored(monkeypatch):
             "mode": "normal_lockdown",
             "device_count": 1,
             "devices": [{"index": 0, "mode": "normal_lockdown"}],
+        },
+        {
+            "checked": True,
+            "mode": "restored",
+            "device_count": 1,
+            "devices": [{"index": 0, "mode": "restored"}],
         },
         {
             "checked": True,
@@ -1981,6 +2326,35 @@ async def test_wait_for_purple_restoreos_polls_until_restored(monkeypatch):
 
     assert result["ready"] is True
     assert result["reason"] == "restoreos_reached"
-    assert result["attempt_count"] == 2
+    assert result["attempt_count"] == 3
+    assert result["stability"]["stable_ready"] is True
+    assert result["stability"]["restored_streak"] == 2
     assert result["history"][0]["mode"] == "normal_lockdown"
+    assert result["history"][-1]["stable_ready"] is True
     assert result["last_probe"]["mode"] == "restored"
+
+
+def test_irecv_public_state_includes_recovery_details(monkeypatch):
+    class FakeMode:
+        name = "RECOVERY_MODE_2"
+        value = 0x1281
+        is_recovery = True
+
+    class FakeIRecv:
+        mode = FakeMode()
+        product_type = "iPhone15,4"
+        hardware_model = "D74AP"
+        ecid = 0x123456789ABCDEF
+
+    monkeypatch.setattr(restore_cli, "IRecv", lambda timeout=0.2: FakeIRecv())
+
+    state = restore_cli._irecv_public_state()
+
+    assert state == {
+        "state": "recovery",
+        "mode": "RECOVERY_MODE_2",
+        "mode_value": 0x1281,
+        "product_type": "iPhone15,4",
+        "hardware_model": "D74AP",
+        "ecid": "0x123456789abcdef",
+    }

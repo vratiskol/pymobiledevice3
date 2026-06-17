@@ -7,16 +7,24 @@ from pathlib import Path
 from typing import Any, Optional
 
 from pymobiledevice3 import usbmux
-from pymobiledevice3.exceptions import ConnectionFailedToUsbmuxdError, PyMobileDevice3Exception
+from pymobiledevice3.exceptions import ConnectionFailedToUsbmuxdError, IRecvNoDeviceConnectedError, PyMobileDevice3Exception
+from pymobiledevice3.irecv import IRecv, Mode
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.restore.restored_client import RestoredClient
 from pymobiledevice3.service_connection import ServiceConnection
+from usb.core import find as usb_find
+from usb.util import find_descriptor, get_string
 
 PURPLE_REVERSE_PROXY_ENABLE_OPTION = "UsePurpleReverseProxy"
 PURPLE_REVERSE_PROXY_DISABLE_OPTION = "DisableReverseProxy"
 PURPLE_REVERSE_PROXY_LOG_LEVEL_OPTION = "PRPLogLevel"
 PURPLE_REVERSE_PROXY_SOCKS_HOST_OPTION = "SOCKSHost"
 PURPLE_REVERSE_PROXY_SOCKS_PORT_OPTION = "SOCKSPort"
+PURPLE_REVERSE_PROXY_PROXY_ENABLE_OPTION = "EnableProxy"
+PURPLE_REVERSE_PROXY_PROXY_ENABLE_SSL_OPTION = "EnableProxySsl"
+PURPLE_REVERSE_PROXY_PROXY_FOR_HTTPS_OPTION = "ForHttps"
+PURPLE_REVERSE_PROXY_PROXY_SOCKS_HOST_OPTION = "UseSOCKSHost"
+PURPLE_REVERSE_PROXY_PROXY_SOCKS_PORT_OPTION = "UseSOCKSPort"
 PURPLE_REVERSE_PROXY_LAUNCHD_PATH = Path("System/Library/LaunchDaemons/com.apple.PurpleReverseProxy.ramdisk.plist")
 PURPLE_REVERSE_PROXY_EXECUTABLE_PATH = Path("usr/libexec/PurpleReverseProxy")
 PURPLE_REVERSE_PROXY_DEVICE_LIBRARY_PATH = Path("usr/lib/libReverseProxyDevice.dylib")
@@ -45,8 +53,11 @@ PURPLE_REVERSE_PROXY_STRING_MARKERS = {
     "purple_reverse_proxy": [
         "BeginCtrl",
         "HelloCtrl",
+        "HelloConn",
         "CtrlConn",
         "CtrlProtoVersion",
+        "ConnProtoVersion",
+        "Identifier",
         "WaitSocket",
         "ConnPort",
         "NotifyConn",
@@ -88,6 +99,13 @@ PURPLE_REVERSE_PROXY_STRING_MARKERS = {
         "AsyncDataRequestMsg",
         "PreviousRestoreLogMsg",
         "PRPLogLevel",
+        "EnableProxy",
+        "EnableProxySsl",
+        "ForHttps",
+        "ProxySettings",
+        "SocksProxySettings",
+        "SOCKSProxyHost",
+        "SOCKSProxyPort",
     ],
     "fdr_library": [
         "_AMFDRHttpCopyPurpleReverseProxyInformation",
@@ -99,6 +117,11 @@ PURPLE_REVERSE_PROXY_STRING_MARKERS = {
     ],
     "aru_service": [
         "DisableReverseProxy",
+        "EnableProxy",
+        "EnableProxySsl",
+        "ForHttps",
+        "UseSOCKSHost",
+        "UseSOCKSPort",
         "SOCKSHost",
         "SOCKSPort",
         "RestoreOptions",
@@ -126,6 +149,11 @@ PURPLE_REVERSE_PROXY_CATALOG = {
         "log_level": PURPLE_REVERSE_PROXY_LOG_LEVEL_OPTION,
         "socks_host": PURPLE_REVERSE_PROXY_SOCKS_HOST_OPTION,
         "socks_port": PURPLE_REVERSE_PROXY_SOCKS_PORT_OPTION,
+        "proxy_enable": PURPLE_REVERSE_PROXY_PROXY_ENABLE_OPTION,
+        "proxy_enable_ssl": PURPLE_REVERSE_PROXY_PROXY_ENABLE_SSL_OPTION,
+        "proxy_for_https": PURPLE_REVERSE_PROXY_PROXY_FOR_HTTPS_OPTION,
+        "proxy_socks_host": PURPLE_REVERSE_PROXY_PROXY_SOCKS_HOST_OPTION,
+        "proxy_socks_port": PURPLE_REVERSE_PROXY_PROXY_SOCKS_PORT_OPTION,
         "disable_when_socks_host_is_set": True,
     },
     "fdr_symbols": [
@@ -137,6 +165,9 @@ PURPLE_REVERSE_PROXY_CATALOG = {
     "notify_commands": [
         "RegisterNotify",
         "SetLogLevel",
+    ],
+    "internal_strings": [
+        "WaitSocket",
     ],
     "proxy_dictionary": {
         "function": "CopyProxyDictionaryWithOptions",
@@ -161,11 +192,18 @@ def build_purple_reverse_proxy_restore_options(
     log_level: Optional[int] = None,
     socks_host: Optional[str] = None,
     socks_port: Optional[int] = None,
+    proxy_enable: bool = False,
+    proxy_enable_ssl: bool = False,
+    proxy_for_https: bool = False,
+    proxy_socks_host: Optional[str] = None,
+    proxy_socks_port: Optional[int] = None,
 ) -> dict[str, Any]:
     if enable and disable:
         raise ValueError("UsePurpleReverseProxy and DisableReverseProxy are mutually exclusive")
     if socks_port is not None and socks_host is None:
         raise ValueError("SOCKSPort requires SOCKSHost")
+    if proxy_socks_port is not None and proxy_socks_host is None:
+        raise ValueError("UseSOCKSPort requires UseSOCKSHost")
     if log_level is not None and not 0 <= log_level <= 7:
         raise ValueError("PRPLogLevel must be between 0 and 7")
 
@@ -182,6 +220,18 @@ def build_purple_reverse_proxy_restore_options(
         restore_options[PURPLE_REVERSE_PROXY_SOCKS_PORT_OPTION] = socks_port if socks_port is not None else 1081
         restore_options[PURPLE_REVERSE_PROXY_DISABLE_OPTION] = True
         notes.append("SOCKSHost disables PurpleReverseProxy according to ARUService RestoreOptions evidence.")
+    if proxy_enable:
+        restore_options[PURPLE_REVERSE_PROXY_PROXY_ENABLE_OPTION] = True
+    if proxy_enable_ssl:
+        restore_options[PURPLE_REVERSE_PROXY_PROXY_ENABLE_SSL_OPTION] = True
+    if proxy_for_https:
+        restore_options[PURPLE_REVERSE_PROXY_PROXY_FOR_HTTPS_OPTION] = True
+    if proxy_socks_host is not None:
+        restore_options[PURPLE_REVERSE_PROXY_PROXY_SOCKS_HOST_OPTION] = proxy_socks_host
+        restore_options[PURPLE_REVERSE_PROXY_PROXY_SOCKS_PORT_OPTION] = (
+            proxy_socks_port if proxy_socks_port is not None else 1081
+        )
+        notes.append("UseSOCKSHost/UseSOCKSPort are ARU proxy options found in RestoreOS firmware.")
 
     return {
         "checked": True,
@@ -192,6 +242,9 @@ def build_purple_reverse_proxy_restore_options(
             "disable": "ARUService DisableReverseProxy",
             "log_level": "restored_update PRPLogLevel",
             "socks": "ARUService SOCKSHost / SOCKSPort",
+            "proxy_options": "ARUService/restored_update EnableProxy / EnableProxySsl / ForHttps",
+            "proxy_socks": "ARUService UseSOCKSHost / UseSOCKSPort",
+            "socks_proxy_settings": "AMSupport/FDR SocksProxySettings with SOCKSProxyHost / SOCKSProxyPort",
             "fdr": "libFDR _AMFDRHttpCopyPurpleReverseProxyInformation",
         },
         "notes": notes,
@@ -274,7 +327,24 @@ def build_purple_reverse_proxy_capabilities(
             "layer": "control_socket",
             "status": _firmware_status(_deep_summary_value(info, "control_protocol_evidence")),
             "commands": ["restore purple-control", "restore purple-session"],
-            "evidence": ["HelloCtrl", "BeginCtrl", "WaitSocket", "Ping", "Pong"],
+            "evidence": ["HelloCtrl", "BeginCtrl", "CtrlConn", "CtrlProtoVersion", "Ping", "Pong"],
+            "requires_live_device": True,
+        },
+        {
+            "name": "internal_accept_helper",
+            "layer": "control_socket",
+            "status": _firmware_status(_deep_summary_value(info, "control_protocol_evidence")),
+            "commands": [],
+            "evidence": PURPLE_REVERSE_PROXY_CATALOG["internal_strings"],
+            "requires_live_device": False,
+            "note": "WaitSocket is a firmware accept-helper string, not a host wire command.",
+        },
+        {
+            "name": "connection_protocol",
+            "layer": "conn_socket",
+            "status": _firmware_status(_deep_summary_value(info, "connection_protocol_evidence")),
+            "commands": ["restore purple-conn", "restore purple-socks-probe", "restore purple-session --probe-socks"],
+            "evidence": ["HelloConn", "ConnProtoVersion", "Identifier"],
             "requires_live_device": True,
         },
         {
@@ -508,6 +578,246 @@ def _lockdown_value(lockdown: Any, property_name: str, value_key: str) -> Any:
     return getattr(lockdown, "all_values", {}).get(value_key)
 
 
+def _irecv_public_state() -> Optional[dict[str, Any]]:
+    try:
+        irecv = IRecv(timeout=0.2)
+    except IRecvNoDeviceConnectedError:
+        return None
+    except Exception:
+        return None
+
+    if irecv.mode is None:
+        return None
+
+    state: dict[str, Any] = {
+        "state": "recovery" if irecv.mode.is_recovery else "dfu",
+        "mode": irecv.mode.name,
+        "mode_value": irecv.mode.value,
+    }
+    with contextlib.suppress(Exception):
+        state["product_type"] = irecv.product_type
+    with contextlib.suppress(Exception):
+        state["hardware_model"] = irecv.hardware_model
+    with contextlib.suppress(Exception):
+        state["ecid"] = f"0x{irecv.ecid:x}"
+    return state
+
+
+def _parse_apple_usb_serial_string(serial_string: Optional[str]) -> dict[str, Any]:
+    if not serial_string:
+        return {}
+
+    parsed: dict[str, Any] = {}
+    for component in serial_string.split(" "):
+        if ":" not in component:
+            continue
+        key, value = component.split(":", 1)
+        if key in ("SRNM", "SRTG") and value.startswith("[") and value.endswith("]"):
+            value = value[1:-1]
+        parsed[key] = value
+    return parsed
+
+
+def _usb_class_name(interface_class: int, interface_subclass: int, interface_protocol: int) -> str:
+    if interface_class == 0xFE and interface_subclass == 0x01 and interface_protocol == 0x02:
+        return "device_firmware_upgrade"
+    if interface_class == 0xFF:
+        return "vendor_specific"
+    return f"class_0x{interface_class:02x}"
+
+
+def _usb_speed_name(speed: Any) -> Optional[str]:
+    return {
+        1: "low",
+        2: "full",
+        3: "high",
+        4: "super",
+        5: "super_plus",
+    }.get(speed)
+
+
+def _usb_endpoint_summary(endpoint) -> dict[str, Any]:
+    transfer_type = endpoint.bmAttributes & 0x3
+    return {
+        "address": f"0x{endpoint.bEndpointAddress:02x}",
+        "direction": "in" if endpoint.bEndpointAddress & 0x80 else "out",
+        "transfer_type": {
+            0: "control",
+            1: "isochronous",
+            2: "bulk",
+            3: "interrupt",
+        }.get(transfer_type, f"transfer_type_0x{transfer_type:02x}"),
+        "max_packet_size": endpoint.wMaxPacketSize,
+    }
+
+
+def _usb_expected_interface_altsettings(mode: Optional[Mode]) -> dict[int, int]:
+    selections = {0: 0}
+    if mode is None:
+        return selections
+    if mode.is_recovery:
+        selections[1] = 1 if mode.value > Mode.RECOVERY_MODE_2.value else 0
+    return selections
+
+
+def _usb_interface_summary(device, interface, selected_altsetting: Optional[int]) -> dict[str, Any]:
+    endpoints = [_usb_endpoint_summary(endpoint) for endpoint in interface.endpoints()]
+    interface_string = None
+    with contextlib.suppress(Exception):
+        if interface.iInterface:
+            interface_string = get_string(device, interface.iInterface)
+
+    return {
+        "interface_number": interface.bInterfaceNumber,
+        "alternate_setting": interface.bAlternateSetting,
+        "selected": selected_altsetting == interface.bAlternateSetting if selected_altsetting is not None else False,
+        "class": _usb_class_name(interface.bInterfaceClass, interface.bInterfaceSubClass, interface.bInterfaceProtocol),
+        "class_code": f"0x{interface.bInterfaceClass:02x}",
+        "subclass_code": f"0x{interface.bInterfaceSubClass:02x}",
+        "protocol_code": f"0x{interface.bInterfaceProtocol:02x}",
+        "endpoint_count": len(endpoints),
+        "iInterface": interface.iInterface,
+        "interface_string": interface_string,
+        "endpoints": endpoints,
+    }
+
+
+def _usb_device_summary(device, *, ecid: Optional[str] = None) -> Optional[dict[str, Any]]:
+    mode = Mode.get_mode_from_value(device.idProduct)
+    if mode is None:
+        return None
+
+    serial_string = None
+    manufacturer_string = None
+    product_string = None
+    with contextlib.suppress(Exception):
+        serial_string = get_string(device, device.iSerialNumber)
+    with contextlib.suppress(Exception):
+        manufacturer_string = get_string(device, device.iManufacturer)
+    with contextlib.suppress(Exception):
+        product_string = get_string(device, device.iProduct)
+    serial_info = _parse_apple_usb_serial_string(serial_string)
+
+    if ecid is not None:
+        device_ecid = serial_info.get("ECID")
+        if device_ecid is None:
+            return None
+        try:
+            if int(device_ecid, 16) != int(ecid, 0):
+                return None
+        except ValueError:
+            if str(device_ecid) != str(ecid):
+                return None
+
+    configuration = device.get_active_configuration()
+    selection_map = _usb_expected_interface_altsettings(mode)
+    interfaces_by_number: dict[int, dict[str, Any]] = {}
+    for interface in find_descriptor(configuration, find_all=True, custom_match=lambda item: True):
+        interface_summary = _usb_interface_summary(device, interface, selection_map.get(interface.bInterfaceNumber))
+        interfaces_by_number.setdefault(
+            interface.bInterfaceNumber,
+            {
+                "interface_number": interface.bInterfaceNumber,
+                "selected_altsetting": selection_map.get(interface.bInterfaceNumber),
+                "alternate_settings": [],
+            },
+        )["alternate_settings"].append(interface_summary)
+
+    interfaces = []
+    for interface_number in sorted(interfaces_by_number):
+        interface_summary = interfaces_by_number[interface_number]
+        interface_summary["alternate_settings"].sort(key=lambda item: item["alternate_setting"])
+        interfaces.append(interface_summary)
+
+    return {
+        "checked": True,
+        "source": "pyusb",
+        "state": "recovery" if mode.is_recovery else "dfu",
+        "mode": mode.name,
+        "mode_value": mode.value,
+        "selected_interface_altsettings": [
+            {"interface_number": interface_number, "alternate_setting": altsetting}
+            for interface_number, altsetting in sorted(selection_map.items())
+        ],
+        "device": {
+            "vendor_id": f"0x{device.idVendor:04x}",
+            "product_id": f"0x{device.idProduct:04x}",
+            "manufacturer": manufacturer_string,
+            "product": product_string,
+            "serial_number": serial_string,
+            "ecid": f"0x{int(serial_info['ECID'], 16):x}" if "ECID" in serial_info else None,
+            "hardware_model": serial_info.get("CPID"),
+            "board_id": serial_info.get("BDID"),
+            "chip_id": serial_info.get("CPID"),
+            "speed": _usb_speed_name(getattr(device, "speed", None)) or getattr(device, "speed", None),
+        },
+        "configuration": {
+            "value": configuration.bConfigurationValue,
+            "interface_count": configuration.bNumInterfaces,
+            "total_length": configuration.wTotalLength,
+        },
+        "interfaces": interfaces,
+    }
+
+
+def collect_live_purple_usb_inventory(ecid: Optional[str] = None) -> dict[str, Any]:
+    try:
+        devices = list(usb_find(find_all=True))
+    except Exception as e:
+        return {
+            "checked": True,
+            "source": "pyusb",
+            "mode": "unknown",
+            "device_count": 0,
+            "reason": f"usb_scan_failed:{e.__class__.__name__}",
+        }
+
+    inventory_devices = []
+    skipped_devices = []
+    for device in devices:
+        if device.idVendor != 0x05AC:
+            continue
+        try:
+            summary = _usb_device_summary(device, ecid=ecid)
+        except Exception as e:
+            skipped_devices.append(
+                {
+                    "vendor_id": f"0x{device.idVendor:04x}",
+                    "product_id": f"0x{device.idProduct:04x}",
+                    "reason": f"usb_summary_failed:{e.__class__.__name__}",
+                }
+            )
+            continue
+        if summary is not None:
+            inventory_devices.append(summary)
+
+    if not inventory_devices:
+        result = {
+            "checked": True,
+            "source": "pyusb",
+            "mode": "no_usb_device",
+            "device_count": 0,
+            "reason": (
+                "No matching Apple recovery/DFU USB device is visible."
+                if ecid is not None
+                else "No Apple recovery/DFU USB device is visible."
+            ),
+        }
+        if skipped_devices:
+            result["skipped_devices"] = skipped_devices
+        return result
+
+    modes = {device["mode"] for device in inventory_devices}
+    mode = modes.pop() if len(modes) == 1 else "multiple"
+    return {
+        "checked": True,
+        "source": "pyusb",
+        "mode": mode,
+        "device_count": len(inventory_devices),
+        "devices": inventory_devices,
+    }
+
+
 def parse_purple_reverse_proxy_launchd(plist_path: Path) -> dict[str, Any]:
     with plist_path.open("rb") as plist_file:
         plist = plistlib.load(plist_file)
@@ -649,6 +959,9 @@ def inspect_purple_reverse_proxy_root_deep(root: Path) -> dict[str, Any]:
         "fdr_evidence": strings["fdr_library"]["markers"].get("_AMFDRHttpCopyPurpleReverseProxyInformation") is True,
         "control_protocol_evidence": strings["purple_reverse_proxy"]["markers"].get("HelloCtrl") is True
         or strings["purple_reverse_proxy"]["markers"].get("BeginCtrl") is True,
+        "connection_protocol_evidence": strings["purple_reverse_proxy"]["markers"].get("HelloConn") is True
+        or strings["purple_reverse_proxy"]["markers"].get("ConnProtoVersion") is True
+        or strings["purple_reverse_proxy"]["markers"].get("Identifier") is True,
         "notify_protocol_evidence": strings["purple_reverse_proxy"]["markers"].get("RegisterNotify") is True
         or strings["purple_reverse_proxy"]["markers"].get("SetLogLevel") is True,
         "proxy_dictionary_evidence": strings["device_library"]["markers"].get("CopyProxyDictionaryWithOptions") is True
@@ -679,12 +992,41 @@ async def collect_live_purple_reverse_proxy_status(
     ecid: Optional[str] = None,
     usbmux_address: Optional[str] = None,
 ) -> dict[str, Any]:
+    usb_inventory = collect_live_purple_usb_inventory(ecid=ecid)
+    irecv_state = _irecv_public_state()
+    if irecv_state is not None:
+        return {
+            "checked": True,
+            "mode": irecv_state["state"],
+            "usb_inventory": usb_inventory,
+            "boot_state": {
+                "checked": True,
+                "source": "irecv",
+                "state": irecv_state["state"],
+                "ready": False,
+                "recovery_mode": irecv_state["state"] == "recovery",
+                "dfu_mode": irecv_state["state"] == "dfu",
+                "irecv": irecv_state,
+            },
+            "irecv": irecv_state,
+            "purple_reverse_proxy_available": False,
+            "reason": "Recovery/DFU devices are not visible through usbmuxd.",
+        }
+
     try:
         devices = [device for device in await usbmux.list_devices(usbmux_address=usbmux_address) if device.is_usb]
     except ConnectionFailedToUsbmuxdError as e:
         return {
             "checked": True,
             "mode": "unknown",
+            "usb_inventory": usb_inventory,
+            "boot_state": {
+                "checked": True,
+                "source": "usbmux",
+                "state": "unknown",
+                "ready": False,
+                "reason": str(e),
+            },
             "purple_reverse_proxy_available": False,
             "reason": str(e),
         }
@@ -693,6 +1035,13 @@ async def collect_live_purple_reverse_proxy_status(
         return {
             "checked": True,
             "mode": "no_usb_device",
+            "usb_inventory": usb_inventory,
+            "boot_state": {
+                "checked": True,
+                "source": "usbmux",
+                "state": "not_seen",
+                "ready": False,
+            },
             "purple_reverse_proxy_available": False,
             "reason": "No USB device is visible through usbmux.",
         }
@@ -727,6 +1076,14 @@ async def collect_live_purple_reverse_proxy_status(
         return {
             "checked": True,
             "mode": "normal_lockdown",
+            "usb_inventory": usb_inventory,
+            "boot_state": {
+                "checked": True,
+                "source": "usbmux",
+                "state": "normal_lockdown",
+                "ready": False,
+                "normal_mode_devices": normal_mode_devices,
+            },
             "normal_mode_devices": normal_mode_devices,
             "purple_reverse_proxy_available": False,
             "reason": "PurpleReverseProxy is a RestoreOS ramdisk launchd service, not a normal-mode lockdown service.",
@@ -735,6 +1092,15 @@ async def collect_live_purple_reverse_proxy_status(
     return {
         "checked": True,
         "mode": "not_normal_lockdown",
+        "usb_inventory": usb_inventory,
+        "boot_state": {
+            "checked": True,
+            "source": "usbmux",
+            "state": "not_normal_lockdown",
+            "ready": False,
+            "usb_device_count": len(devices),
+            "inaccessible_device_count": inaccessible_devices,
+        },
         "usb_device_count": len(devices),
         "inaccessible_device_count": inaccessible_devices,
         "purple_reverse_proxy_available": False,
@@ -865,6 +1231,22 @@ def _mode_from_query_type(query_type: dict[str, Any]) -> str:
     return "unknown"
 
 
+def _boot_state_from_query_type(query_type: dict[str, Any]) -> dict[str, Any]:
+    state = _mode_from_query_type(query_type)
+    boot_state = {
+        "checked": True,
+        "source": "usbmux_query_type",
+        "state": state,
+        "ready": state == "restored",
+        "reachable": bool(query_type.get("reachable")),
+    }
+    if "type" in query_type:
+        boot_state["query_type"] = query_type["type"]
+    if "restore_protocol_version" in query_type:
+        boot_state["restore_protocol_version"] = query_type["restore_protocol_version"]
+    return boot_state
+
+
 async def collect_live_purple_reverse_proxy_probe(
     *,
     udid: Optional[str] = None,
@@ -881,6 +1263,7 @@ async def collect_live_purple_reverse_proxy_probe(
     output can be pasted into issue/PR text. Raw usbmux identifiers are included
     only when include_identifiers is explicitly enabled.
     """
+    usb_inventory = collect_live_purple_usb_inventory(ecid=udid)
     try:
         devices = [device for device in await usbmux.list_devices(usbmux_address=usbmux_address) if device.is_usb]
     except ConnectionFailedToUsbmuxdError:
@@ -888,6 +1271,7 @@ async def collect_live_purple_reverse_proxy_probe(
             "checked": True,
             "mode": "unknown",
             "device_count": 0,
+            "usb_inventory": usb_inventory,
             "reason": "usbmuxd_unavailable",
         }
     except OSError as e:
@@ -895,6 +1279,7 @@ async def collect_live_purple_reverse_proxy_probe(
             "checked": True,
             "mode": "unknown",
             "device_count": 0,
+            "usb_inventory": usb_inventory,
             "reason": f"usbmuxd_error:{e.__class__.__name__}",
         }
 
@@ -906,6 +1291,7 @@ async def collect_live_purple_reverse_proxy_probe(
             "checked": True,
             "mode": "no_usb_device",
             "device_count": 0,
+            "usb_inventory": usb_inventory,
             "reason": (
                 "No matching USB device is visible through usbmux."
                 if udid is not None
@@ -931,6 +1317,7 @@ async def collect_live_purple_reverse_proxy_probe(
             "index": index,
             "mode": _mode_from_query_type(query_type),
             "query_type": query_type,
+            "boot_state": _boot_state_from_query_type(query_type),
             "ports": ports,
         }
         if include_identifiers:
@@ -959,6 +1346,7 @@ async def collect_live_purple_reverse_proxy_probe(
         "checked": True,
         "mode": mode,
         "device_count": len(probed_devices),
+        "usb_inventory": usb_inventory,
         **({"include_identifiers": True} if include_identifiers else {}),
         "ports": probe_ports,
         "devices": probed_devices,
@@ -969,13 +1357,30 @@ def _purple_probe_has_restored_device(probe: dict[str, Any]) -> bool:
     return any(device.get("mode") == "restored" for device in probe.get("devices", []))
 
 
-def _purple_probe_wait_snapshot(attempt: int, elapsed: float, probe: dict[str, Any]) -> dict[str, Any]:
+def _purple_probe_wait_snapshot(
+    attempt: int,
+    elapsed: float,
+    probe: dict[str, Any],
+    *,
+    restored_streak: int,
+    stable_ready: bool,
+    stable_since: Optional[float],
+    stable_attempts: int,
+    stable_seconds: float,
+    poll_interval: float,
+) -> dict[str, Any]:
     return {
         "attempt": attempt,
         "elapsed": round(elapsed, 3),
         "mode": probe.get("mode"),
         "device_count": probe.get("device_count", 0),
         "restored": _purple_probe_has_restored_device(probe),
+        "restored_streak": restored_streak,
+        "stable_ready": stable_ready,
+        "stable_since": round(stable_since, 3) if stable_since is not None else None,
+        "stable_attempts": stable_attempts,
+        "stable_seconds": stable_seconds,
+        "poll_interval": round(poll_interval, 3),
     }
 
 
@@ -986,6 +1391,10 @@ async def wait_for_purple_restoreos(
     timeout: float = 180.0,
     poll_interval: float = 1.0,
     probe_timeout: float = 1.0,
+    stable_attempts: int = 2,
+    stable_seconds: float = 0.0,
+    poll_backoff_factor: float = 1.0,
+    max_poll_interval: float = 5.0,
     include_services: bool = False,
     ports: Optional[list[dict[str, Any]]] = None,
     include_identifiers: bool = False,
@@ -1002,6 +1411,18 @@ async def wait_for_purple_restoreos(
         "reason": "No probe was attempted.",
     }
     history: list[dict[str, Any]] = []
+    restored_streak = 0
+    stable_since: Optional[float] = None
+    current_poll_interval = poll_interval
+
+    if stable_attempts < 1:
+        raise ValueError("stable_attempts must be at least 1")
+    if stable_seconds < 0:
+        raise ValueError("stable_seconds must be non-negative")
+    if poll_backoff_factor < 1.0:
+        raise ValueError("poll_backoff_factor must be at least 1.0")
+    if max_poll_interval < poll_interval:
+        raise ValueError("max_poll_interval must be greater than or equal to poll_interval")
 
     while True:
         attempt_count += 1
@@ -1014,10 +1435,34 @@ async def wait_for_purple_restoreos(
             include_identifiers=include_identifiers,
         )
         elapsed = asyncio.get_running_loop().time() - start
-        snapshot = _purple_probe_wait_snapshot(attempt_count, elapsed, last_probe)
+        restored = _purple_probe_has_restored_device(last_probe)
+        if restored:
+            if restored_streak == 0:
+                stable_since = elapsed
+            restored_streak += 1
+        else:
+            restored_streak = 0
+            stable_since = None
+        stable_ready = bool(
+            restored
+            and restored_streak >= stable_attempts
+            and stable_since is not None
+            and (elapsed - stable_since) >= stable_seconds
+        )
+        snapshot = _purple_probe_wait_snapshot(
+            attempt_count,
+            elapsed,
+            last_probe,
+            restored_streak=restored_streak,
+            stable_ready=stable_ready,
+            stable_since=stable_since,
+            stable_attempts=stable_attempts,
+            stable_seconds=stable_seconds,
+            poll_interval=current_poll_interval,
+        )
         if include_history:
             history.append(snapshot)
-        if snapshot["restored"]:
+        if stable_ready:
             result = {
                 "checked": True,
                 "ready": True,
@@ -1028,6 +1473,15 @@ async def wait_for_purple_restoreos(
                 "timeout": timeout,
                 "poll_interval": poll_interval,
                 "probe_timeout": probe_timeout,
+                "stability": {
+                    "stable_ready": True,
+                    "required_stable_attempts": stable_attempts,
+                    "required_stable_seconds": stable_seconds,
+                    "restored_streak": restored_streak,
+                    "stable_since": round(stable_since, 3) if stable_since is not None else None,
+                    "poll_backoff_factor": poll_backoff_factor,
+                    "max_poll_interval": max_poll_interval,
+                },
                 "last_probe": last_probe,
                 "reason": "restoreos_reached",
             }
@@ -1048,6 +1502,15 @@ async def wait_for_purple_restoreos(
                 "timeout": timeout,
                 "poll_interval": poll_interval,
                 "probe_timeout": probe_timeout,
+                "stability": {
+                    "stable_ready": False,
+                    "required_stable_attempts": stable_attempts,
+                    "required_stable_seconds": stable_seconds,
+                    "restored_streak": restored_streak,
+                    "stable_since": round(stable_since, 3) if stable_since is not None else None,
+                    "poll_backoff_factor": poll_backoff_factor,
+                    "max_poll_interval": max_poll_interval,
+                },
                 "last_probe": last_probe,
                 "reason": "timeout_waiting_for_restoreos",
             }
@@ -1055,7 +1518,9 @@ async def wait_for_purple_restoreos(
                 result["history"] = history
             return result
 
-        await asyncio.sleep(min(poll_interval, max(0.0, deadline - now)))
+        await asyncio.sleep(min(current_poll_interval, max(0.0, deadline - now)))
+        if poll_backoff_factor > 1.0:
+            current_poll_interval = min(max_poll_interval, current_poll_interval * poll_backoff_factor)
 
 
 def build_purple_reverse_proxy_info(firmware_root: Optional[Path] = None, deep: bool = False) -> dict[str, Any]:

@@ -31,6 +31,7 @@ from pymobiledevice3.restore.mbn import mbn_mav25_stitch, mbn_stitch
 from pymobiledevice3.restore.purple import apply_purple_reverse_proxy_restore_options
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore_options import RestoreOptions
+from pymobiledevice3.restore.restore_options import summarize_restore_message_details, summarize_restore_options
 from pymobiledevice3.restore.restored_client import RestoredClient
 from pymobiledevice3.restore.tss import TSSRequest, TSSResponse
 from pymobiledevice3.service_connection import ServiceConnection
@@ -1221,10 +1222,12 @@ class Restore(BaseRestore):
             self.logger.error(f"unknown data request: {message}")
 
     async def handle_previous_restore_log_msg(self, message: dict):
+        self.logger.debug(f"restore message summary: {summarize_restore_message_details(message)}")
         restorelog = message["PreviousRestoreLog"]
         self.logger.debug(f"PreviousRestoreLog: {restorelog}")
 
     async def handle_progress_msg(self, message: dict) -> None:
+        self.logger.debug(f"restore message summary: {summarize_restore_message_details(message)}")
         operation = message["Operation"]
         if operation in PROGRESS_BAR_OPERATIONS:
             message["Operation"] = PROGRESS_BAR_OPERATIONS[operation]
@@ -1248,6 +1251,7 @@ class Restore(BaseRestore):
         self.logger.debug(f"progress-bar: {message}")
 
     async def handle_status_msg(self, message: dict):
+        self.logger.debug(f"restore message summary: {summarize_restore_message_details(message)}")
         self.logger.debug(f"status message: {message}")
         status = message["Status"]
         log = message.get("Log")
@@ -1266,6 +1270,7 @@ class Restore(BaseRestore):
                 self.logger.error("unknown error")
 
     async def handle_checkpoint_msg(self, message: dict):
+        self.logger.debug(f"restore message summary: {summarize_restore_message_details(message)}")
         self.logger.debug(f"checkpoint: {message}")
 
     async def handle_bb_update_status_msg(self, message: dict):
@@ -1363,6 +1368,8 @@ class Restore(BaseRestore):
         )
         if self._purple_restore_options:
             apply_purple_reverse_proxy_restore_options(opts, self._purple_restore_options)
+        self._restore_options_summary = summarize_restore_options(opts)
+        self.logger.debug(f"restore options summary: {self._restore_options_summary}")
 
         # start the restore process
         await self._restored.start_restore(opts)

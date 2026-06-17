@@ -58,6 +58,19 @@ APPLE_VENDOR_ID = 0x05AC
 logger = logging.getLogger(__name__)
 
 
+def _normalize_ecid(ecid):
+    if ecid is None:
+        return None
+    if isinstance(ecid, int):
+        return ecid
+
+    ecid = str(ecid).strip()
+    try:
+        return int(ecid, 0)
+    except ValueError:
+        return int(ecid, 16)
+
+
 class IRecv:
     def __init__(self, ecid=None, timeout=0xFFFFFFFF, is_recovery=None):
         self.mode: Optional[Mode] = None
@@ -258,6 +271,7 @@ class IRecv:
             return None
 
     def _find(self, ecid=None, timeout=0xFFFFFFFF, is_recovery=None):
+        requested_ecid = _normalize_ecid(ecid)
         start = time.time()
         end = start + timeout
         while (self._device is None) and (time.time() < end):
@@ -282,9 +296,9 @@ class IRecv:
                     self.mode = mode
                     self._populate_device_info()
 
-                    if ecid is not None:
+                    if requested_ecid is not None:
                         found_ecid = int(self._device_info["ECID"], 16)
-                        if found_ecid != ecid:
+                        if found_ecid != requested_ecid:
                             # wrong device - move on
                             self._device = None
                             continue

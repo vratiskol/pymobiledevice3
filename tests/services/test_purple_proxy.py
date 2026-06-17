@@ -3,7 +3,15 @@ import struct
 
 import pytest
 
+from pymobiledevice3.exceptions import ConnectionTerminatedError
 from pymobiledevice3.restore import purple_proxy
+from pymobiledevice3.restore.restore_options import (
+    summarize_restore_message,
+    summarize_restore_message_details,
+    summarize_restore_message_type,
+    summarize_restore_options,
+)
+from pymobiledevice3.restore.purple import collect_live_purple_usb_inventory
 from pymobiledevice3.restore.purple_proxy import (
     PURPLE_PROXY_CONTROL_PORT,
     PURPLE_PROXY_NOTIFY_PORT,
@@ -13,6 +21,7 @@ from pymobiledevice3.restore.purple_proxy import (
     build_purple_proxy_dictionary,
     classify_purple_proxy_notify_message,
     is_purple_proxy_pong_response,
+    probe_purple_proxy_conn,
     probe_purple_proxy_hello,
     run_purple_proxy_control_command,
     run_purple_proxy_notify_command,
@@ -30,12 +39,12 @@ class FakeService:
         self.closed = False
 
     async def recv_plist(self, endianity=">"):
-        assert endianity == ">"
+        assert endianity in (">", "<")
         return self.responses.pop(0)
 
     async def send_plist(self, message, endianity=">", fmt=plistlib.FMT_XML):
-        assert endianity == ">"
-        assert fmt == plistlib.FMT_XML
+        assert endianity in (">", "<")
+        assert fmt in (plistlib.FMT_XML, plistlib.FMT_BINARY)
         self.sent.append(message)
 
     async def recvall(self, size):
@@ -50,19 +59,84 @@ class FakeService:
         self.closed = True
 
 
+class FakeUsbEndpoint:
+    def __init__(self, address, attributes=2, max_packet_size=512):
+        self.bEndpointAddress = address
+        self.bmAttributes = attributes
+        self.wMaxPacketSize = max_packet_size
+
+
+class FakeUsbInterface:
+    def __init__(self, interface_number, alternate_setting, interface_class, interface_subclass, interface_protocol, iinterface, endpoints):
+        self.bInterfaceNumber = interface_number
+        self.bAlternateSetting = alternate_setting
+        self.bInterfaceClass = interface_class
+        self.bInterfaceSubClass = interface_subclass
+        self.bInterfaceProtocol = interface_protocol
+        self.iInterface = iinterface
+        self._endpoints = list(endpoints)
+
+    def endpoints(self):
+        return list(self._endpoints)
+
+
+class FakeUsbConfiguration:
+    def __init__(self, interfaces):
+        self.bConfigurationValue = 1
+        self.bNumInterfaces = 2
+        self.wTotalLength = 0x39
+        self._interfaces = list(interfaces)
+
+    def __iter__(self):
+        return iter(self._interfaces)
+
+
+class FakeUsbDevice:
+    idVendor = 0x05AC
+    idProduct = 0x1281
+    speed = 3
+    iSerialNumber = 4
+    iManufacturer = 2
+    iProduct = 3
+
+    def __init__(self):
+        self._configuration = FakeUsbConfiguration(
+            [
+                FakeUsbInterface(0, 0, 0xFE, 0x01, 0x02, 0, [FakeUsbEndpoint(0x04)]),
+                FakeUsbInterface(1, 0, 0xFF, 0xFF, 0x51, 0, []),
+                FakeUsbInterface(1, 1, 0xFF, 0xFF, 0x51, 6, [FakeUsbEndpoint(0x81), FakeUsbEndpoint(0x02)]),
+            ]
+        )
+
+    def get_active_configuration(self):
+        return self._configuration
+
+
 class FakePurpleProxyClient:
-    def __init__(self, response=None, messages=None):
+    def __init__(self, response=None, messages=None, sync_response=None):
         self.response = response or {}
         self.messages = list(messages or [])
+        self.sync_response = sync_response or {
+            "Command": "ControlSync",
+            "message": 1,
+            "message_name": "sync",
+            "sync": True,
+            "payload_hex": "0100",
+            "payload_size": 2,
+        }
         self.sent = []
         self.closed = False
 
-    async def hello_control(self, protocol_version=1):
-        assert protocol_version == 2
+    async def hello_control(self, protocol_version=1, **fields):
+        assert protocol_version in (1, 2)
         return self.response
 
-    async def begin_control(self, protocol_version=1):
-        assert protocol_version == 2
+    async def hello_conn(self, protocol_version=1, **fields):
+        assert protocol_version in (1, 2)
+        return self.response
+
+    async def begin_control(self, protocol_version=1, **fields):
+        assert protocol_version in (1, 2)
         return self.response
 
     async def wait_socket(self, conn_port=PURPLE_PROXY_SOCKS_PORT):
@@ -81,13 +155,21 @@ class FakePurpleProxyClient:
     async def read_dictionary(self):
         return self.messages.pop(0)
 
+    async def read_control_sync_message(self):
+        return self.sync_response
+
     async def close(self):
         self.closed = True
 
 
-def parse_prefixed_plist(data: bytes):
-    size = struct.unpack(">L", data[:4])[0]
+def parse_prefixed_plist(data: bytes, endianity: str = ">"):
+    size = struct.unpack(f"{endianity}L", data[:4])[0]
     return plistlib.loads(data[4 : 4 + size])
+
+
+def parse_command_frame(data: bytes, preamble: bytes, endianity: str = "<"):
+    assert data.startswith(preamble)
+    return parse_prefixed_plist(data[len(preamble) :], endianity=endianity)
 
 
 @pytest.mark.asyncio
@@ -125,35 +207,84 @@ async def test_client_trace_records_plist_io_with_sanitized_responses():
 
 @pytest.mark.asyncio
 async def test_hello_control_sends_command_and_reads_response():
-    service = FakeService(responses=[{"Status": "OK", "CtrlProtoVersion": 1}])
+    service = FakeService(responses=[purple_proxy.PURPLE_PROXY_HELLO_CONTROL_PREAMBLE, b"\xe1\x10"])
     client = PurpleProxyClient(service)
 
     response = await client.hello_control(HostSupportsDeprecatedProtocol=True)
 
-    assert response == {"Status": "OK", "CtrlProtoVersion": 1}
-    assert service.sent == [
-        {
-            "Command": "HelloCtrl",
-            "CtrlProtoVersion": 1,
-            "HostSupportsDeprecatedProtocol": True,
-        }
-    ]
+    assert response == {
+        "Command": "HelloCtrl",
+        "CtrlProtoVersion": 1,
+        "ConnPort": 4321,
+        "DeprecatedProtocol": True,
+        "RequestedCtrlProtoVersion": 2,
+        "IgnoredRequestFields": ["HostSupportsDeprecatedProtocol"],
+    }
+    assert service.sent == [purple_proxy.PURPLE_PROXY_HELLO_CONTROL_PREAMBLE]
 
 
 @pytest.mark.asyncio
 async def test_control_command_helpers_use_firmware_command_names():
-    service = FakeService(responses=[{"Status": "OK"}, {"SocketReady": True}, {"Pong": True}])
-    client = PurpleProxyClient(service)
+    service = FakeService(responses=[{"Status": "OK"}, {"Pong": True}])
+    client = PurpleProxyClient(service, endianity="<")
 
     assert await client.begin_control(protocol_version=2, CtrlConn=True) == {"Status": "OK"}
-    assert await client.wait_socket(conn_port=1081) == {"SocketReady": True}
+    with pytest.raises(RuntimeError, match="WaitSocket is an internal firmware accept helper"):
+        await client.wait_socket(conn_port=1081)
     assert await client.send_ping() == {"Pong": True}
 
-    assert service.sent == [
-        {"Command": "BeginCtrl", "CtrlProtoVersion": 2, "CtrlConn": True},
-        {"Command": "WaitSocket", "ConnPort": 1081},
-        {"Command": "Ping"},
-    ]
+    assert parse_command_frame(service.sent[0], purple_proxy.PURPLE_PROXY_BEGIN_CONTROL_PREAMBLE) == {
+        "Command": "BeginCtrl",
+        "CtrlProtoVersion": 2,
+        "CtrlConn": True,
+    }
+    assert service.sent[1:] == [{"Command": "Ping"}]
+
+
+@pytest.mark.asyncio
+async def test_control_command_helpers_support_legacy_protocol_version_one():
+    service = FakeService(responses=[purple_proxy.PURPLE_PROXY_HELLO_CONTROL_PREAMBLE, b"\xe1\x10", {"Status": "OK"}])
+    client = PurpleProxyClient(service, endianity="<")
+
+    assert await client.hello_control(protocol_version=1) == {
+        "Command": "HelloCtrl",
+        "CtrlProtoVersion": 1,
+        "ConnPort": 4321,
+        "DeprecatedProtocol": True,
+        "RequestedCtrlProtoVersion": 1,
+    }
+    assert await client.begin_control(protocol_version=1) == {"Status": "OK"}
+
+    assert service.sent[0] == purple_proxy.PURPLE_PROXY_HELLO_CONTROL_PREAMBLE
+    assert parse_command_frame(service.sent[1], purple_proxy.PURPLE_PROXY_BEGIN_CONTROL_PREAMBLE) == {
+        "Command": "BeginCtrl",
+        "CtrlProtoVersion": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_conn_command_helpers_use_firmware_command_names():
+    service = FakeService(responses=[{"Identifier": "device-id", "ConnProtoVersion": 2}])
+    client = PurpleProxyClient(service, endianity="<")
+
+    assert await client.hello_conn(protocol_version=2) == {"Identifier": "device-id", "ConnProtoVersion": 2}
+    assert parse_command_frame(service.sent[0], purple_proxy.PURPLE_PROXY_HELLO_CONN_PREAMBLE) == {
+        "Command": "HelloConn",
+        "ConnProtoVersion": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_conn_command_helpers_support_legacy_protocol_version_one():
+    service = FakeService(responses=[purple_proxy.PURPLE_PROXY_HELLO_CONN_PREAMBLE])
+    client = PurpleProxyClient(service, endianity="<")
+
+    assert await client.hello_conn(protocol_version=1) == {
+        "Command": "HelloConn",
+        "ConnProtoVersion": 1,
+        "DeprecatedProtocol": True,
+    }
+    assert service.sent[0] == purple_proxy.PURPLE_PROXY_HELLO_CONN_PREAMBLE
 
 
 @pytest.mark.asyncio
@@ -366,6 +497,55 @@ async def test_probe_purple_proxy_hello_returns_sanitized_response(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_probe_purple_proxy_conn_returns_sanitized_response(monkeypatch):
+    fake_client = FakePurpleProxyClient({
+        "Identifier": "sensitive",
+        "ConnProtoVersion": 2,
+    })
+    calls = []
+
+    async def fake_connect_socks(udid=None, **kwargs):
+        calls.append({"udid": udid, **kwargs})
+        return fake_client
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_socks", staticmethod(fake_connect_socks))
+
+    result = await probe_purple_proxy_conn(
+        udid="sensitive-udid",
+        usbmux_address="/tmp/usbmux",
+        timeout=0.1,
+        port=1234,
+        protocol_version=2,
+        include_response=True,
+    )
+
+    assert result == {
+        "checked": True,
+        "experimental": True,
+        "command": "HelloConn",
+        "port": 1234,
+        "protocol_version": 2,
+        "include_response": True,
+        "reachable": True,
+        "response_keys": ["ConnProtoVersion", "Identifier"],
+        "identifier": "<redacted>",
+        "response": {
+            "Identifier": "<redacted>",
+            "ConnProtoVersion": 2,
+        },
+    }
+    assert calls == [
+        {
+            "udid": "sensitive-udid",
+            "connection_type": "USB",
+            "usbmux_address": "/tmp/usbmux",
+            "port": 1234,
+        }
+    ]
+    assert fake_client.closed is True
+
+
+@pytest.mark.asyncio
 async def test_run_purple_proxy_control_command_begin_returns_sanitized_response(monkeypatch):
     fake_client = FakePurpleProxyClient({
         "Status": "OK",
@@ -405,14 +585,7 @@ async def test_run_purple_proxy_control_command_begin_returns_sanitized_response
 
 
 @pytest.mark.asyncio
-async def test_run_purple_proxy_control_command_wait_socket_sends_conn_port(monkeypatch):
-    fake_client = FakePurpleProxyClient({"SocketReady": True})
-
-    async def fake_connect_control(udid=None, **kwargs):
-        return fake_client
-
-    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_control", staticmethod(fake_connect_control))
-
+async def test_run_purple_proxy_control_command_wait_socket_reports_internal_helper():
     result = await run_purple_proxy_control_command(
         PurpleProxyCommand.WAIT_SOCKET,
         timeout=0.1,
@@ -427,11 +600,10 @@ async def test_run_purple_proxy_control_command_wait_socket_sends_conn_port(monk
         "port": PURPLE_PROXY_CONTROL_PORT,
         "include_response": True,
         "conn_port": 4321,
-        "reachable": True,
-        "response_keys": ["SocketReady"],
-        "response": {"SocketReady": True},
+        "firmware_internal": True,
+        "reachable": False,
+        "reason": "WaitSocket is an internal firmware accept helper, not a host wire command.",
     }
-    assert fake_client.closed is True
 
 
 @pytest.mark.asyncio
@@ -530,6 +702,32 @@ async def test_run_purple_proxy_notify_command_register_collects_sanitized_messa
 
 
 @pytest.mark.asyncio
+async def test_run_purple_proxy_notify_command_keeps_sent_success_when_listen_closes(monkeypatch):
+    class ClosingNotifyClient(FakePurpleProxyClient):
+        async def read_dictionary(self):
+            raise ConnectionTerminatedError()
+
+    fake_client = ClosingNotifyClient()
+
+    async def fake_connect_notify(udid=None, **kwargs):
+        return fake_client
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_notify", staticmethod(fake_connect_notify))
+
+    result = await run_purple_proxy_notify_command(
+        PurpleProxyCommand.REGISTER_NOTIFY,
+        timeout=0.1,
+        listen_timeout=0.1,
+        max_messages=1,
+    )
+
+    assert result["reachable"] is True
+    assert result["sent"] is True
+    assert result["message_error_type"] == "ConnectionTerminatedError"
+    assert fake_client.sent == [{"Command": "RegisterNotify"}]
+
+
+@pytest.mark.asyncio
 async def test_run_purple_proxy_notify_command_set_log_level_sends_level(monkeypatch):
     fake_client = FakePurpleProxyClient()
 
@@ -593,7 +791,7 @@ async def test_run_purple_proxy_socks_probe_accepts_no_auth_handshake(monkeypatc
 
     async def fake_connect_socks(udid=None, **kwargs):
         calls.append({"udid": udid, **kwargs})
-        return PurpleProxyClient(service)
+        return PurpleProxyClient(service, endianity="<")
 
     monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_socks", staticmethod(fake_connect_socks))
 
@@ -607,12 +805,13 @@ async def test_run_purple_proxy_socks_probe_accepts_no_auth_handshake(monkeypatc
     assert result == {
         "checked": True,
         "experimental": True,
-        "protocol": "SOCKS5",
-        "port": PURPLE_PROXY_SOCKS_PORT,
-        "include_response": True,
-        "reachable": True,
-        "handshake": {
-            "sent": True,
+            "protocol": "SOCKS5",
+            "port": PURPLE_PROXY_SOCKS_PORT,
+            "include_response": True,
+            "requires_control_connection": True,
+            "reachable": True,
+            "handshake": {
+                "sent": True,
             "version": 5,
             "method": 0,
             "method_name": "no_authentication_required",
@@ -629,7 +828,7 @@ async def test_run_purple_proxy_socks_probe_accepts_no_auth_handshake(monkeypatc
             "ok": True,
         },
     }
-    assert service.sent == [b"\x05\x01\x00"]
+    assert service.sent[0] == b"\x05\x01\x00"
     assert service.closed is True
     assert calls == [
         {
@@ -644,10 +843,17 @@ async def test_run_purple_proxy_socks_probe_accepts_no_auth_handshake(monkeypatc
 
 @pytest.mark.asyncio
 async def test_run_purple_proxy_socks_probe_sends_connect_request(monkeypatch):
-    service = FakeService(responses=[b"\x05\x00", b"\x05\x00\x00\x01", b"\x00\x00\x00\x00", b"\x04\xd2"])
+    service = FakeService(
+        responses=[
+            b"\x05\x00",
+            b"\x05\x00\x00\x01",
+            b"\x00\x00\x00\x00",
+            b"\x04\xd2",
+        ]
+    )
 
     async def fake_connect_socks(udid=None, **kwargs):
-        return PurpleProxyClient(service)
+        return PurpleProxyClient(service, endianity="<")
 
     monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_socks", staticmethod(fake_connect_socks))
 
@@ -678,10 +884,8 @@ async def test_run_purple_proxy_socks_probe_sends_connect_request(monkeypatch):
         "connect_succeeded": True,
         "ok": True,
     }
-    assert service.sent == [
-        b"\x05\x01\x00",
-        b"\x05\x01\x00\x03\x0cexample.test\x01\xbb",
-    ]
+    assert service.sent[0] == b"\x05\x01\x00"
+    assert service.sent[1] == b"\x05\x01\x00\x03\x0cexample.test\x01\xbb"
     assert service.closed is True
 
 
@@ -700,6 +904,7 @@ async def test_run_purple_proxy_socks_probe_reports_connect_error(monkeypatch):
         "protocol": "SOCKS5",
         "port": PURPLE_PROXY_SOCKS_PORT,
         "include_response": False,
+        "requires_control_connection": True,
         "reachable": False,
         "error_type": "OSError",
         "summary": {
@@ -714,6 +919,7 @@ async def test_run_purple_proxy_socks_probe_reports_connect_error(monkeypatch):
 async def test_run_purple_proxy_session_keeps_notify_open_during_control_sequence(monkeypatch):
     notify_client = FakePurpleProxyClient(messages=[{"Event": "ProxyOnline", "SerialNumber": "sensitive"}])
     control_client = FakePurpleProxyClient({"Command": "Pong", "SerialNumber": "sensitive"})
+    conn_client = FakePurpleProxyClient({"Command": "HelloConn", "Identifier": "sensitive"})
     calls = []
 
     async def fake_connect_notify(udid=None, **kwargs):
@@ -724,8 +930,13 @@ async def test_run_purple_proxy_session_keeps_notify_open_during_control_sequenc
         calls.append({"kind": "control", "udid": udid, **kwargs})
         return control_client
 
+    async def fake_connect_socks(udid=None, **kwargs):
+        calls.append({"kind": "conn", "udid": udid, **kwargs})
+        return conn_client
+
     monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_notify", staticmethod(fake_connect_notify))
     monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_control", staticmethod(fake_connect_control))
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_socks", staticmethod(fake_connect_socks))
 
     result = await run_purple_proxy_session(
         udid="sensitive-udid",
@@ -743,9 +954,12 @@ async def test_run_purple_proxy_session_keeps_notify_open_during_control_sequenc
 
     phases = result["phases"]
     assert result["summary"] == {
+        "hello_control_reachable": False,
+        "hello_conn_reachable": True,
         "control_reachable": True,
-        "ping_pong": True,
-        "wait_socket_reachable": True,
+        "control_sync_received": True,
+        "ping_pong": False,
+        "wait_socket_reachable": False,
         "notify_registered": True,
         "set_log_level_sent": True,
         "socks_probe_ok": None,
@@ -763,9 +977,21 @@ async def test_run_purple_proxy_session_keeps_notify_open_during_control_sequenc
         "unknown_count": 0,
     }
     assert phases["register_notify"]["messages"] == [{"Event": "ProxyOnline", "SerialNumber": "<redacted>"}]
+    assert phases["hello_control"] == {
+        "checked": False,
+        "reason": "Not part of the default purple-session flow.",
+    }
     assert phases["begin_control"]["response"] == {"Command": "Pong", "SerialNumber": "<redacted>"}
-    assert phases["ping"]["pong"] is True
-    assert phases["wait_socket"]["conn_port"] == 4321
+    assert phases["control_sync"]["sync"] is True
+    assert phases["hello_conn"]["reachable"] is True
+    assert phases["ping"] == {
+        "checked": False,
+        "reason": "Not part of the BeginCtrl/ControlSync negotiation flow.",
+    }
+    assert phases["wait_socket"] == {
+        "checked": False,
+        "reason": "WaitSocket is an internal firmware accept helper, not a host wire command.",
+    }
     assert phases["proxy_dictionary"]["proxy_url"] == "socks://127.0.0.1:4321/"
     assert phases["socks_probe"] == {
         "checked": False,
@@ -790,16 +1016,74 @@ async def test_run_purple_proxy_session_keeps_notify_open_during_control_sequenc
             "usbmux_address": "/tmp/usbmux",
             "port": 1234,
         },
+        {
+            "kind": "conn",
+            "udid": "sensitive-udid",
+            "connection_type": "USB",
+            "usbmux_address": "/tmp/usbmux",
+            "port": 4321,
+        },
     ]
     assert notify_client.closed is True
     assert control_client.closed is True
+    assert conn_client.closed is True
     assert "sensitive" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_run_purple_proxy_session_connects_conn_after_control_sync(monkeypatch):
+    notify_client = FakePurpleProxyClient()
+    control_client = FakePurpleProxyClient({"Pong": True, "ConnPort": 4321})
+    conn_client = FakePurpleProxyClient({"Command": "HelloConn", "Identifier": "sensitive"})
+    calls = []
+
+    async def fake_connect_notify(udid=None, **kwargs):
+        calls.append({"kind": "notify", "port": kwargs["port"]})
+        return notify_client
+
+    async def fake_connect_control(udid=None, **kwargs):
+        calls.append({"kind": "control", "port": kwargs["port"]})
+        return control_client
+
+    async def fake_connect_socks(udid=None, **kwargs):
+        calls.append({"kind": "conn", "port": kwargs["port"]})
+        return conn_client
+
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_notify", staticmethod(fake_connect_notify))
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_control", staticmethod(fake_connect_control))
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_socks", staticmethod(fake_connect_socks))
+
+    result = await run_purple_proxy_session(
+        timeout=0.1,
+        protocol_version=2,
+        listen_timeout=0.0,
+        conn_port=4321,
+    )
+
+    assert result["summary"] == {
+        "hello_control_reachable": False,
+        "hello_conn_reachable": True,
+        "control_reachable": True,
+        "control_sync_received": True,
+        "ping_pong": False,
+        "wait_socket_reachable": False,
+        "notify_registered": True,
+        "set_log_level_sent": None,
+        "socks_probe_ok": None,
+        "proxy_dictionary_ready": True,
+        "ok": True,
+    }
+    assert [call["port"] for call in calls if call["kind"] == "conn"] == [4321]
+    assert result["phases"]["control_sync"]["sync"] is True
+    assert result["phases"]["hello_conn"]["reachable"] is True
+    assert conn_client.closed is True
 
 
 @pytest.mark.asyncio
 async def test_run_purple_proxy_session_can_include_identifiers(monkeypatch):
     notify_client = FakePurpleProxyClient(messages=[{"Event": "ProxyOnline", "SerialNumber": "sensitive"}])
     control_client = FakePurpleProxyClient({"Command": "Pong", "SerialNumber": "sensitive"})
+    conn_client = FakePurpleProxyClient({"Command": "HelloConn", "Identifier": "sensitive"})
 
     async def fake_connect_notify(udid=None, **kwargs):
         return notify_client
@@ -807,8 +1091,12 @@ async def test_run_purple_proxy_session_can_include_identifiers(monkeypatch):
     async def fake_connect_control(udid=None, **kwargs):
         return control_client
 
+    async def fake_connect_socks(udid=None, **kwargs):
+        return conn_client
+
     monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_notify", staticmethod(fake_connect_notify))
     monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_control", staticmethod(fake_connect_control))
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_socks", staticmethod(fake_connect_socks))
 
     result = await run_purple_proxy_session(
         timeout=0.1,
@@ -825,6 +1113,7 @@ async def test_run_purple_proxy_session_can_include_identifiers(monkeypatch):
 
     assert result["include_identifiers"] is True
     assert result["phases"]["register_notify"]["messages"] == [{"Event": "ProxyOnline", "SerialNumber": "sensitive"}]
+    assert result["phases"]["hello_conn"]["response"] == {"Command": "HelloConn", "Identifier": "sensitive"}
     assert result["phases"]["begin_control"]["response"] == {"Command": "Pong", "SerialNumber": "sensitive"}
 
 
@@ -834,10 +1123,10 @@ async def test_run_purple_proxy_session_trace_records_phase_and_plist_events(mon
     control_service = FakeService(
         responses=[
             {"Command": "BeginAck", "SerialNumber": "sensitive"},
-            {"Command": "Pong", "SerialNumber": "sensitive"},
-            {"SocketReady": True},
+            b"\x01\x00",
         ]
     )
+    conn_service = FakeService(responses=[{"Command": "HelloConn", "Identifier": "sensitive"}])
 
     async def fake_connect_notify(udid=None, **kwargs):
         return PurpleProxyClient(
@@ -855,8 +1144,17 @@ async def test_run_purple_proxy_session_trace_records_phase_and_plist_events(mon
             include_identifiers=kwargs.get("include_identifiers", False),
         )
 
+    async def fake_connect_socks(udid=None, **kwargs):
+        return PurpleProxyClient(
+            conn_service,
+            trace=kwargs["trace"],
+            trace_channel="socks",
+            include_identifiers=kwargs.get("include_identifiers", False),
+        )
+
     monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_notify", staticmethod(fake_connect_notify))
     monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_control", staticmethod(fake_connect_control))
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_socks", staticmethod(fake_connect_socks))
 
     result = await run_purple_proxy_session(
         timeout=0.1,
@@ -873,9 +1171,10 @@ async def test_run_purple_proxy_session_trace_records_phase_and_plist_events(mon
     assert result["trace"]["enabled"] is True
     assert result["trace"]["event_count"] == len(events)
     assert "trace_timing" in result["phases"]["begin_control"]
+    assert "trace_timing" in result["phases"]["hello_conn"]
     assert "send_plist" in [event["event"] for event in events]
     assert "recv_plist" in [event["event"] for event in events]
-    assert {"Command": "Pong", "SerialNumber": "<redacted>"} in [
+    assert {"Command": "BeginAck", "SerialNumber": "<redacted>"} in [
         event.get("response") for event in events if event["event"] == "recv_plist"
     ]
 
@@ -884,6 +1183,7 @@ async def test_run_purple_proxy_session_trace_records_phase_and_plist_events(mon
 async def test_run_purple_proxy_session_can_require_socks_probe(monkeypatch):
     notify_client = FakePurpleProxyClient()
     control_client = FakePurpleProxyClient({"Command": "Pong"})
+    conn_client = FakePurpleProxyClient({"Command": "HelloConn", "Identifier": "sensitive"})
     socks_calls = []
 
     async def fake_connect_notify(udid=None, **kwargs):
@@ -891,6 +1191,9 @@ async def test_run_purple_proxy_session_can_require_socks_probe(monkeypatch):
 
     async def fake_connect_control(udid=None, **kwargs):
         return control_client
+
+    async def fake_connect_socks(udid=None, **kwargs):
+        return conn_client
 
     async def fake_run_purple_proxy_socks_probe(**kwargs):
         socks_calls.append(kwargs)
@@ -909,6 +1212,7 @@ async def test_run_purple_proxy_session_can_require_socks_probe(monkeypatch):
 
     monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_notify", staticmethod(fake_connect_notify))
     monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_control", staticmethod(fake_connect_control))
+    monkeypatch.setattr(purple_proxy.PurpleProxyClient, "connect_socks", staticmethod(fake_connect_socks))
     monkeypatch.setattr(purple_proxy, "run_purple_proxy_socks_probe", fake_run_purple_proxy_socks_probe)
 
     result = await run_purple_proxy_session(
@@ -932,12 +1236,14 @@ async def test_run_purple_proxy_session_can_require_socks_probe(monkeypatch):
             "usbmux_address": "/tmp/usbmux",
             "timeout": 0.1,
             "port": 4321,
+            "conn_protocol_version": 2,
             "connect_host": "example.test",
             "connect_port": 443,
             "connection_type": "USB",
             "include_response": False,
         }
     ]
+    assert conn_client.closed is True
     assert "sensitive" not in repr(result)
 
 
@@ -955,6 +1261,8 @@ async def test_run_purple_proxy_session_summarizes_unreachable_control(monkeypat
     result = await run_purple_proxy_session(timeout=0.1, listen_timeout=0.0)
 
     assert result["summary"]["ok"] is False
+    assert result["summary"]["hello_control_reachable"] is False
+    assert result["summary"]["hello_conn_reachable"] is False
     assert result["summary"]["set_log_level_sent"] is None
     assert result["summary"]["socks_probe_ok"] is None
     assert result["phases"]["set_log_level"] == {
@@ -965,8 +1273,13 @@ async def test_run_purple_proxy_session_summarizes_unreachable_control(monkeypat
         "checked": False,
         "reason": "--probe-socks was not provided.",
     }
+    assert result["phases"]["hello_control"] == {
+        "checked": False,
+        "reason": "Not part of the default purple-session flow.",
+    }
     assert result["phases"]["begin_control"]["reachable"] is False
     assert result["phases"]["begin_control"]["error_type"] == "OSError"
+    assert result["phases"]["hello_conn"]["reachable"] is False
 
 
 @pytest.mark.asyncio
@@ -983,8 +1296,190 @@ async def test_probe_purple_proxy_hello_reports_connect_error(monkeypatch):
         "experimental": True,
         "command": "HelloCtrl",
         "port": PURPLE_PROXY_CONTROL_PORT,
-        "protocol_version": 1,
+        "protocol_version": 2,
         "include_response": False,
         "reachable": False,
         "error_type": "OSError",
     }
+
+
+def test_summarize_restore_message_type_recognizes_checkpoint_alias():
+    summary = summarize_restore_message_type("CheckpointMsg")
+
+    assert summary == {
+        "checked": True,
+        "message_type": "CheckpointMsg",
+        "canonical_type": "Checkpoint",
+        "family": "checkpoint",
+        "purpose": "Restore checkpoint marker",
+        "alias_of": "Checkpoint",
+    }
+
+
+def test_summarize_restore_message_reports_keys_without_payload_values():
+    summary = summarize_restore_message({"MsgType": "StatusMsg", "Status": 0, "Log": "hidden"})
+
+    assert summary == {
+        "checked": True,
+        "message_type": "StatusMsg",
+        "canonical_type": "StatusMsg",
+        "family": "status",
+        "purpose": "Restore status and final error reporting",
+        "message_keys": ["Log", "MsgType", "Status"],
+    }
+
+
+def test_summarize_restore_message_details_reports_status_and_log_shape():
+    summary = summarize_restore_message_details({"MsgType": "StatusMsg", "Status": 0, "Log": "line1\nline2"})
+
+    assert summary["message_keys"] == ["Log", "MsgType", "Status"]
+    assert summary["details"] == {
+        "status": {
+            "kind": "int",
+            "value": 0,
+            "success": True,
+        },
+        "log": {
+            "kind": "string",
+            "char_count": 11,
+            "line_count": 2,
+        },
+    }
+
+
+def test_summarize_restore_message_details_reports_restore_state_keys():
+    summary = summarize_restore_message_details(
+        {
+            "MsgType": "CheckpointMsg",
+            "restoreOutcome": {"kind": "success"},
+            "restoreChildFailures": ["baseband"],
+            "restoreRebootRetryEnabled": True,
+        }
+    )
+
+    assert summary["state"] == {
+        "restoreChildFailures": {
+            "family": "restore_state",
+            "purpose": "Child-operation failures accumulated during restore.",
+            "value_summary": {
+                "kind": "list",
+                "item_count": 1,
+            },
+        },
+        "restoreOutcome": {
+            "family": "restore_state",
+            "purpose": "Overall restore outcome reported by restored_update.",
+            "value_summary": {
+                "kind": "dict",
+                "item_count": 1,
+                "keys": ["kind"],
+            },
+        },
+        "restoreRebootRetryEnabled": {
+            "family": "restore_state",
+            "purpose": "Reboot retry is enabled for restore.",
+            "value_summary": {
+                "kind": "bool",
+                "value": True,
+            },
+        },
+    }
+
+
+def test_collect_live_purple_usb_inventory_reports_interface_altsettings(monkeypatch):
+    from pymobiledevice3.restore import purple
+
+    monkeypatch.setattr(purple, "usb_find", lambda find_all=True: [FakeUsbDevice()])
+    monkeypatch.setattr(
+        purple,
+        "get_string",
+        lambda device, index: {
+            2: "Apple Inc.",
+            3: "Apple Mobile Device (Recovery Mode)",
+            4: "SDOM:01 CPID:8120 CPRV:11 CPFM:03 SCEP:01 BDID:08 ECID:0123456789ABCDEF IBFL:3D SIKA:00 SRNM:[PYMD3TEST0]",
+            6: "Apple USB Serial Interface",
+        }.get(index, ""),
+    )
+
+    summary = collect_live_purple_usb_inventory(ecid="0x123456789abcdef")
+
+    assert summary["mode"] == "RECOVERY_MODE_2"
+    assert summary["device_count"] == 1
+    device = summary["devices"][0]
+    assert device["configuration"] == {
+        "value": 1,
+        "interface_count": 2,
+        "total_length": 57,
+    }
+    assert device["selected_interface_altsettings"] == [
+        {"interface_number": 0, "alternate_setting": 0},
+        {"interface_number": 1, "alternate_setting": 0},
+    ]
+    assert device["interfaces"][0]["selected_altsetting"] == 0
+    assert device["interfaces"][0]["alternate_settings"][0]["selected"] is True
+    assert device["interfaces"][1]["selected_altsetting"] == 0
+    assert device["interfaces"][1]["alternate_settings"][0]["selected"] is True
+    assert device["interfaces"][1]["alternate_settings"][1]["selected"] is False
+    assert device["interfaces"][1]["alternate_settings"][1]["endpoints"] == [
+        {"address": "0x81", "direction": "in", "transfer_type": "bulk", "max_packet_size": 512},
+        {"address": "0x02", "direction": "out", "transfer_type": "bulk", "max_packet_size": 512},
+    ]
+
+
+def test_collect_live_purple_usb_inventory_skips_transient_usb_devices(monkeypatch):
+    from pymobiledevice3.restore import purple
+
+    class DisappearingUsbDevice(FakeUsbDevice):
+        def get_active_configuration(self):
+            raise RuntimeError("device disappeared")
+
+    monkeypatch.setattr(purple, "usb_find", lambda find_all=True: [DisappearingUsbDevice()])
+    monkeypatch.setattr(
+        purple,
+        "get_string",
+        lambda device, index: {
+            2: "Apple Inc.",
+            3: "Apple Mobile Device (Recovery Mode)",
+            4: "SDOM:01 CPID:8120 CPRV:11 CPFM:03 SCEP:01 BDID:08 ECID:0123456789ABCDEF IBFL:3D SIKA:00 SRNM:[PYMD3TEST0]",
+        }.get(index, ""),
+    )
+
+    summary = collect_live_purple_usb_inventory(ecid="0x123456789abcdef")
+
+    assert summary["mode"] == "no_usb_device"
+    assert summary["device_count"] == 0
+    assert summary["skipped_devices"] == [
+        {
+            "vendor_id": "0x05ac",
+            "product_id": "0x1281",
+            "reason": "usb_summary_failed:RuntimeError",
+        }
+    ]
+
+
+def test_summarize_restore_options_exposes_boot_stability_hints():
+    summary = summarize_restore_options(
+        {
+            "RecoveryOSFailureIsFatal": False,
+            "RetainRecoveryOS": True,
+            "RecoveryOSOnly": False,
+            "InstallRecoveryOS": True,
+            "ForceInstallRecoveryOS": False,
+            "restoreRebootRetryEnabled": True,
+            "restoreRebootRetryZone": "post-boot",
+        }
+    )
+
+    assert summary["stability"] == {
+        "recoveryos_required": True,
+        "recoveryos_failure_fatal": False,
+        "retains_recoveryos": True,
+        "recoveryos_only": False,
+        "install_recoveryos": True,
+        "force_install_recoveryos": False,
+        "reboot_retry_enabled": True,
+        "reboot_retry_zone": "post-boot",
+    }
+    assert "RecoveryOS failure is non-fatal; the device may finish without RecoveryOS." in summary["notes"]
+    assert "RecoveryOS installation is explicitly requested." in summary["notes"]
+    assert "RecoveryOS is retained after restore." in summary["notes"]
