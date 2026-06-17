@@ -120,6 +120,25 @@ def test_should_preserve_backup_file_keeps_metadata() -> None:
     assert Mobilebackup2Service.should_preserve_backup_file("Manifest.db", "ignored", None)
 
 
+def test_backup_request_message_includes_source_identifier() -> None:
+    assert Mobilebackup2Service._backup_request_message("device-udid", full=False) == {
+        "MessageName": "Backup",
+        "TargetIdentifier": "device-udid",
+        "SourceIdentifier": "device-udid",
+    }
+
+
+def test_backup_request_message_marks_full_backup() -> None:
+    assert Mobilebackup2Service._backup_request_message("device-udid", full=True) == {
+        "MessageName": "Backup",
+        "TargetIdentifier": "device-udid",
+        "SourceIdentifier": "device-udid",
+        "Options": {
+            "ForceFullBackup": True,
+        },
+    }
+
+
 def test_should_do_full_backup_when_incremental_metadata_is_missing(tmp_path: Path) -> None:
     assert Mobilebackup2Service._should_do_full_backup(False, tmp_path) is True
 
