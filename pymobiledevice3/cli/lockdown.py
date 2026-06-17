@@ -3,7 +3,7 @@ import datetime
 import logging
 import plistlib
 from pathlib import Path
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 import typer
 from typer_injector import InjectingTyper
@@ -15,20 +15,174 @@ from pymobiledevice3.cli.cli_common import (
     print_json,
     sudo_required,
 )
-from pymobiledevice3.cli.remote import tunnel_task
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
-from pymobiledevice3.remote.common import TunnelProtocol
-from pymobiledevice3.remote.tunnel_service import CoreDeviceTunnelProxy
 from pymobiledevice3.services.heartbeat import HeartbeatService
 from pymobiledevice3.utils import run_in_loop
 
 logger = logging.getLogger(__name__)
+
+CELLULAR_LOCKDOWN_KEYS = (
+    "TelephonyCapability",
+    "HasBaseband",
+    "DataPlanCapability",
+    "DualSIMActivationPolicyCapable",
+    "EUICCChipID",
+    "SIMCapability",
+    "SIMPhonebookCapability",
+    "SIMStatus",
+    "SIMStatus2",
+    "SIMTrayStatus",
+    "SIMTrayStatus2",
+    "BasebandAPTimeSync",
+    "BasebandBoardSnum",
+    "BasebandCertId",
+    "BasebandChipId",
+    "BasebandChipset",
+    "BasebandClass",
+    "BasebandFirmwareManifestData",
+    "BasebandFirmwareUpdateInfo",
+    "BasebandFirmwareVersion",
+    "BasebandKeyHashInformation",
+    "BasebandPostponementStatus",
+    "BasebandPostponementStatusBlob",
+    "BasebandRegionSKU",
+    "BasebandRegionSKURadioTechnology",
+    "BasebandSecurityInfoBlob",
+    "BasebandSerialNumber",
+    "BasebandSkeyId",
+    "BasebandStatus",
+    "BasebandUniqueId",
+    "InternationalMobileEquipmentIdentity",
+    "InternationalMobileEquipmentIdentity2",
+    "InternationalMobileSubscriberIdentity",
+    "IntegratedCircuitCardIdentity",
+    "IntegratedCircuitCardIdentifier",
+    "IntegratedCircuitCardIdentifier2",
+    "MobileEquipmentIdentifier",
+    "PhoneNumber",
+)
+
+CELLULAR_FIRMWARE_PREFLIGHT_KEYS = (
+    "ChipID",
+    "CertID",
+    "ChipSerialNo",
+    "Nonce",
+    "EUICCChipID",
+    "EUICCCSN",
+    "EUICCCertIdentifier",
+    "EUICCGoldNonce",
+    "EUICCMainNonce",
+)
+
+CELLULAR_SENSITIVE_KEYS = {
+    "basebandboardsnum",
+    "basebandfirmwaremanifestdata",
+    "basebandkeyhashinformation",
+    "basebandpostponementstatusblob",
+    "basebandserialnumber",
+    "basebandsecurityinfoblob",
+    "basebanduniqueid",
+    "chipserialno",
+    "euicccertidentifier",
+    "euicccsn",
+    "euiccgoldnonce",
+    "euiccmainnonce",
+    "integratedcircuitcardidentity",
+    "integratedcircuitcardidentifier",
+    "integratedcircuitcardidentifier2",
+    "internationalmobileequipmentidentity",
+    "internationalmobileequipmentidentity2",
+    "internationalmobilesubscriberidentity",
+    "mobileequipmentidentifier",
+    "nonce",
+    "phonenumber",
+}
+
+CELLULAR_RESTORE_TSS_MAPPING = {
+    "EUICCChipID": "eUICC,ChipID",
+    "EUICCCSN": "eUICC,EID",
+    "EUICCCertIdentifier": "eUICC,RootKeyIdentifier",
+    "EUICCGoldNonce": "EUICCGoldNonce",
+    "EUICCMainNonce": "EUICCMainNonce",
+}
 
 cli = InjectingTyper(
     name="lockdown",
     help="Pair/Unpair device or access other lockdown services",
     no_args_is_help=True,
 )
+
+
+def _normalized_cellular_key(key: str) -> str:
+    return "".join(character for character in key.lower() if character.isalnum())
+
+
+def _is_sensitive_cellular_key(key: str) -> bool:
+    return _normalized_cellular_key(key) in CELLULAR_SENSITIVE_KEYS
+
+
+def _redact_cellular_value(key: str, value: Any, include_sensitive: bool) -> Any:
+    if include_sensitive or not _is_sensitive_cellular_key(key):
+        return value
+    return "<redacted>"
+
+
+def _collect_present_cellular_values(source: dict[str, Any], keys: tuple[str, ...], include_sensitive: bool) -> dict:
+    return {
+        key: _redact_cellular_value(key, source[key], include_sensitive)
+        for key in keys
+        if source.get(key) is not None
+    }
+
+
+def _build_cellular_restore_tss_parameters(firmware_preflight_info: dict[str, Any], include_sensitive: bool) -> dict:
+    parameters = {
+        tss_key: _redact_cellular_value(preflight_key, firmware_preflight_info[preflight_key], include_sensitive)
+        for preflight_key, tss_key in CELLULAR_RESTORE_TSS_MAPPING.items()
+        if firmware_preflight_info.get(preflight_key) is not None
+    }
+    return {
+        "available": bool(parameters),
+        "parameters": {"@eUICC,Ticket": True, **parameters} if parameters else {},
+        "source": "FirmwarePreflightInfo",
+    }
+
+
+def build_cellular_info(service_provider: LockdownServiceProvider, include_sensitive: bool = False) -> dict:
+    all_values = getattr(service_provider, "all_values", {}) or {}
+    firmware_preflight_info = all_values.get("FirmwarePreflightInfo") or {}
+    preflight_info = all_values.get("PreflightInfo") or {}
+    if not isinstance(firmware_preflight_info, dict):
+        firmware_preflight_info = {}
+    if not isinstance(preflight_info, dict):
+        preflight_info = {}
+    lockdown_values = _collect_present_cellular_values(all_values, CELLULAR_LOCKDOWN_KEYS, include_sensitive)
+    firmware_preflight_values = _collect_present_cellular_values(
+        firmware_preflight_info, CELLULAR_FIRMWARE_PREFLIGHT_KEYS, include_sensitive
+    )
+
+    return {
+        "checked": True,
+        "redacted": not include_sensitive,
+        "sources": {
+            "lockdown": True,
+            "preflight_info": bool(preflight_info),
+            "firmware_preflight_info": bool(firmware_preflight_info),
+        },
+        "summary": {
+            "telephony_capability": all_values.get("TelephonyCapability"),
+            "has_baseband": all_values.get("HasBaseband"),
+            "data_plan_capability": all_values.get("DataPlanCapability"),
+            "dual_sim_activation_policy_capable": all_values.get("DualSIMActivationPolicyCapable"),
+            "sim_status": all_values.get("SIMStatus"),
+            "sim_status2": all_values.get("SIMStatus2"),
+            "euicc_present": all_values.get("EUICCChipID") is not None
+            or firmware_preflight_info.get("EUICCChipID") is not None,
+        },
+        "lockdown": lockdown_values,
+        "firmware_preflight_info": firmware_preflight_values,
+        "restore_tss_parameters": _build_cellular_restore_tss_parameters(firmware_preflight_info, include_sensitive),
+    }
 
 
 @cli.command("recovery")
@@ -62,6 +216,21 @@ def lockdown_developer_service(service_provider: ServiceProviderDep, service_nam
 def lockdown_info(service_provider: ServiceProviderDep) -> None:
     """query all lockdown values"""
     print_json(service_provider.all_values)
+
+
+@cli.command("cellular-info")
+def lockdown_cellular_info(
+    service_provider: ServiceProviderDep,
+    include_sensitive: Annotated[
+        bool,
+        typer.Option(
+            "--include-sensitive",
+            help="Include raw IMEI, IMSI, ICCID, EID, phone number, serial, and nonce values.",
+        ),
+    ] = False,
+) -> None:
+    """query cellular, SIM, baseband, and eUICC restore-preflight values"""
+    print_json(build_cellular_info(service_provider, include_sensitive=include_sensitive))
 
 
 @cli.command("get")
@@ -190,6 +359,10 @@ async def lockdown_wifi_connections(
 
 
 async def async_cli_start_tunnel(service_provider: LockdownServiceProvider, script_mode: bool) -> None:
+    from pymobiledevice3.cli.remote import tunnel_task
+    from pymobiledevice3.remote.common import TunnelProtocol
+    from pymobiledevice3.remote.tunnel_service import CoreDeviceTunnelProxy
+
     await tunnel_task(
         await CoreDeviceTunnelProxy.create(service_provider),
         script_mode=script_mode,
