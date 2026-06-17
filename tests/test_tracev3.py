@@ -107,23 +107,46 @@ def test_tracev3_catalog_scanner_reports_kct_cell_monitor_fields() -> None:
         0x600D,
         struct.pack("<QIBB2s", 1234, 5678, 2, 3, b"\x00\x00")
         + b"CDMA\x00"
+        + b"kCTCellMonitorBandInfo = 7;\x00"
+        + b"kCTCellMonitorBandwidth = 75;\x00"
         + b"kCTCellMonitorCellId = 137096039;\x00"
+        + b"kCTCellMonitorCellRadioAccessTechnology = kCTCellMonitorRadioAccessTechnologyLTE;\x00"
+        + b"kCTCellMonitorDeploymentType = 3;\x00"
         + b"kCTCellMonitorMCC = 208;\x00"
-        + b"kCTCellMonitorMNC = 20;\x00",
+        + b"kCTCellMonitorMNC = 20;\x00"
+        + b"kCTCellMonitorPID = 9;\x00"
+        + b"kCTCellMonitorRSRP = 0;\x00"
+        + b"kCTCellMonitorRSRQ = 0;\x00"
+        + b"kCTCellMonitorSectorLat = 0;\x00"
+        + b"kCTCellMonitorSectorLong = 0;\x00"
+        + b"kCTCellMonitorTAC = 30301;\x00"
+        + b"kCTCellMonitorUARFCN = 3175;\x00"
     )
 
     scanner.scan_payload("system_logs.logarchive/logdata.LiveData.tracev3", payload)
     report = scanner.build_report()
 
     assert "137096039" not in str(report)
+    assert "30301" not in str(report)
     assert report["cell_towers"] == [
         {
+            "band": "7",
+            "bandwidth": "75",
             "cell_id": "<redacted>",
             "country": "France",
             "count": 1,
+            "deployment_type": "3",
             "mcc": "208",
             "mnc": "20",
+            "physical_cell_id": "<redacted>",
+            "rat": "LTE",
+            "rsrp": "0",
+            "rsrq": "0",
+            "sector_latitude": "<redacted>",
+            "sector_longitude": "<redacted>",
             "sources": ["system_logs.logarchive/logdata.LiveData.tracev3"],
+            "tac": "<redacted>",
+            "uarfcn": "3175",
         }
     ]
     assert {
@@ -133,6 +156,37 @@ def test_tracev3_catalog_scanner_reports_kct_cell_monitor_fields() -> None:
         ("cell_id", "<redacted>"),
         ("mcc", "208"),
         ("mnc", "20"),
+        ("rat", "LTE"),
+        ("tac", "<redacted>"),
+    }
+
+
+def test_tracev3_catalog_scanner_derives_lte_lookup_keys() -> None:
+    scanner = Tracev3CatalogScanner(include_sensitive=True)
+    payload = _tracev3_chunk(0x1000, b"23F77\x00D37AP\x00") + _tracev3_chunk(
+        0x600D,
+        struct.pack("<QIBB2s", 1234, 5678, 2, 3, b"\x00\x00")
+        + b"kCTCellMonitorCellId = 137096039;\x00"
+        + b"kCTCellMonitorCellRadioAccessTechnology = kCTCellMonitorRadioAccessTechnologyLTE;\x00"
+        + b"kCTCellMonitorMCC = 208;\x00"
+        + b"kCTCellMonitorMNC = 20;\x00"
+        + b"kCTCellMonitorTAC = 30301;\x00",
+    )
+
+    scanner.scan_payload("system_logs.logarchive/logdata.LiveData.tracev3", payload)
+    report = scanner.build_report()
+
+    assert report["cell_towers"][0]["lookup"] == {
+        "cell_id_format": "lte_eci",
+        "eci": 137096039,
+        "enodeb_id": 535531,
+        "lookup_ready": True,
+        "lookup_type": "lte",
+        "mcc": "208",
+        "mnc": "20",
+        "required_fields": ["mcc", "mnc", "tac", "eci"],
+        "sector_id": 103,
+        "tac": 30301,
     }
 
 

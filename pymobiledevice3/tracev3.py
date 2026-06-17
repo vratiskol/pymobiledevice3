@@ -59,12 +59,14 @@ APPLE_COMPRESSION_ALGORITHMS = {
 
 CELLULAR_TRACEV3_BYTES = re.compile(
     rb"CommCenter|CoreTelephony|MCC|MNC|CellID|Cell ID|ECGI|ServingCell|serving cell|"
-    rb"camped|PLMN|timingadvance|locationId|cellular network|baseband",
+    rb"CellMonitor|TAC|LAC|PCI|RSRP|RSRQ|UARFCN|camped|PLMN|timingadvance|locationId|"
+    rb"cellular network|baseband",
     re.IGNORECASE,
 )
 CELLULAR_TRACEV3_TEXT = re.compile(
     r"CommCenter|CoreTelephony|MCC|MNC|CellID|Cell ID|ECGI|ServingCell|serving cell|"
-    r"camped|PLMN|timingadvance|locationId|cellular network|baseband",
+    r"CellMonitor|TAC|LAC|PCI|RSRP|RSRQ|UARFCN|camped|PLMN|timingadvance|locationId|"
+    r"cellular network|baseband",
     re.IGNORECASE,
 )
 FORMAT_SPECIFIER_PATTERN = re.compile(
@@ -106,22 +108,96 @@ TRACEV3_LOG_REFERENCE_CATEGORIES = {
 }
 RAW_FIELD_REDACTION_PATTERNS = (
     re.compile(r"\b(kCTCellMonitorCellId)\b\s*[:=,]\s*([0-9A-Fa-fx]{3,})", re.I),
+    re.compile(
+        r"\b(kCTCellMonitor(?:BaseStationId|BaseStationLat|BaseStationLong|CellId|ChannelNumber|LAC|NID|"
+        r"PID|PCI|PNOffset|SID|SectorId|SectorLat|SectorLong|TAC|ZoneId))\b\s*[:=,]\s*([0-9A-Fa-fx.-]{1,})",
+        re.I,
+    ),
     re.compile(r"\b(cell(?:ular)?[ _-]?(?:id|identity)|cellid|ci|eci|ecgi)\b\s*[:=,]\s*([0-9A-Fa-fx]{3,})", re.I),
     re.compile(r"\b(lac|tac|pci|sid|nid)\b\s*[:=,]\s*([0-9A-Fa-fx]{2,})", re.I),
     re.compile(r"\b(?:lat|latitude|lon|lng|longitude)\b\s*[:=,]\s*[+-]?[0-9]{1,3}\.[0-9]{3,}", re.I),
 )
-TRACEV3_CELL_FIELD_VALUE_PATTERN = r"(?P<value><redacted>|0x[0-9A-Fa-f]+|[0-9A-Fa-f]+)"
+TRACEV3_CELL_FIELD_VALUE_PATTERN = r"(?P<value><redacted>|0x[0-9A-Fa-f]+|[0-9A-Fa-f.-]+)"
+TRACEV3_CELL_SYMBOL_VALUE_PATTERN = r"(?P<value><redacted>|[A-Za-z0-9_.-]+)"
 TRACEV3_CELL_FIELD_PATTERNS = {
+    "arfcn": re.compile(rf"\bkCTCellMonitorARFCN\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "band": re.compile(rf"\bkCTCellMonitorBandInfo\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "band_class": re.compile(rf"\bkCTCellMonitorBandClass\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "bandwidth": re.compile(rf"\bkCTCellMonitorBandwidth\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "base_station_id": re.compile(rf"\bkCTCellMonitorBaseStationId\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "base_station_latitude": re.compile(rf"\bkCTCellMonitorBaseStationLat\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "base_station_longitude": re.compile(rf"\bkCTCellMonitorBaseStationLong\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "bwp_support": re.compile(rf"\bkCTCellMonitorBWPSupport\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
     "cell_id": re.compile(
         r"\b(?:kCTCellMonitorCellId|cell\s*id|cellid|cellular[ _-]?identity|ci|eci|ecgi)\b"
         rf"\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}",
         re.I,
     ),
-    "lac": re.compile(rf"\bLAC\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "cell_type": re.compile(
+        r"\bkCTCellMonitorCellType\b\s*[:=,]\s*(?:kCTCellMonitorCellType)?"
+        rf"{TRACEV3_CELL_SYMBOL_VALUE_PATTERN}",
+        re.I,
+    ),
+    "channel_number": re.compile(rf"\bkCTCellMonitorChannelNumber\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "csg_id": re.compile(rf"\bkCTCellMonitorCsgId\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "csg_indication": re.compile(rf"\bkCTCellMonitorCSGIndication\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "derived_mcc": re.compile(r"\bkCTCellMonitorDerivedMCC\b\s*[:=,]\s*(?P<value>[0-9]{3})", re.I),
+    "deployment_type": re.compile(rf"\bkCTCellMonitorDeploymentType\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "ecio": re.compile(rf"\bkCTCellMonitorEcio\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "ecio_filtered": re.compile(rf"\bkCTCellMonitorEcioFiltered\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "ecn0": re.compile(rf"\bkCTCellMonitorECN0\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "gscn": re.compile(rf"\bkCTCellMonitorGSCN\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "is_sa": re.compile(rf"\bkCTCellMonitorIsSA\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "lac": re.compile(rf"\b(?:kCTCellMonitorLAC|LAC)\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
     "mcc": re.compile(r"\b(?:kCTCellMonitorMCC|MCC)\b\s*[:=,]\s*(?P<value>[0-9]{3})", re.I),
     "mnc": re.compile(r"\b(?:kCTCellMonitorMNC|MNC)\b\s*[:=,]\s*(?P<value>[0-9]{1,3})", re.I),
-    "pci": re.compile(rf"\b(?:PCI|physCellId)\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
-    "tac": re.compile(rf"\bTAC\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "neighbor_type": re.compile(rf"\bkCTCellMonitorNeighborType\b\s*[:=,]\s*{TRACEV3_CELL_SYMBOL_VALUE_PATTERN}", re.I),
+    "network_id_3gpp_release": re.compile(
+        rf"\bkCTCellMonitorNetworkID3GPPRelVersion\b\s*[:=,]\s*{TRACEV3_CELL_SYMBOL_VALUE_PATTERN}",
+        re.I,
+    ),
+    "network_id_gnb_sw_version": re.compile(
+        rf"\bkCTCellMonitorNetworkIDGNBSwVersion\b\s*[:=,]\s*{TRACEV3_CELL_SYMBOL_VALUE_PATTERN}",
+        re.I,
+    ),
+    "network_id_vendor_type": re.compile(
+        rf"\bkCTCellMonitorNetworkIDVendorType\b\s*[:=,]\s*{TRACEV3_CELL_SYMBOL_VALUE_PATTERN}",
+        re.I,
+    ),
+    "nid": re.compile(rf"\bkCTCellMonitorNID\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "nrarfcn": re.compile(rf"\bkCTCellMonitorNRARFCN\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "nr_frequency_type": re.compile(
+        rf"\bkCTCellMonitorNRFrequencyType\b\s*[:=,]\s*{TRACEV3_CELL_SYMBOL_VALUE_PATTERN}",
+        re.I,
+    ),
+    "nr_redcap_info": re.compile(rf"\bkCTCellMonitorNRRedCapInfo\b\s*[:=,]\s*{TRACEV3_CELL_SYMBOL_VALUE_PATTERN}", re.I),
+    "physical_cell_id": re.compile(rf"\bkCTCellMonitorPID\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "pci": re.compile(rf"\b(?:kCTCellMonitorPCI|PCI|physCellId)\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "pmax": re.compile(rf"\bkCTCellMonitorPMax\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "pn_offset": re.compile(rf"\bkCTCellMonitorPNOffset\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "rat": re.compile(
+        r"\b(?:kCTCellMonitorCellRadioAccessTechnology|RAT)\b\s*[:=,]\s*"
+        r"(?:kCTCellMonitorRadioAccessTechnology)?(?P<value>[A-Za-z0-9]+)",
+        re.I,
+    ),
+    "ref_ecio": re.compile(rf"\bkCTCellMonitorRefEcio\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "ref_pn": re.compile(rf"\bkCTCellMonitorRefPn\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "rsrp": re.compile(rf"\bkCTCellMonitorRSRP\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "rsrq": re.compile(rf"\bkCTCellMonitorRSRQ\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "rscp": re.compile(rf"\bkCTCellMonitorRSCP\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "rssi": re.compile(rf"\bkCTCellMonitorRSSI\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "rx_agc": re.compile(rf"\bkCTCellMonitorRxAGC\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "scn": re.compile(rf"\bkCTCellMonitorSCN\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "scs": re.compile(rf"\bkCTCellMonitorSCS\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "sector_latitude": re.compile(rf"\bkCTCellMonitorSectorLat\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "sector_id": re.compile(rf"\bkCTCellMonitorSectorId\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "sector_longitude": re.compile(rf"\bkCTCellMonitorSectorLong\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "sid": re.compile(rf"\bkCTCellMonitorSID\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "snr": re.compile(rf"\bkCTCellMonitorSNR\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "tac": re.compile(rf"\b(?:kCTCellMonitorTAC|TAC)\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "throughput": re.compile(rf"\bkCTCellMonitorThroughput\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "uarfcn": re.compile(rf"\bkCTCellMonitorUARFCN\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
+    "zone_id": re.compile(rf"\bkCTCellMonitorZoneId\b\s*[:=,]\s*{TRACEV3_CELL_FIELD_VALUE_PATTERN}", re.I),
 }
 TRACEV3_RAT_PATTERN = re.compile(r"\b(?:5G|NR|LTE|4G|UMTS|WCDMA|GSM|EDGE|GPRS|CDMA|eHRPD)\b", re.IGNORECASE)
 
@@ -221,6 +297,8 @@ class Tracev3CatalogScanner:
         self.max_values = max_values
         self.max_sources = max_sources
         self.bytes_scanned = 0
+        self.cell_tower_observations: list[dict[str, Any]] = []
+        self.cell_tower_observations_count = 0
         self.cell_towers: dict[tuple[tuple[str, str], ...], dict[str, Any]] = {}
         self.cellular_files: dict[str, dict[str, Any]] = {}
         self.cellular_field_values: dict[str, dict[str, Any]] = {}
@@ -270,6 +348,8 @@ class Tracev3CatalogScanner:
     def build_report(self) -> dict[str, Any]:
         return {
             "bytes_scanned": self.bytes_scanned,
+            "cell_tower_observations": self.cell_tower_observations[: self.max_values],
+            "cell_tower_observations_count": self.cell_tower_observations_count,
             "cell_towers": _top_records(self.cell_towers, self.max_values),
             "cell_towers_count": len(self.cell_towers),
             "cellular_field_values": _top_records(self.cellular_field_values, self.max_values),
@@ -321,6 +401,7 @@ class Tracev3CatalogScanner:
     def _scan_structure(self, path: str, data: bytes) -> None:
         self.tracev3_files += 1
         self.structure_bytes_scanned += len(data)
+        clock = None
         try:
             for chunk in iter_tracev3_chunks(data):
                 key = f"{chunk.tag:04x}:{chunk.subtag:02x}"
@@ -341,13 +422,15 @@ class Tracev3CatalogScanner:
                 _append_source(record["sources"], path, self.max_sources)
                 if chunk.tag == TRACEV3_HEADER_TAG:
                     payload = data[chunk.payload_offset : chunk.payload_end]
+                    try:
+                        decoded_header = decode_tracev3_header(payload, include_sensitive=self.include_sensitive)
+                    except ValueError as e:
+                        decoded_header = {"error": str(e), "payload_size": len(payload)}
+                    else:
+                        clock = _tracev3_clock_from_header(decoded_header)
                     if len(self.tracev3_headers) < self.max_values:
-                        try:
-                            header = decode_tracev3_header(payload, include_sensitive=self.include_sensitive)
-                        except ValueError as e:
-                            header = {"error": str(e), "payload_size": len(payload)}
-                        header["source"] = path
-                        self.tracev3_headers.append(header)
+                        decoded_header["source"] = path
+                        self.tracev3_headers.append(decoded_header)
                     for text in iter_printable_strings(payload):
                         if not _looks_like_tracev3_header_text(text):
                             continue
@@ -381,7 +464,8 @@ class Tracev3CatalogScanner:
                     if len(self.tracev3_firehose_blocks) < self.max_values:
                         self.tracev3_firehose_blocks.append(_truncate_tracev3_detail(firehose, self.max_values))
                     strings = firehose.get("strings", [])
-                    self._scan_cell_tower_strings(path, strings)
+                    observed_at = _tracev3_firehose_wall_time(clock, firehose.get("header", {}))
+                    self._scan_cell_tower_strings(path, strings, observed_at=observed_at)
                     for text in strings:
                         self._scan_log_references(path, text)
                         if CELLULAR_TRACEV3_TEXT.search(text):
@@ -460,15 +544,16 @@ class Tracev3CatalogScanner:
             )
         return fields
 
-    def _scan_cell_tower_strings(self, path: str, strings: list[str]) -> None:
+    def _scan_cell_tower_strings(self, path: str, strings: list[str], *, observed_at: Optional[str] = None) -> None:
         fields: dict[str, str] = {}
         for text in strings:
             extracted = _extract_tracev3_cell_fields(text)
-            if not any(field != "rat" for field in extracted):
+            if not any(field != "rat" for field in extracted) and not _is_explicit_cell_monitor_rat(text):
                 continue
             for field, value in extracted.items():
                 fields.setdefault(field, value)
         self._record_cell_tower(path, fields)
+        self._record_cell_tower_observation(path, fields, observed_at=observed_at)
 
     def _record_cell_tower(self, path: str, fields: dict[str, str]) -> None:
         if "cell_id" not in fields:
@@ -477,10 +562,38 @@ class Tracev3CatalogScanner:
             return
         if "mcc" in fields:
             fields.setdefault("country", _mcc_country(fields["mcc"]))
+        record_fields: dict[str, Any] = dict(fields)
+        lookup = _cell_tower_lookup(fields)
+        if lookup is not None:
+            record_fields["lookup"] = lookup
         key = tuple(sorted(fields.items()))
-        record = self.cell_towers.setdefault(key, {"count": 0, "sources": [], **fields})
+        record = self.cell_towers.setdefault(key, {"count": 0, "sources": [], **record_fields})
         record["count"] += 1
         _append_source(record["sources"], path, self.max_sources)
+
+    def _record_cell_tower_observation(
+        self,
+        path: str,
+        fields: dict[str, str],
+        *,
+        observed_at: Optional[str],
+    ) -> None:
+        if "cell_id" not in fields:
+            return
+        if not any(field in fields for field in ("mcc", "mnc", "lac", "tac", "pci")):
+            return
+        observation_fields: dict[str, Any] = dict(fields)
+        if "mcc" in fields:
+            observation_fields.setdefault("country", _mcc_country(fields["mcc"]))
+        lookup = _cell_tower_lookup(fields)
+        if lookup is not None:
+            observation_fields["lookup"] = lookup
+        observation = {"source": path, **observation_fields}
+        if observed_at is not None:
+            observation["observed_at"] = observed_at
+        self.cell_tower_observations_count += 1
+        if len(self.cell_tower_observations) < self.max_values:
+            self.cell_tower_observations.append(observation)
 
     def _scan_log_references(self, path: str, text: str) -> None:
         for reference in _iter_tracev3_log_references(text):
@@ -1036,8 +1149,109 @@ def _extract_tracev3_cell_fields(text: str) -> dict[str, str]:
     return fields
 
 
+def _is_explicit_cell_monitor_rat(text: str) -> bool:
+    return "kCTCellMonitorCellRadioAccessTechnology" in text
+
+
 def _mcc_country(mcc: str) -> str:
     return TRACEV3_MCC_COUNTRIES.get(mcc, "unknown")
+
+
+def _tracev3_clock_from_header(header: dict[str, Any]) -> Optional[dict[str, int]]:
+    timebase = header.get("timebase", {})
+    wall_time = header.get("wall_time", {})
+    try:
+        mach_continuous_time = int(header["mach_continuous_time"])
+        timebase_numer = int(timebase["numer"])
+        timebase_denom = int(timebase["denom"])
+        unix_seconds = int(wall_time["unix_seconds"])
+        unix_microseconds = int(wall_time["unix_microseconds"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if timebase_denom <= 0:
+        return None
+    return {
+        "mach_continuous_time": mach_continuous_time,
+        "timebase_denom": timebase_denom,
+        "timebase_numer": timebase_numer,
+        "unix_microseconds": unix_microseconds,
+        "unix_seconds": unix_seconds,
+    }
+
+
+def _tracev3_firehose_wall_time(clock: Optional[dict[str, int]], firehose_header: dict[str, Any]) -> Optional[str]:
+    if clock is None:
+        return None
+    try:
+        firehose_mach_time = int(firehose_header["mach_continuous_time"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    delta_ticks = firehose_mach_time - clock["mach_continuous_time"]
+    delta_seconds = (delta_ticks * clock["timebase_numer"]) / clock["timebase_denom"] / 1_000_000_000
+    wall_seconds = clock["unix_seconds"] + (clock["unix_microseconds"] / 1_000_000) + delta_seconds
+    try:
+        return datetime.fromtimestamp(wall_seconds, tz=timezone.utc).isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _cell_tower_lookup(fields: dict[str, str]) -> Optional[dict[str, Any]]:
+    mcc = fields.get("mcc")
+    mnc = fields.get("mnc")
+    cell_id = _parse_cell_integer(fields.get("cell_id"))
+    if not mcc or not mnc or cell_id is None:
+        return None
+
+    rat = fields.get("rat", "").upper()
+    tac = _parse_cell_integer(fields.get("tac"))
+    if tac is not None and rat in {"", "4G", "LTE"}:
+        return {
+            "cell_id_format": "lte_eci",
+            "eci": cell_id,
+            "enodeb_id": cell_id >> 8,
+            "lookup_ready": True,
+            "lookup_type": "lte",
+            "mcc": mcc,
+            "mnc": mnc,
+            "required_fields": ["mcc", "mnc", "tac", "eci"],
+            "sector_id": cell_id & 0xFF,
+            "tac": tac,
+        }
+
+    lac = _parse_cell_integer(fields.get("lac"))
+    if lac is not None:
+        return {
+            "cell_id_format": "cid",
+            "cid": cell_id,
+            "lac": lac,
+            "lookup_ready": True,
+            "lookup_type": "gsm_umts",
+            "mcc": mcc,
+            "mnc": mnc,
+            "required_fields": ["mcc", "mnc", "lac", "cid"],
+        }
+
+    if tac is not None and rat == "NR":
+        return {
+            "cell_id_format": "nr_nci",
+            "lookup_ready": True,
+            "lookup_type": "nr",
+            "mcc": mcc,
+            "mnc": mnc,
+            "nci": cell_id,
+            "required_fields": ["mcc", "mnc", "tac", "nci"],
+            "tac": tac,
+        }
+    return None
+
+
+def _parse_cell_integer(value: Optional[str]) -> Optional[int]:
+    if value is None or value == "<redacted>":
+        return None
+    try:
+        return int(value, 0)
+    except ValueError:
+        return None
 
 
 def _iter_tracev3_log_references(text: str) -> Iterator[str]:

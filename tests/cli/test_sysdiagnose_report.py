@@ -35,3 +35,37 @@ def test_crash_sysdiagnose_report_cli_writes_json(tmp_path: Path) -> None:
     assert report["gsm"]["plmns"][0]["country"] == "United States"
     assert report["gsm"]["unified_log"]["files_scanned"] == 1
     assert report["gsm"]["unified_log"]["tower_lookup_ready_templates"] == 1
+
+
+def test_crash_sysdiagnose_report_cli_accepts_cell_database(tmp_path: Path) -> None:
+    sysdiagnose = tmp_path / "sysdiagnose"
+    sysdiagnose.mkdir()
+    (sysdiagnose / "cellular.log").write_text("MCC=208 MNC=20 TAC=30301 CellID=137096039 RAT=LTE\n")
+    cell_db = tmp_path / "cells.csv"
+    cell_db.write_text(
+        "\n".join([
+            "radio,mcc,net,area,cell,unit,lon,lat,range,samples,changeable,created,updated,averageSignal",
+            "LTE,208,20,30301,137096039,,2.352200,48.856600,250,7,1,1710000000,1710000100,-75",
+        ])
+    )
+    output = tmp_path / "report.json"
+
+    result = CliRunner().invoke(
+        __main__.app,
+        [
+            "crash",
+            "sysdiagnose-report",
+            str(sysdiagnose),
+            "--cell-db",
+            str(cell_db),
+            "--include-sensitive",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(output.read_text())
+    assert report["gsm"]["cell_database"]["matches"] == 1
+    assert report["gsm"]["cell_towers"][0]["cell_database_match"]["latitude"] == 48.8566
+    assert report["gsm"]["cell_towers"][0]["cell_database_match"]["longitude"] == 2.3522

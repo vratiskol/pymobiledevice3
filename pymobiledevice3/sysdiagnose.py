@@ -1,9 +1,12 @@
+import csv
 import hashlib
 import json
+import math
 import plistlib
 import re
 import tarfile
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -12,6 +15,82 @@ from pymobiledevice3.tracev3 import DEFAULT_MAX_TRACEV3_FILE_BYTES, Tracev3Catal
 DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_SOURCES_PER_FINDING = 5
 MAX_VALUES_PER_SECTION = 50
+OPENCELLID_COLUMNS = (
+    "radio",
+    "mcc",
+    "net",
+    "area",
+    "cell",
+    "unit",
+    "lon",
+    "lat",
+    "range",
+    "samples",
+    "changeable",
+    "created",
+    "updated",
+    "average_signal",
+)
+CELL_DB_COLUMN_ALIASES = {
+    "area": {"area", "lac", "tac", "location_area_code", "locationareacode"},
+    "cell": {"cell", "cellid", "cell_id", "cid", "ci", "eci", "nci"},
+    "lat": {"lat", "latitude"},
+    "lon": {"lon", "lng", "longitude"},
+    "mcc": {"mcc", "mobile_country_code", "mobilecountrycode"},
+    "mnc": {"mnc", "net", "mobile_network_code", "mobilenetworkcode"},
+    "radio": {"radio", "rat", "technology", "type"},
+}
+CELL_DB_EXTRA_COLUMNS = {
+    "accuracy": {"accuracy", "accuracy_meters", "radius"},
+    "average_signal": {"averagesignal", "average_signal", "avg_signal"},
+    "changeable": {"changeable"},
+    "created": {"created", "first_seen", "firstseen"},
+    "range": {"range", "range_meters"},
+    "samples": {"samples"},
+    "updated": {"updated", "last_seen", "lastseen"},
+}
+CELL_DB_RADIO_ALIASES = {
+    "4G": "LTE",
+    "5G": "NR",
+    "GPRS": "GSM",
+    "WCDMA": "UMTS",
+}
+CELL_JOURNEY_RAT_RANKS = {
+    "NR": 5,
+    "LTE": 4,
+    "UMTS": 3,
+    "WCDMA": 3,
+    "CDMA": 2,
+    "EHRPD": 2,
+    "EDGE": 1,
+    "GPRS": 1,
+    "GSM": 1,
+}
+CELL_JOURNEY_IMPOSSIBLE_SPEED_KMH = 1000
+CELL_JOURNEY_SUSPICIOUS_SPEED_KMH = 350
+CELL_JOURNEY_SHORT_WINDOW_SECONDS = 300
+CELL_JOURNEY_CHURN_WINDOW_SECONDS = 120
+CELL_JOURNEY_CHURN_UNIQUE_CELLS = 4
+TIMELINE_EVIDENCE_MAX_LENGTH = 320
+TIMELINE_TIMESTAMP_PATTERNS = (
+    re.compile(
+        r"\b(?P<value>[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}"
+        r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:?[0-9]{2})?)\b"
+    ),
+)
+TIMELINE_EVENT_CLASSIFIERS = (
+    ("power", "reboot_or_shutdown", re.compile(r"\b(?:reboot|booted|shutdown|power(?:ed)? off|panic)\b", re.I)),
+    ("lock_state", "lock_state", re.compile(r"\b(?:lock(?:ed)?|unlock(?:ed)?|passcode|biometric)\b", re.I)),
+    ("vpn", "vpn_state", re.compile(r"\b(?:VPN|utun|tunnel|NetworkExtension)\b", re.I)),
+    ("wifi", "wifi_state", re.compile(r"\b(?:Wi-?Fi|SSID|BSSID|AWDL|wifid|airport)\b", re.I)),
+    ("location", "location", re.compile(r"\b(?:CoreLocation|locationd|latitude|longitude|GPS|CLLocation|geod)\b", re.I)),
+    ("baseband", "baseband", re.compile(r"\b(?:Baseband|bbticket|AppleBaseband|ambtool)\b", re.I)),
+    ("sim_carrier", "sim_carrier", re.compile(r"\b(?:SIM|ICCID|IMSI|EID|carrier|roaming|PLMN)\b", re.I)),
+    ("cellular", "cellular", re.compile(r"\b(?:CommCenter|CoreTelephony|cell|MCC|MNC|TAC|LAC|RAT|LTE|GSM|NR)\b", re.I)),
+    ("network", "network", re.compile(r"\b(?:IPv4|IPv6|IP address|ifconfig|route|DHCP|interface|network)\b", re.I)),
+)
+BSSID_PATTERN = re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b")
+IP_ADDRESS_PATTERN = re.compile(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b")
 
 TEXT_SUFFIXES = {
     ".ips",
@@ -152,11 +231,13 @@ class SysdiagnoseAnalyzer:
         self,
         *,
         include_sensitive: bool = False,
+        cell_db: Optional[Path] = None,
         max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
         max_tracev3_file_bytes: int = DEFAULT_MAX_TRACEV3_FILE_BYTES,
         max_values: int = MAX_VALUES_PER_SECTION,
         scan_unified_log: bool = True,
     ) -> None:
+        self.cell_db = cell_db
         self.include_sensitive = include_sensitive
         self.max_file_bytes = max_file_bytes
         self.max_tracev3_file_bytes = max_tracev3_file_bytes
@@ -174,6 +255,8 @@ class SysdiagnoseAnalyzer:
         self.scan_unified_log = scan_unified_log
         self.skipped_large_files = 0
         self.text_files_scanned = 0
+        self.timeline_events: list[dict[str, Any]] = []
+        self.timeline_events_count = 0
         self.total_bytes = 0
         self.total_entries = 0
         self.tracev3_catalog = Tracev3CatalogScanner(include_sensitive=include_sensitive, max_values=max_values)
@@ -204,7 +287,7 @@ class SysdiagnoseAnalyzer:
                 continue
             self._scan_payload(entry.path, data)
 
-        return {
+        report = {
             "archive": {
                 "path": str(source),
                 "type": archive_type,
@@ -225,6 +308,26 @@ class SysdiagnoseAnalyzer:
                 "text_files_scanned": self.text_files_scanned,
             },
         }
+        if self.cell_db is not None:
+            report["gsm"]["cell_database"] = _enrich_cell_towers_from_database(
+                report["gsm"],
+                self.cell_db,
+                include_sensitive=self.include_sensitive,
+                max_values=self.max_values,
+            )
+        report["gsm"]["journey"] = _analyze_cellular_journey(
+            report["gsm"],
+            include_sensitive=self.include_sensitive,
+            max_values=self.max_values,
+        )
+        report["timeline"] = _build_unified_timeline(
+            report,
+            self.timeline_events,
+            raw_text_events_count=self.timeline_events_count,
+            include_sensitive=self.include_sensitive,
+            max_values=self.max_values,
+        )
+        return report
 
     def _build_gsm_report(self) -> dict:
         return {
@@ -310,7 +413,31 @@ class SysdiagnoseAnalyzer:
                 self._record_coordinate(match.group("lat"), match.group("lon"), path)
 
         for line in text.splitlines():
+            self._scan_timeline_line(path, line)
             self._scan_cell_tower_line(path, line)
+
+    def _scan_timeline_line(self, path: str, line: str) -> None:
+        timestamp = _extract_timeline_timestamp(line)
+        if timestamp is None:
+            return
+        classified = _classify_timeline_event(path, line)
+        if classified is None:
+            return
+        category, event_type, severity = classified
+        event = {
+            "category": category,
+            "event_type": event_type,
+            "evidence": _timeline_evidence(line, include_sensitive=self.include_sensitive),
+            "severity": severity,
+            "source": path,
+            "timestamp": timestamp,
+        }
+        details = _timeline_event_details(line, include_sensitive=self.include_sensitive)
+        if details:
+            event["details"] = details
+        self.timeline_events_count += 1
+        if len(self.timeline_events) < self.max_values * 20:
+            self.timeline_events.append(event)
 
     def _scan_cell_tower_line(self, path: str, line: str) -> None:
         lowered = line.lower()
@@ -402,18 +529,835 @@ def analyze_sysdiagnose(
     source: Path,
     *,
     include_sensitive: bool = False,
+    cell_db: Optional[Path] = None,
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
     max_tracev3_file_bytes: int = DEFAULT_MAX_TRACEV3_FILE_BYTES,
     max_values: int = MAX_VALUES_PER_SECTION,
     scan_unified_log: bool = True,
 ) -> dict:
     return SysdiagnoseAnalyzer(
+        cell_db=cell_db,
         include_sensitive=include_sensitive,
         max_file_bytes=max_file_bytes,
         max_tracev3_file_bytes=max_tracev3_file_bytes,
         max_values=max_values,
         scan_unified_log=scan_unified_log,
     ).analyze(source)
+
+
+def _build_unified_timeline(
+    report: dict,
+    text_events: list[dict[str, Any]],
+    *,
+    raw_text_events_count: int,
+    include_sensitive: bool,
+    max_values: int,
+) -> dict[str, Any]:
+    events = [_copy_record(event) for event in text_events]
+    gsm_report = report.get("gsm", {})
+    for observation in _report_cell_observations(gsm_report, fallback_to_towers=False):
+        event = _timeline_event_from_cell_observation(observation)
+        if event is not None:
+            events.append(event)
+    journey = gsm_report.get("journey", {})
+    if isinstance(journey, dict):
+        for flag in journey.get("flags", []):
+            event = _timeline_event_from_journey_flag(flag)
+            if event is not None:
+                events.append(event)
+    events.sort(key=_timeline_sort_key)
+    raw_events_count = len(events)
+    events = _dedupe_timeline_events(events)
+    categories: dict[str, dict[str, Any]] = {}
+    event_types: dict[str, dict[str, Any]] = {}
+    for event in events:
+        _count_timeline_value(categories, event.get("category"))
+        _count_timeline_value(event_types, event.get("event_type"))
+    return {
+        "available": bool(events),
+        "categories": _top_records(categories, max_values),
+        "event_types": _top_records(event_types, max_values),
+        "events": events[:max_values],
+        "events_count": len(events),
+        "limitations": _timeline_limitations(events),
+        "raw_events_count": raw_events_count,
+        "raw_text_events_count": raw_text_events_count,
+        "schema": "sysdiagnose_unified_timeline_v1",
+        "truncated": len(events) > max_values,
+    }
+
+
+def _timeline_event_from_cell_observation(observation: dict[str, Any]) -> Optional[dict[str, Any]]:
+    timestamp = observation.get("observed_at")
+    if not timestamp:
+        return None
+    event = {
+        "category": "cellular",
+        "cell_key": _journey_cell_key(observation),
+        "event_type": "cellular_observation",
+        "severity": "info",
+        "source": observation.get("source", "system_logs.logarchive"),
+        "timestamp": timestamp,
+    }
+    details = _normalize_journey_observation(observation)
+    details.pop("source", None)
+    if details:
+        event["details"] = details
+    return event
+
+
+def _timeline_event_from_journey_flag(flag: dict[str, Any]) -> Optional[dict[str, Any]]:
+    timestamp = flag.get("to_observed_at") or flag.get("from_observed_at")
+    if not timestamp:
+        return None
+    return _copy_record({
+        "category": "cellular",
+        "details": {
+            "elapsed_seconds": flag.get("elapsed_seconds"),
+            "from_cell_key": flag.get("from_cell_key"),
+            "to_cell_key": flag.get("to_cell_key"),
+        },
+        "event_type": f"journey_{flag.get('type', 'flag')}",
+        "evidence": flag.get("reason"),
+        "severity": flag.get("severity", "medium"),
+        "source": "gsm.journey",
+        "timestamp": timestamp,
+    })
+
+
+def _extract_timeline_timestamp(line: str) -> Optional[str]:
+    for pattern in TIMELINE_TIMESTAMP_PATTERNS:
+        match = pattern.search(line)
+        if not match:
+            continue
+        value = match.group("value")
+        parsed = _parse_iso_datetime(value)
+        if parsed is not None:
+            return parsed.isoformat()
+        return value
+    return None
+
+
+def _classify_timeline_event(path: str, line: str) -> Optional[tuple[str, str, str]]:
+    haystack = f"{path}\n{line}"
+    for category, event_type, pattern in TIMELINE_EVENT_CLASSIFIERS:
+        if not pattern.search(haystack):
+            continue
+        return category, event_type, _timeline_event_severity(category, event_type, line)
+    return None
+
+
+def _timeline_event_severity(category: str, event_type: str, line: str) -> str:
+    lowered = line.lower()
+    if event_type == "reboot_or_shutdown" or "panic" in lowered:
+        return "medium"
+    if category == "baseband" and any(token in lowered for token in ("disabled", "error", "fail", "panic")):
+        return "medium"
+    if category in {"vpn", "sim_carrier"} and any(token in lowered for token in ("changed", "roaming", "connected", "disconnected")):
+        return "low"
+    return "info"
+
+
+def _timeline_event_details(line: str, *, include_sensitive: bool) -> dict[str, Any]:
+    details: dict[str, Any] = {}
+    fields = {}
+    for field, pattern in CELL_FIELD_PATTERNS.items():
+        match = pattern.search(line)
+        if match:
+            fields[field] = match.group(1) if include_sensitive or field not in {"cell_id", "lac", "tac", "pci"} else "<redacted>"
+    rat = RAT_PATTERN.search(line)
+    if rat:
+        fields["rat"] = rat.group(0).upper()
+    if fields:
+        details["cellular"] = fields
+    for pattern in COORDINATE_PATTERNS:
+        match = pattern.search(line)
+        if not match:
+            continue
+        if include_sensitive:
+            details["coordinate"] = {
+                "latitude": _safe_float(match.group("lat")),
+                "longitude": _safe_float(match.group("lon")),
+            }
+        else:
+            details["coordinate"] = {"redacted": True}
+        break
+    if include_sensitive:
+        bssids = BSSID_PATTERN.findall(line)
+        if bssids:
+            details["bssids"] = bssids[:MAX_SOURCES_PER_FINDING]
+        ip_addresses = [value for value in IP_ADDRESS_PATTERN.findall(line) if _valid_ipv4(value)]
+        if ip_addresses:
+            details["ip_addresses"] = ip_addresses[:MAX_SOURCES_PER_FINDING]
+    return details
+
+
+def _timeline_evidence(line: str, *, include_sensitive: bool) -> str:
+    evidence = " ".join(line.split())
+    if not include_sensitive:
+        for pattern in IDENTIFIER_PATTERNS.values():
+            evidence = pattern.sub(lambda match: match.group(0).replace(match.group(1), "<redacted>"), evidence)
+        evidence = PHONE_NUMBER_PATTERN.sub(lambda match: match.group(0).replace(match.group(1), "<redacted>"), evidence)
+        evidence = BSSID_PATTERN.sub("<redacted-bssid>", evidence)
+        evidence = IP_ADDRESS_PATTERN.sub(lambda match: "<redacted-ip>" if _valid_ipv4(match.group(0)) else match.group(0), evidence)
+        for pattern in COORDINATE_PATTERNS:
+            evidence = pattern.sub("coordinate=<redacted>", evidence)
+    if len(evidence) > TIMELINE_EVIDENCE_MAX_LENGTH:
+        return evidence[: TIMELINE_EVIDENCE_MAX_LENGTH - 1] + "..."
+    return evidence
+
+
+def _valid_ipv4(value: str) -> bool:
+    try:
+        return all(0 <= int(part) <= 255 for part in value.split("."))
+    except ValueError:
+        return False
+
+
+def _timeline_sort_key(event: dict[str, Any]) -> tuple[int, str, str, str]:
+    timestamp = event.get("timestamp")
+    parsed = _parse_iso_datetime(timestamp)
+    if parsed is None:
+        return (1, "", str(event.get("category", "")), str(event.get("source", "")))
+    return (0, parsed.isoformat(), str(event.get("category", "")), str(event.get("source", "")))
+
+
+def _dedupe_timeline_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    for event in events:
+        if deduped and _timeline_duplicate_key(deduped[-1]) == _timeline_duplicate_key(event):
+            deduped[-1]["occurrences"] = deduped[-1].get("occurrences", 1) + 1
+            continue
+        deduped.append(event)
+    return deduped
+
+
+def _timeline_duplicate_key(event: dict[str, Any]) -> tuple[Any, Any, Any, Any, Any, str]:
+    return (
+        event.get("timestamp"),
+        event.get("category"),
+        event.get("event_type"),
+        event.get("source"),
+        event.get("cell_key"),
+        json.dumps(event.get("details", event.get("evidence", "")), sort_keys=True),
+    )
+
+
+def _count_timeline_value(records: dict[str, dict[str, Any]], value: Any) -> None:
+    if not value:
+        return
+    key = str(value)
+    record = records.setdefault(key, {"count": 0, "sources": [], "value": key})
+    record["count"] += 1
+
+
+def _timeline_limitations(events: list[dict[str, Any]]) -> list[str]:
+    limitations = ["Timeline is best-effort and only includes parsed timestamped events."]
+    if not events:
+        limitations.append("No timestamped forensic timeline events were parsed.")
+    if not any(event.get("category") == "cellular" for event in events):
+        limitations.append("No timestamped cellular observations were available in the unified timeline.")
+    return limitations
+
+
+def _enrich_cell_towers_from_database(
+    gsm_report: dict,
+    cell_db: Path,
+    *,
+    include_sensitive: bool,
+    max_values: int,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "format": "csv",
+        "lookups": 0,
+        "matched_towers": 0,
+        "matches": 0,
+        "path": str(cell_db),
+        "rows_scanned": 0,
+    }
+    towers = _report_cell_towers(gsm_report) + _report_cell_observations(gsm_report, fallback_to_towers=False)
+    wanted: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    for tower in towers:
+        key = _cell_db_lookup_key_from_tower(tower)
+        if key is None:
+            continue
+        wanted.setdefault(key, []).append(tower)
+    metadata["lookups"] = len(wanted)
+    if not wanted:
+        return metadata
+
+    errors: list[str] = []
+    try:
+        with cell_db.open(newline="", encoding="utf-8", errors="replace") as handle:
+            reader = csv.reader(handle)
+            first_row = next(reader, None)
+            if first_row is None:
+                metadata["errors"] = ["empty cell database"]
+                return metadata
+            has_header = _cell_db_has_header(first_row)
+            columns = _cell_db_columns(first_row if has_header else OPENCELLID_COLUMNS[: len(first_row)])
+            if not has_header:
+                metadata["rows_scanned"] += 1
+                _match_cell_db_row(first_row, columns, wanted, metadata, include_sensitive=include_sensitive)
+            for row in reader:
+                metadata["rows_scanned"] += 1
+                try:
+                    _match_cell_db_row(row, columns, wanted, metadata, include_sensitive=include_sensitive)
+                except ValueError as e:
+                    if len(errors) < max_values:
+                        errors.append(str(e))
+    except OSError as e:
+        metadata["errors"] = [str(e)]
+        return metadata
+    if errors:
+        metadata["errors"] = errors
+    return metadata
+
+
+def _report_cell_towers(gsm_report: dict) -> list[dict[str, Any]]:
+    towers = list(gsm_report.get("cell_towers", []))
+    unified_log = gsm_report.get("unified_log", {})
+    if isinstance(unified_log, dict):
+        towers.extend(unified_log.get("cell_towers", []))
+    return towers
+
+
+def _report_cell_observations(gsm_report: dict, *, fallback_to_towers: bool = True) -> list[dict[str, Any]]:
+    unified_log = gsm_report.get("unified_log", {})
+    observations = []
+    if isinstance(unified_log, dict):
+        observations.extend(unified_log.get("cell_tower_observations", []))
+    if observations or not fallback_to_towers:
+        return observations
+    return _report_cell_towers(gsm_report)
+
+
+def _analyze_cellular_journey(
+    gsm_report: dict,
+    *,
+    include_sensitive: bool,
+    max_values: int,
+) -> dict[str, Any]:
+    observations = [_normalize_journey_observation(item) for item in _report_cell_observations(gsm_report)]
+    observations = [item for item in observations if item]
+    observations.sort(key=_journey_sort_key)
+    raw_observations_count = len(observations)
+    observations = _dedupe_journey_observations(observations)
+    flags: list[dict[str, Any]] = []
+    segments: list[dict[str, Any]] = []
+    limitations = [
+        "Heuristic analysis only: no single flag proves IMSI-catcher, rogue base-station, or hijack activity.",
+        "Coordinates are optional; distance and speed checks require cell database matches with latitude/longitude.",
+    ]
+    if not observations:
+        return {
+            "analysis": "cellular_journey_heuristic_v1",
+            "available": False,
+            "coordinates_optional": True,
+            "flags": [],
+            "limitations": [*limitations, "No cellular observations were parsed."],
+            "located_observations_count": 0,
+            "observations": [],
+            "observations_count": 0,
+            "ordered_observations_count": 0,
+            "raw_observations_count": 0,
+            "risk_level": "unknown",
+            "risk_score": 0,
+            "segments": [],
+        }
+
+    _add_identity_collision_flags(observations, flags, max_values=max_values)
+    _add_short_window_churn_flags(observations, flags, max_values=max_values)
+    for previous, current in zip(observations, observations[1:]):
+        segment = _journey_segment(previous, current, include_sensitive=include_sensitive)
+        if segment is not None and len(segments) < max_values:
+            segments.append(segment)
+        _add_transition_flags(previous, current, flags, segment=segment, max_values=max_values)
+
+    score = min(sum(_journey_flag_weight(flag) for flag in flags), 100)
+    return {
+        "analysis": "cellular_journey_heuristic_v1",
+        "available": len(observations) >= 1,
+        "coordinates_optional": True,
+        "flags": flags[:max_values],
+        "limitations": limitations + _journey_limitations(observations),
+        "located_observations_count": sum(1 for item in observations if _journey_coordinate(item) is not None),
+        "observations": observations[:max_values],
+        "observations_count": len(observations),
+        "ordered_observations_count": sum(1 for item in observations if item.get("observed_at")),
+        "raw_observations_count": raw_observations_count,
+        "risk_level": _journey_risk_level(score, observations),
+        "risk_score": score,
+        "segments": segments,
+    }
+
+
+def _normalize_journey_observation(item: dict[str, Any]) -> dict[str, Any]:
+    observation: dict[str, Any] = {}
+    for field in (
+        "band",
+        "bandwidth",
+        "cell_id",
+        "cell_type",
+        "country",
+        "lac",
+        "mcc",
+        "mnc",
+        "physical_cell_id",
+        "rat",
+        "source",
+        "tac",
+        "uarfcn",
+    ):
+        value = item.get(field)
+        if value not in (None, "", "<redacted>"):
+            observation[field] = value
+    lookup = item.get("lookup")
+    if isinstance(lookup, dict):
+        observation["lookup"] = lookup
+    match = item.get("cell_database_match")
+    if isinstance(match, dict):
+        observation["cell_database_match"] = match
+    observed_at = item.get("observed_at")
+    if observed_at:
+        observation["observed_at"] = observed_at
+    observation["cell_key"] = _journey_cell_key(observation)
+    return observation
+
+
+def _dedupe_journey_observations(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    for observation in observations:
+        if deduped and _journey_duplicate_key(deduped[-1]) == _journey_duplicate_key(observation):
+            continue
+        deduped.append(observation)
+    return deduped
+
+
+def _journey_duplicate_key(item: dict[str, Any]) -> tuple[Any, Any, Any, Any]:
+    return (
+        item.get("observed_at"),
+        item.get("cell_key"),
+        item.get("rat"),
+        item.get("cell_type"),
+    )
+
+
+def _journey_sort_key(item: dict[str, Any]) -> tuple[int, str, str]:
+    observed_at = item.get("observed_at")
+    parsed = _parse_iso_datetime(observed_at) if observed_at else None
+    if parsed is None:
+        return (1, "", str(item.get("source", "")))
+    return (0, parsed.isoformat(), str(item.get("source", "")))
+
+
+def _journey_cell_key(item: dict[str, Any]) -> str:
+    lookup = item.get("lookup") if isinstance(item.get("lookup"), dict) else {}
+    area = lookup.get("tac") or lookup.get("lac") or item.get("tac") or item.get("lac") or "unknown"
+    cell = lookup.get("eci") or lookup.get("nci") or lookup.get("cid") or item.get("cell_id") or "unknown"
+    return "-".join([
+        str(item.get("mcc", "unknown")),
+        str(item.get("mnc", "unknown")),
+        str(area),
+        str(cell),
+    ])
+
+
+def _journey_segment(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    include_sensitive: bool,
+) -> Optional[dict[str, Any]]:
+    previous_time = _parse_iso_datetime(previous.get("observed_at"))
+    current_time = _parse_iso_datetime(current.get("observed_at"))
+    if previous_time is None or current_time is None:
+        return None
+    elapsed_seconds = (current_time - previous_time).total_seconds()
+    if elapsed_seconds < 0:
+        return None
+    segment: dict[str, Any] = {
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "from_cell_key": previous.get("cell_key"),
+        "from_observed_at": previous.get("observed_at"),
+        "to_cell_key": current.get("cell_key"),
+        "to_observed_at": current.get("observed_at"),
+    }
+    previous_coordinate = _journey_coordinate(previous)
+    current_coordinate = _journey_coordinate(current)
+    if previous_coordinate is None or current_coordinate is None:
+        segment["distance_available"] = False
+        return segment
+    distance_meters = _haversine_meters(previous_coordinate, current_coordinate)
+    adjusted_distance = max(
+        0.0,
+        distance_meters - _journey_coordinate_range(previous) - _journey_coordinate_range(current),
+    )
+    segment.update({
+        "distance_available": True,
+        "distance_meters": round(distance_meters, 3),
+        "range_adjusted_distance_meters": round(adjusted_distance, 3),
+    })
+    if elapsed_seconds > 0:
+        speed_kmh = adjusted_distance / elapsed_seconds * 3.6
+        segment["range_adjusted_speed_kmh"] = round(speed_kmh, 3)
+        if speed_kmh >= CELL_JOURNEY_IMPOSSIBLE_SPEED_KMH:
+            segment["movement_flag"] = "impossible_speed"
+        elif speed_kmh >= CELL_JOURNEY_SUSPICIOUS_SPEED_KMH:
+            segment["movement_flag"] = "suspicious_speed"
+    if include_sensitive:
+        segment["from_coordinate"] = {"latitude": previous_coordinate[0], "longitude": previous_coordinate[1]}
+        segment["to_coordinate"] = {"latitude": current_coordinate[0], "longitude": current_coordinate[1]}
+    return segment
+
+
+def _add_transition_flags(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    flags: list[dict[str, Any]],
+    *,
+    segment: Optional[dict[str, Any]],
+    max_values: int,
+) -> None:
+    if len(flags) >= max_values:
+        return
+    elapsed_seconds = segment.get("elapsed_seconds") if segment else None
+    if previous.get("mcc") and current.get("mcc") and previous.get("mcc") != current.get("mcc"):
+        _append_journey_flag(
+            flags,
+            "mcc_change",
+            "high" if _short_elapsed(elapsed_seconds) else "medium",
+            previous,
+            current,
+            elapsed_seconds=elapsed_seconds,
+            reason="Mobile country code changed between consecutive cell observations.",
+        )
+    elif _plmn(previous) and _plmn(current) and _plmn(previous) != _plmn(current):
+        _append_journey_flag(
+            flags,
+            "plmn_change",
+            "medium" if _short_elapsed(elapsed_seconds) else "low",
+            previous,
+            current,
+            elapsed_seconds=elapsed_seconds,
+            reason="Mobile network changed between consecutive cell observations.",
+        )
+    if _rat_downgrade(previous.get("rat"), current.get("rat")):
+        _append_journey_flag(
+            flags,
+            "rat_downgrade",
+            "high" if current.get("rat") in {"GSM", "EDGE", "GPRS"} else "medium",
+            previous,
+            current,
+            elapsed_seconds=elapsed_seconds,
+            reason="Radio access technology downgraded between consecutive observations.",
+        )
+    if segment and segment.get("movement_flag"):
+        _append_journey_flag(
+            flags,
+            segment["movement_flag"],
+            "high" if segment["movement_flag"] == "impossible_speed" else "medium",
+            previous,
+            current,
+            elapsed_seconds=elapsed_seconds,
+            reason="Cell database coordinates imply an implausible movement speed.",
+            extra={"range_adjusted_speed_kmh": segment.get("range_adjusted_speed_kmh")},
+        )
+
+
+def _add_identity_collision_flags(observations: list[dict[str, Any]], flags: list[dict[str, Any]], *, max_values: int) -> None:
+    seen: dict[str, set[str]] = {}
+    for item in observations:
+        cell_id = str(item.get("cell_id") or "")
+        if not cell_id:
+            continue
+        seen.setdefault(cell_id, set()).add(_journey_cell_key(item))
+    for cell_id, keys in seen.items():
+        if len(keys) <= 1:
+            continue
+        flags.append({
+            "cell_id": cell_id,
+            "distinct_keys": sorted(keys)[:max_values],
+            "reason": "Same cell identifier appeared with multiple MCC/MNC/area combinations.",
+            "severity": "medium",
+            "type": "cell_identity_collision",
+        })
+        if len(flags) >= max_values:
+            return
+
+
+def _add_short_window_churn_flags(
+    observations: list[dict[str, Any]],
+    flags: list[dict[str, Any]],
+    *,
+    max_values: int,
+) -> None:
+    timed = [(item, _parse_iso_datetime(item.get("observed_at"))) for item in observations if item.get("observed_at")]
+    timed = [(item, observed_at) for item, observed_at in timed if observed_at is not None]
+    for index, (start_item, start_time) in enumerate(timed):
+        window = [start_item]
+        for item, observed_at in timed[index + 1 :]:
+            if (observed_at - start_time).total_seconds() > CELL_JOURNEY_CHURN_WINDOW_SECONDS:
+                break
+            window.append(item)
+        unique_cells = {item.get("cell_key") for item in window}
+        if len(unique_cells) < CELL_JOURNEY_CHURN_UNIQUE_CELLS:
+            continue
+        flags.append({
+            "cell_keys": sorted(unique_cells)[:max_values],
+            "duration_seconds": CELL_JOURNEY_CHURN_WINDOW_SECONDS,
+            "from_observed_at": start_item.get("observed_at"),
+            "reason": "Many distinct cells were observed in a short window.",
+            "severity": "medium",
+            "type": "rapid_cell_churn",
+            "unique_cell_count": len(unique_cells),
+        })
+        if len(flags) >= max_values:
+            return
+
+
+def _append_journey_flag(
+    flags: list[dict[str, Any]],
+    flag_type: str,
+    severity: str,
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    elapsed_seconds: Optional[float],
+    reason: str,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    flag = {
+        "elapsed_seconds": elapsed_seconds,
+        "from_cell_key": previous.get("cell_key"),
+        "from_observed_at": previous.get("observed_at"),
+        "reason": reason,
+        "severity": severity,
+        "to_cell_key": current.get("cell_key"),
+        "to_observed_at": current.get("observed_at"),
+        "type": flag_type,
+    }
+    if extra:
+        flag.update(extra)
+    flags.append(_copy_record(flag))
+
+
+def _journey_coordinate(item: dict[str, Any]) -> Optional[tuple[float, float]]:
+    match = item.get("cell_database_match")
+    if not isinstance(match, dict):
+        return None
+    lat = match.get("latitude")
+    lon = match.get("longitude")
+    if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+        return None
+    return float(lat), float(lon)
+
+
+def _journey_coordinate_range(item: dict[str, Any]) -> float:
+    match = item.get("cell_database_match")
+    if not isinstance(match, dict):
+        return 0.0
+    for field in ("range", "accuracy"):
+        value = match.get(field)
+        if value is None:
+            continue
+        try:
+            return max(float(value), 0.0)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _haversine_meters(start: tuple[float, float], end: tuple[float, float]) -> float:
+    lat1, lon1 = math.radians(start[0]), math.radians(start[1])
+    lat2, lon2 = math.radians(end[0]), math.radians(end[1])
+    delta_lat = lat2 - lat1
+    delta_lon = lon2 - lon1
+    a = math.sin(delta_lat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
+    return 6_371_000 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = value.replace("Z", "+00:00")
+    if " " in normalized and "T" not in normalized:
+        normalized = normalized.replace(" ", "T", 1)
+    if re.search(r"[+-][0-9]{4}$", normalized):
+        normalized = f"{normalized[:-5]}{normalized[-5:-2]}:{normalized[-2:]}"
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _plmn(item: dict[str, Any]) -> Optional[tuple[str, str]]:
+    mcc = item.get("mcc")
+    mnc = item.get("mnc")
+    if not mcc or not mnc:
+        return None
+    return str(mcc), str(mnc)
+
+
+def _rat_downgrade(previous: Any, current: Any) -> bool:
+    previous_rank = CELL_JOURNEY_RAT_RANKS.get(_normalize_cell_radio(previous) or "")
+    current_rank = CELL_JOURNEY_RAT_RANKS.get(_normalize_cell_radio(current) or "")
+    return previous_rank is not None and current_rank is not None and current_rank < previous_rank
+
+
+def _short_elapsed(elapsed_seconds: Optional[float]) -> bool:
+    return elapsed_seconds is not None and elapsed_seconds <= CELL_JOURNEY_SHORT_WINDOW_SECONDS
+
+
+def _journey_flag_weight(flag: dict[str, Any]) -> int:
+    return {"high": 50, "medium": 20, "low": 5}.get(str(flag.get("severity")), 0)
+
+
+def _journey_risk_level(score: int, observations: list[dict[str, Any]]) -> str:
+    if len(observations) < 2:
+        return "unknown"
+    if score >= 50:
+        return "high"
+    if score >= 20:
+        return "medium"
+    return "low"
+
+
+def _journey_limitations(observations: list[dict[str, Any]]) -> list[str]:
+    limitations = []
+    if sum(1 for item in observations if item.get("observed_at")) < 2:
+        limitations.append("Fewer than two timestamped observations; transition timing is incomplete.")
+    if not any(_journey_coordinate(item) is not None for item in observations):
+        limitations.append("No cell database coordinates; movement speed and geographic continuity were not checked.")
+    return limitations
+
+
+def _cell_db_lookup_key_from_tower(tower: dict[str, Any]) -> Optional[tuple[str, str, str, str]]:
+    mcc = _normalize_cell_number(tower.get("mcc"))
+    mnc = _normalize_cell_number(tower.get("mnc"))
+    lookup = tower.get("lookup") if isinstance(tower.get("lookup"), dict) else {}
+    area = _normalize_cell_number(lookup.get("tac") or lookup.get("lac") or tower.get("tac") or tower.get("lac"))
+    cell = _normalize_cell_number(
+        lookup.get("eci") or lookup.get("nci") or lookup.get("cid") or tower.get("cell_id") or tower.get("ecgi")
+    )
+    if not all((mcc, mnc, area, cell)):
+        return None
+    return mcc, mnc, area, cell
+
+
+def _cell_db_has_header(row: list[str]) -> bool:
+    normalized = {_normalize_cell_db_column_name(column) for column in row}
+    return bool(normalized & {"mcc", "mobilecountrycode"}) and bool(normalized & {"cell", "cellid", "cid", "eci"})
+
+
+def _cell_db_columns(row: tuple[str, ...] | list[str]) -> dict[str, int]:
+    columns: dict[str, int] = {}
+    for index, column in enumerate(row):
+        normalized = _normalize_cell_db_column_name(column)
+        for canonical, aliases in CELL_DB_COLUMN_ALIASES.items():
+            if normalized in aliases:
+                columns[canonical] = index
+                break
+        for canonical, aliases in CELL_DB_EXTRA_COLUMNS.items():
+            if normalized in aliases:
+                columns[canonical] = index
+                break
+    return columns
+
+
+def _match_cell_db_row(
+    row: list[str],
+    columns: dict[str, int],
+    wanted: dict[tuple[str, str, str, str], list[dict[str, Any]]],
+    metadata: dict[str, Any],
+    *,
+    include_sensitive: bool,
+) -> None:
+    mcc = _normalize_cell_number(_cell_db_value(row, columns, "mcc"))
+    mnc = _normalize_cell_number(_cell_db_value(row, columns, "mnc"))
+    area = _normalize_cell_number(_cell_db_value(row, columns, "area"))
+    cell = _normalize_cell_number(_cell_db_value(row, columns, "cell"))
+    if not all((mcc, mnc, area, cell)):
+        return
+    key = (mcc, mnc, area, cell)
+    candidates = wanted.get(key)
+    if not candidates:
+        return
+    lat = _safe_float(_cell_db_value(row, columns, "lat") or "")
+    lon = _safe_float(_cell_db_value(row, columns, "lon") or "")
+    if lat is None or lon is None or not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        raise ValueError(f"invalid coordinate for cell database key {key}")
+    radio = _normalize_cell_radio(_cell_db_value(row, columns, "radio"))
+    for tower in candidates:
+        if tower.get("cell_database_match"):
+            continue
+        tower_radio = _normalize_cell_radio(tower.get("rat"))
+        if radio and tower_radio and radio != tower_radio:
+            continue
+        tower["cell_database_match"] = _cell_database_match_record(row, columns, lat, lon, include_sensitive)
+        metadata["matched_towers"] += 1
+    metadata["matches"] += 1
+
+
+def _cell_database_match_record(
+    row: list[str],
+    columns: dict[str, int],
+    lat: float,
+    lon: float,
+    include_sensitive: bool,
+) -> dict[str, Any]:
+    match: dict[str, Any] = {
+        "area": _normalize_cell_number(_cell_db_value(row, columns, "area")),
+        "cell": _normalize_cell_number(_cell_db_value(row, columns, "cell")),
+        "mcc": _normalize_cell_number(_cell_db_value(row, columns, "mcc")),
+        "mnc": _normalize_cell_number(_cell_db_value(row, columns, "mnc")),
+    }
+    radio = _normalize_cell_radio(_cell_db_value(row, columns, "radio"))
+    if radio:
+        match["radio"] = radio
+    if include_sensitive:
+        match["latitude"] = lat
+        match["longitude"] = lon
+    else:
+        match["coordinate"] = _sensitive_digest(f"{lat:.6f},{lon:.6f}")
+    for field in ("accuracy", "average_signal", "changeable", "created", "range", "samples", "updated"):
+        value = _cell_db_value(row, columns, field)
+        if value:
+            match[field] = value
+    return _copy_record(match)
+
+
+def _cell_db_value(row: list[str], columns: dict[str, int], field: str) -> Optional[str]:
+    index = columns.get(field)
+    if index is None or index >= len(row):
+        return None
+    value = row[index].strip()
+    return value or None
+
+
+def _normalize_cell_db_column_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.strip().lower())
+
+
+def _normalize_cell_number(value: Any) -> Optional[str]:
+    if value is None or value == "<redacted>":
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return str(int(text, 0))
+    except ValueError:
+        return text.lstrip("0") or "0" if text.isdecimal() else text
+
+
+def _normalize_cell_radio(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    radio = str(value).strip().upper()
+    if not radio:
+        return None
+    return CELL_DB_RADIO_ALIASES.get(radio, radio)
 
 
 def _archive_type(source: Path) -> str:

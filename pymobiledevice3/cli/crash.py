@@ -226,6 +226,18 @@ def crash_sysdiagnose_report(
             help="Include raw phone/SIM identifiers and exact coordinates. Defaults to redacted hashes/counts.",
         ),
     ] = False,
+    cell_db: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--cell-db",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+            help="OpenCellID/Mylnikov-style CSV cell database used to enrich tower records with coordinates.",
+        ),
+    ] = None,
     max_file_bytes: Annotated[
         int,
         typer.Option(
@@ -253,6 +265,7 @@ def crash_sysdiagnose_report(
     """Build a forensic JSON report from a local sysdiagnose archive or directory."""
     report = analyze_sysdiagnose(
         source,
+        cell_db=cell_db,
         include_sensitive=include_sensitive,
         max_file_bytes=max_file_bytes,
         max_tracev3_file_bytes=max_tracev3_file_bytes,
