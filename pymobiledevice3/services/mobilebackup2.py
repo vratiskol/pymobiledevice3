@@ -220,7 +220,7 @@ class Mobilebackup2Service(LockdownService):
                     manifest_path.unlink(missing_ok=True)
                 (device_directory / "Manifest.plist").touch()
 
-                await dl.send_process_message({"MessageName": "Backup", "TargetIdentifier": self.lockdown.udid})
+                await dl.send_process_message(self._backup_request_message(self.lockdown.udid, full=full))
                 await dl.dl_loop(progress_callback)
                 if filter_callback is not None:
                     self.prune_backup_directory(device_directory, filter_callback, password=password)
@@ -246,6 +246,17 @@ class Mobilebackup2Service(LockdownService):
             (device_directory / filename).is_file() and (device_directory / filename).stat().st_size > 0
             for filename in INCREMENTAL_BACKUP_REQUIRED_FILES
         )
+
+    @staticmethod
+    def _backup_request_message(identifier: str, full: bool) -> dict[str, object]:
+        message: dict[str, object] = {
+            "MessageName": "Backup",
+            "TargetIdentifier": identifier,
+            "SourceIdentifier": identifier,
+        }
+        if full:
+            message["Options"] = {"ForceFullBackup": True}
+        return message
 
     async def _observe_backup_notifications(self, notification_proxy: NotificationProxyService) -> None:
         for notification in BACKUP_OBSERVED_NOTIFICATIONS:
