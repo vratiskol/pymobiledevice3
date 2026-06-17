@@ -101,7 +101,6 @@ def classify_artifact(path: Path) -> str:
         return "directory"
 
     suffixes = [suffix.lower() for suffix in path.suffixes]
-    suffix_chain = "".join(suffixes)
     if any(suffix in {".crash", ".ips", ".panic"} for suffix in suffixes):
         return "crash_report"
     if path.suffix.lower() in PACKET_CAPTURE_SUFFIXES:
@@ -110,28 +109,43 @@ def classify_artifact(path: Path) -> str:
         return "logarchive"
     if _is_mobilebackup_domains_plist(path):
         return "mobilebackup_domains_plist"
-    if "sysdiagnose" in name and suffixes:
+    if _is_sysdiagnose_archive(name):
         return "sysdiagnose_archive"
-    if _is_file_relay_archive(name, suffix_chain):
+    if _is_file_relay_archive(name):
         return "file_relay_archive"
-    if _is_diagnostics_archive(name, suffix_chain):
+    if _is_diagnostics_archive(name):
         return "diagnostics_archive"
     if path.suffix.lower() == ".plist":
         return "plist"
     return "file"
 
 
-def _is_file_relay_archive(name: str, suffix_chain: str) -> bool:
-    if suffix_chain not in FILE_RELAY_ARCHIVE_SUFFIX_CHAINS:
+def _is_sysdiagnose_archive(name: str) -> bool:
+    return _has_suffix_chain(name, ARCHIVE_SUFFIX_CHAINS) and "sysdiagnose" in name
+
+
+def _is_file_relay_archive(name: str) -> bool:
+    archive_name = _remove_suffix_chain(name, FILE_RELAY_ARCHIVE_SUFFIX_CHAINS)
+    if archive_name is None:
         return False
     if "file_relay" in name or "file-relay" in name:
         return True
-    archive_name = name.removesuffix(suffix_chain)
     return _normalize_artifact_name(archive_name) in FILE_RELAY_ARCHIVE_NAME_HINTS
 
 
-def _is_diagnostics_archive(name: str, suffix_chain: str) -> bool:
-    return suffix_chain in ARCHIVE_SUFFIX_CHAINS and any(hint in name for hint in DIAGNOSTICS_ARCHIVE_NAME_HINTS)
+def _is_diagnostics_archive(name: str) -> bool:
+    return _has_suffix_chain(name, ARCHIVE_SUFFIX_CHAINS) and any(hint in name for hint in DIAGNOSTICS_ARCHIVE_NAME_HINTS)
+
+
+def _has_suffix_chain(name: str, suffix_chains: set[str]) -> bool:
+    return any(name.endswith(suffix_chain) for suffix_chain in suffix_chains)
+
+
+def _remove_suffix_chain(name: str, suffix_chains: set[str]) -> Optional[str]:
+    for suffix_chain in sorted(suffix_chains, key=len, reverse=True):
+        if name.endswith(suffix_chain):
+            return name[: -len(suffix_chain)]
+    return None
 
 
 def _is_mobilebackup_domains_plist(path: Path) -> bool:

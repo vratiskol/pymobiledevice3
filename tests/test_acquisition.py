@@ -74,11 +74,17 @@ def test_classify_artifact_detects_common_acquisition_artifacts(tmp_path) -> Non
     crash.write_text("{}")
     sysdiagnose = tmp_path / "sysdiagnose_2026.tar.gz"
     sysdiagnose.write_bytes(b"archive")
+    dotted_sysdiagnose = tmp_path / "sysdiagnose_2026.06.12_17-45-46+0200_iPhone-OS_iPhone_23F77.tar.gz"
+    dotted_sysdiagnose.write_bytes(b"archive")
+    sysdiagnose_json_report = tmp_path / "sysdiagnose_report.json"
+    sysdiagnose_json_report.write_text("{}")
 
     assert classify_artifact(backup) == "itunes_backup"
     assert classify_artifact(backup_root) == "itunes_backup_root"
     assert classify_artifact(crash) == "crash_report"
     assert classify_artifact(sysdiagnose) == "sysdiagnose_archive"
+    assert classify_artifact(dotted_sysdiagnose) == "sysdiagnose_archive"
+    assert classify_artifact(sysdiagnose_json_report) == "file"
 
 
 def test_classify_artifact_detects_forensic_collection_artifacts(tmp_path) -> None:
@@ -93,6 +99,8 @@ def test_classify_artifact_detects_forensic_collection_artifacts(tmp_path) -> No
     file_relay_archive.write_bytes(b"archive")
     diagnostics_archive = tmp_path / "os_trace_2026.tar"
     diagnostics_archive.write_bytes(b"archive")
+    dotted_diagnostics_archive = tmp_path / "diagnostics_2026.06.12.tar.gz"
+    dotted_diagnostics_archive.write_bytes(b"archive")
     mobilebackup_domains = tmp_path / "Domains.plist"
     with mobilebackup_domains.open("wb") as out:
         plistlib.dump({"SystemDomains": {}, "Version": "24.0"}, out)
@@ -105,6 +113,7 @@ def test_classify_artifact_detects_forensic_collection_artifacts(tmp_path) -> No
     assert classify_artifact(logarchive) == "logarchive"
     assert classify_artifact(file_relay_archive) == "file_relay_archive"
     assert classify_artifact(diagnostics_archive) == "diagnostics_archive"
+    assert classify_artifact(dotted_diagnostics_archive) == "diagnostics_archive"
     assert classify_artifact(mobilebackup_domains) == "mobilebackup_domains_plist"
     assert classify_artifact(generic_domains) == "plist"
 
